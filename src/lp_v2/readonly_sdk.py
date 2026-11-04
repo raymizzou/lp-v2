@@ -348,25 +348,29 @@ class ReadOnlySDK:
                 result['region']=fact('PASS' if allowed else 'FAIL','JP_CLOSED_ONLY_EXCEPTION' if region['blocked'] is True and allowed else 'REGION_POLICY')
         except Exception:
             pass
+        from lp_v2.relayer_credentials import parse_relayer_credentials
+        from polymarket._internal.actions.relayer.auth import make_relayer_header_resolver_sync
         try:
-            if (not isinstance(relayer,dict) or set(relayer)!={'key','address'} or not isinstance(relayer['key'],str)
-                    or not relayer['key'] or relayer['address'].lower()!=identity['signer_address'].lower()):
-                result['relayer_auth']=fact('FAIL','RELAYER_IDENTITY'); return result
-            self.__audit.require_ready()
-            response=self.__http.get(PRODUCTION.relayer_url+'/transactions',headers={
-                'RELAYER_API_KEY':relayer['key'],'RELAYER_API_KEY_ADDRESS':relayer['address']})
-            if response.status_code in (401,403):
-                result['relayer_auth']=fact('FAIL','RELAYER_AUTH_REJECTED')
-            else:
-                response.raise_for_status()
-                rows=response.json()
-                if not isinstance(rows,list) or any(not isinstance(row,dict) or
-                        not isinstance(row.get('owner'),str) or row['owner'].lower()!=identity['signer_address'].lower()
-                        for row in rows):
-                    raise ValueError()
-                result['relayer_auth']=fact('PASS','AUTHENTICATED_GET_ONLY')
-        except Exception:
-            pass
+            relayer_key=parse_relayer_credentials(relayer,identity['signer_address'])
+        except ValueError:
+            result['relayer_auth']=fact('FAIL','RELAYER_IDENTITY')
+        else:
+            try:
+                self.__audit.require_ready()
+                headers=make_relayer_header_resolver_sync(relayer_key)('GET','/transactions',None)
+                response=self.__http.get(PRODUCTION.relayer_url+'/transactions',headers=headers)
+                if response.status_code in (401,403):
+                    result['relayer_auth']=fact('FAIL','RELAYER_AUTH_REJECTED')
+                else:
+                    response.raise_for_status()
+                    rows=response.json()
+                    if not isinstance(rows,list) or any(not isinstance(row,dict) or
+                            not isinstance(row.get('owner'),str) or row['owner'].lower()!=identity['signer_address'].lower()
+                            for row in rows):
+                        raise ValueError()
+                    result['relayer_auth']=fact('PASS','AUTHENTICATED_GET_ONLY')
+            except Exception:
+                pass
         result['relayer_merge']=fact('UNKNOWN','AUTH_DOES_NOT_PROVE_MERGE_READINESS')
         return result
 

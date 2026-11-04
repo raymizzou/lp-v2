@@ -85,9 +85,10 @@ def file_snapshot(profile):
     credentials=L2Credentials(**json.loads(values['l2_credentials']));relayer=json.loads(values['relayer_credentials'])
     if (type(credentials.signature_type) is not int or credentials.signature_type!=1
             or signer.lower()!=credentials.signer_address.lower()
-            or classify_wallet_type(signer=signer,wallet=credentials.wallet_address,config=PRODUCTION.wallet_derivation)!='POLY_PROXY'
-            or set(relayer)!={'key','address'} or not isinstance(relayer['key'],str) or not relayer['key']
-            or relayer['address'].lower()!=signer.lower()):raise ValueError('derived identity differs')
+            or classify_wallet_type(signer=signer,wallet=credentials.wallet_address,config=PRODUCTION.wallet_derivation)!='POLY_PROXY'):
+        raise ValueError('derived identity differs')
+    from lp_v2.relayer_credentials import parse_relayer_credentials
+    parse_relayer_credentials(relayer,signer)
     identity=dict(signer_address=signer,wallet_address=credentials.wallet_address,signature_type=1)
     from lp_v2.live_control.identity import same_identity
     if not same_identity(identity,profile['identity']):raise ValueError('full frozen identity differs')

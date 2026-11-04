@@ -149,7 +149,7 @@ def test_live_factory_uses_pinned_sdk_and_frozen_identity(tmp_path,monkeypatch):
     args,_=live_args(tmp_path)
     args[args.index('--market')+1]=market_id
     relay=tmp_path/'relayer.json'
-    relay.write_text(json.dumps(dict(key='synthetic-relayer',address=SIGNER)))
+    relay.write_text(json.dumps(dict(key='synthetic-relayer',address=json.loads((tmp_path/'l2.json').read_text())['signer_address'])))
     relay.chmod(0o600)
     args+=['--relayer-credentials-file',str(relay)]
     config=replace(parse_run(args),started_at=AT)
@@ -470,3 +470,57 @@ def test_live_factory_accepts_absent_in_play(tmp_path,monkeypatch,case):
     else:
         with pytest.raises(MarketCheckFailure):create_live_runner(config,public=public,http=http)
         assert created==[] and not (Path(config.state_dir)/'journal.sqlite').exists()
+
+
+def test_live_factory_selects_explicit_builder_credentials(tmp_path,monkeypatch,capsys):
+    from types import SimpleNamespace
+    import httpx
+    from polymarket import SecureClient
+    from polymarket.auth import BuilderApiKey,RelayerApiKey
+    from lp_v2.live_runtime import create_live_runner
+    from tests.test_readonly_sdk import external_sdk,market_wire,CID as market_id
+    from tests.fakes.live_exchange import Exchange
+    args,_=live_args(tmp_path)
+    args[args.index('--market')+1]=market_id
+    relay=tmp_path/'relayer.json';relay.touch(mode=0o600)
+    args+=['--relayer-credentials-file',str(relay)]
+    config=replace(parse_run(args),started_at=AT)
+    signer=config.credentials.signer_address
+    builder=dict(kind='builder',key='builder-sentinel',secret='c3ludGhldGljLXNlY3JldA==',passphrase='phrase-sentinel',address=signer)
+    seen=[]
+    def create(**kw):
+        seen.append(kw)
+        ex=Exchange();ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=config.credentials.wallet_address;ex.sdk.signer=signer
+        object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+        return ex.sdk
+    monkeypatch.setattr(SecureClient,'create',create)
+    for n,payload in enumerate([builder,dict(key='legacy-key',address=signer),dict(builder,address=signer.lower(),secret=builder['secret'].rstrip('='))]):
+        relay.write_text(json.dumps(payload))
+        state=tmp_path/f'valid-{n}';state.mkdir(mode=0o700)
+        public,_=external_sdk([market_wire()])
+        http=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'in_play':False})))
+        runner=create_live_runner(replace(config,state_dir=str(state)),public=public,http=http)
+        key=seen[-1]['api_key']
+        assert type(key) is (BuilderApiKey if n!=1 else RelayerApiKey)
+        assert key.key==payload['key']
+        if n!=1:assert (key.secret,key.passphrase)==(payload['secret'],'phrase-sentinel')
+        else:assert str(key.address).lower()==signer.lower()
+        assert seen[-1]['wallet']==config.credentials.wallet_address
+        runner.sdk.close();runner.observations.close()
+    assert len(seen)==3
+    invalid=[{},None,[],dict(builder,extra='x'),dict(builder,kind='auto'),dict(builder,address='0x1234'),
+             dict(builder,address='0x'+'9'*40),dict(builder,key=True),dict(builder,secret=None),
+             dict(builder,secret='!invalid!'),dict(builder,secret='a'),dict(builder,secret='===='),
+             dict(builder,passphrase=' \t'),dict(builder,key='bad\rheader'),dict(builder,passphrase='bad\x00header'),
+             dict(builder,secret='é'),dict(key='legacy-key',address='0x'+'9'*40),dict(key='',address=signer)]
+    invalid += [{k:v for k,v in builder.items() if k!=missing} for missing in builder]
+    for payload in invalid:
+        relay.write_text(json.dumps(payload))
+        state=tmp_path/'rejected'
+        public,_=external_sdk([market_wire()])
+        http=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'in_play':False})))
+        with pytest.raises(ValueError,match='^invalid relayer credentials$') as error:
+            create_live_runner(replace(config,state_dir=str(state)),public=public,http=http)
+        assert 'sentinel' not in str(error.value)
+        assert not state.exists() and len(seen)==3
+    assert 'sentinel' not in str(capsys.readouterr())

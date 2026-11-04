@@ -304,3 +304,64 @@ def test_fixed_market_accepts_false_or_absent_in_play(monkeypatch,case):
         assert 'SECRET_SENTINEL' not in repr(row)
         assert seen and gets and all(method=='GET' for method,url in gets)
     finally:sdk.close()
+
+
+def test_builder_readiness_uses_signed_get_without_merge(monkeypatch,caplog):
+    import base64,hashlib,hmac,time,json
+    from eth_account import Account
+    from polymarket.environments import PRODUCTION
+    from polymarket._internal.wallet import derive_proxy_wallet_address
+    from lp_v2.readonly_sdk import ReadOnlySDK,L2Credentials
+    signer=Account.from_key(bytes([7])*32).address
+    wallet=derive_proxy_wallet_address(signer,PRODUCTION.wallet_derivation)
+    identity=dict(signer_address=signer,wallet_address=wallet,signature_type=1)
+    creds=L2Credentials(key='l2-key',secret='c2VjcmV0',passphrase='l2-phrase',**identity)
+    builder=dict(kind='builder',key='builder-sentinel',secret='c3ludGhldGljLXNlY3JldA==',passphrase='phrase-sentinel',address=signer)
+    monkeypatch.setattr(time,'time',lambda:1700000000.75)
+    seen=[];scenario={}
+    def http(request):
+        seen.append(request)
+        assert request.method=='GET'
+        path=request.url.path
+        assert path in ('/balance-allowance','/auth/ban-status/closed-only','/data/orders','/api/geoblock','/transactions')
+        if path=='/transactions':
+            assert str(request.url)=='https://relayer-v2.polymarket.com/transactions'
+            if scenario.get('legacy'):
+                assert request.headers['RELAYER_API_KEY']=='legacy-key'
+                assert request.headers['RELAYER_API_KEY_ADDRESS'].lower()==signer.lower()
+                assert not any(k.startswith('poly_builder') for k in request.headers)
+            else:
+                expected=base64.urlsafe_b64encode(hmac.new(b'synthetic-secret',b'1700000000GET/transactions',hashlib.sha256).digest()).decode()
+                assert {k:v for k,v in request.headers.items() if k.startswith('poly_builder')}=={
+                    'poly_builder_api_key':'builder-sentinel','poly_builder_passphrase':'phrase-sentinel',
+                    'poly_builder_timestamp':'1700000000','poly_builder_signature':expected}
+                assert 'RELAYER_API_KEY' not in request.headers
+            return httpx.Response(scenario.get('status',200),json=scenario.get('rows',[{'owner':signer}]))
+        data={'/balance-allowance':dict(balance='200000000',allowances={PRODUCTION.standard_exchange:'200000000',PRODUCTION.neg_risk_exchange:'200000000'}),
+              '/auth/ban-status/closed-only':dict(closed_only=False),'/data/orders':dict(data=[],next_cursor='LTE='),'/api/geoblock':dict(blocked=False,country='US')}
+        return httpx.Response(200,json=data[path])
+    public,_=external_sdk()
+    sdk=ReadOnlySDK(public=public,http=httpx.Client(transport=httpx.MockTransport(http)),credentials=creds)
+    def check(payload):return sdk.read_account_readiness(AT,capital_usdc=D('100'),identity=identity,relayer=payload)
+    try:
+        good=check(builder)
+        assert good['relayer_auth']['status']=='PASS'
+        assert good['relayer_auth']['reason']=='AUTHENTICATED_GET_ONLY'
+        assert good['relayer_merge']['status']=='UNKNOWN' and good['relayer_merge']['reason']=='AUTH_DOES_NOT_PROVE_MERGE_READINESS'
+        for status,rows,expected in [(401,[], 'FAIL'),(403,[],'FAIL'),(500,[],'UNKNOWN'),(200,{},'UNKNOWN'),(200,[{'owner':signer},{'owner':'0x'+'9'*40}],'UNKNOWN'),(200,[{}],'UNKNOWN')]:
+            scenario.update(status=status,rows=rows);before=len([r for r in seen if r.url.path=='/transactions'])
+            result=check(builder)
+            assert result['relayer_auth']['status']==expected
+            assert result['relayer_merge']['status']=='UNKNOWN'
+            assert len([r for r in seen if r.url.path=='/transactions'])==before+1
+        scenario.clear()
+        for payload in ({},dict(builder,extra='x'),dict(builder,secret='!'),dict(builder,address=False),dict(builder,kind='auto'),dict(builder,key='bad\nheader')):
+            before=len([r for r in seen if r.url.path=='/transactions'])
+            result=check(payload)
+            assert result['relayer_auth']['status']=='FAIL'
+            assert len([r for r in seen if r.url.path=='/transactions'])==before
+            assert 'sentinel' not in json.dumps(result)
+        scenario['legacy']=True
+        assert check(dict(key='legacy-key',address=signer))['relayer_auth']['status']=='PASS'
+        assert 'sentinel' not in caplog.text
+    finally:sdk.close()

@@ -252,6 +252,19 @@ preparation also repeats the handoff proofs under that lock before writing run.e
 Authenticated L2 GETs prove balance, explicit spender allowances, closed-only
 state and order observations independently. Authenticated relayer `/transactions`
 GET proves key authentication only; public `/deployed` cannot substitute for it.
+The protected relayer file accepts exactly legacy `{key,address}` or Builder
+`{kind,key,secret,passphrase,address}` with `kind="builder"`. Both bind the complete
+valid signer address, ignoring hex case. Builder strings must be nonblank, contain
+no CR/LF/NUL, and the secret must decode nonempty standard or URL-safe base64
+(optional padding). Unknown, missing, extra or mixed fields refuse safely.
+The same parser constructs the pinned SDK key for the live factory and validates
+protected invocation snapshots; snapshots retain metadata and public identity only.
+Builder check signs exactly `GET /transactions` with no body using SDK 0.2.0
+`POLY_BUILDER_*` headers; legacy retains `RELAYER_API_KEY` and
+`RELAYER_API_KEY_ADDRESS`. A 401/403 is FAIL without fallback; server errors,
+malformed rows or any foreign owner remain UNKNOWN. Neither headers nor transaction
+history appear in reports. Profile v1 still contains only file references;
+credential migration and state recovery are separate operator work.
 Required pre-start Proxy configuration is a separate concrete fact: signature
 type 1, complete signer/derived Proxy identity, the pinned SDK and supported
 production chain/relayer/wallet-derivation configuration must agree. This proof

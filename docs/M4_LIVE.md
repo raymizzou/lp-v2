@@ -57,7 +57,13 @@ Git、stdout 或 journal：
 | --- | --- |
 | `/etc/lp-v2/signing-key` | 仅该钱包的签名私钥文本，独立于 L2 文件 |
 | `/etc/lp-v2/credentials.json` | 既有 L2 `key`、`secret`、`passphrase`、`signer_address`、`wallet_address`、`signature_type` |
-| `/etc/lp-v2/relayer.json` | 既有 Relayer API 的 `key` 与 `address`，供 SDK Proxy 免 gas merge 使用 |
+| `/etc/lp-v2/relayer.json` | 既有 legacy `{key,address}` 或显式 Builder `{kind,key,secret,passphrase,address}`，供 SDK Proxy 免 gas merge 使用 |
+
+Builder 文件的 `kind` 必须为 `builder`，`address` 必须是与签名文件一致的完整
+20 字节 signer 地址（十六进制大小写可不同）。`secret` 为 SDK 支持的标准或 URL-safe
+base64，可省略 padding；所有字符串必须非空且不能含 CR/LF/NUL，拒绝未知或额外字段。
+legacy 文件仍严格只含 `key`、`address`。检查、实际 SDK 工厂和启动文件连续性证明
+使用同一解析规则；不根据 401 猜测格式、回退认证或创建凭据。
 
 L2 凭据不能替代 Relayer 凭据。模板只留路径，不创建、分发或申请任何凭据。
 真实凭据的准备与投放另需授权。

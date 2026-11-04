@@ -827,3 +827,63 @@ def test_live_on_accepts_absent_in_play(combined_world,monkeypatch,capsys,case):
     assert world.readonly and world.lease is None and seen
     assert all(path.read_bytes()==data for path,data in credentials.items())
     assert 'SECRET_SENTINEL' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('mode',['builder','legacy'])
+def test_check_and_start_bind_same_builder_credential(combined_world,monkeypatch,capsys,mode):
+    from lp_v2.cli import main
+    world=combined_world;profile=world.profile
+    path=Path(profile['files']['relayer_credentials'])
+    payload=dict(key='SECRET_RELAYER',address=profile['identity']['signer_address'])
+    if mode=='builder':payload.update(kind='builder',secret='c3ludGhldGljLXNlY3JldA',passphrase='SECRET_PHRASE')
+    path.write_text(json.dumps(payload))
+    credentials={Path(profile['files'][k]):(Path(profile['files'][k]).read_bytes(),Path(profile['files'][k]).stat().st_uid) for k in ('signing_key','l2_credentials','relayer_credentials')}
+    monkeypatch.setattr('builtins.input',lambda _:'on')
+    assert main(['live','check'])==0
+    checked=json.loads(capsys.readouterr().out)
+    assert checked['checks']['relayer_auth']['status']=='PASS'
+    # Malformed explicit schemas/unsafe headers and unprotected files never start.
+    bads=[dict(payload,address='0x'+'9'*40),dict(payload,key=False),dict(payload,unexpected='x'),dict(payload,key='SECRET\nHEADER')]
+    for bad in bads:
+        path.write_text(json.dumps(bad))
+        assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
+        assert 'SECRET' not in capsys.readouterr().out
+        assert world.mutations==[]
+    path.write_text(json.dumps(payload));path.chmod(0o644)
+    assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
+    capsys.readouterr();assert world.mutations==[]
+    path.chmod(0o600)
+    assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==0
+    started=json.loads(capsys.readouterr().out.splitlines()[-1])
+    assert started['status']=='PASS' and started['verified_rounds']==2
+    run_id=started['run_id']
+    assert world.mutations.count(('start','lp-v2-live.service'))==1
+    request=dict(schema_version=1,action='observe',profile=profile,run_id=run_id)
+    code,raw=world.invoke(request)
+    assert json.loads(raw)['executor_running'] is True
+    # Full identity and metadata continuity are both binding, including restored bytes.
+    l2=Path(profile['files']['l2_credentials']);original=l2.read_bytes()
+    changed=json.loads(original);changed['wallet_address']='0x'+'9'*36+profile['identity']['wallet_address'][-4:]
+    l2.write_text(json.dumps(changed))
+    code,raw=world.invoke(request);assert json.loads(raw).get('executor_running') is not True
+    l2.write_bytes(original)
+    code,raw=world.invoke(request);assert json.loads(raw).get('executor_running') is not True
+    before=path.read_bytes();path.write_bytes(before)
+    code,raw=world.invoke(request);assert json.loads(raw).get('executor_running') is not True
+    count=len(world.mutations);world.process_identity_valid=False
+    code,raw=world.invoke(dict(schema_version=1,action='off',profile=profile,run_id=run_id,action_id='e'*32))
+    assert code==2 and len(world.mutations)==count
+    world.process_identity_valid=True
+    world.http_overrides['/markets/'+profile['trading']['market_condition_id']]=(200,{'in_play':True})
+    assert main(['live','off'])==0
+    stopped=json.loads(capsys.readouterr().out)
+    assert stopped['drain']=='PASS' and stopped['readonly_restored'] is True
+    count=len(world.mutations)
+    assert main(['live','off'])==0
+    capsys.readouterr();assert len(world.mutations)==count
+    assert all(p.read_bytes()==data and p.stat().st_uid==uid for p,(data,uid) in credentials.items())
+    assert 'SECRET' not in json.dumps(started)+json.dumps(stopped)+raw
+    relayer=[r for r in world.http_requests if r.url.path=='/transactions']
+    assert relayer and all(r.method=='GET' for r in world.http_requests)
+    assert ('POLY_BUILDER_API_KEY' in relayer[0].headers)==(mode=='builder')
+    assert not any(r.url.path=='/deployed' for r in world.http_requests)

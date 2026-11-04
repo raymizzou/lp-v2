@@ -311,7 +311,7 @@ def create_live_runner(config, *, public=None, http=None):
     import json
     from pathlib import Path
     from polymarket import SecureClient
-    from polymarket.auth import RelayerApiKey
+    from lp_v2.relayer_credentials import parse_relayer_credentials
     from polymarket.models.clob.api_key import ApiKeyCreds
     from lp_v2.cli import owner_file
     from lp_v2.journal import Journal
@@ -342,7 +342,10 @@ def create_live_runner(config, *, public=None, http=None):
             raise MarketCheckFailure(config.market) from None
         tokens=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
         with owner_file(config.relayer_credentials_file) as source:
-            relayer_key=RelayerApiKey(**json.load(source))
+            try:
+                relayer_key=parse_relayer_credentials(json.load(source),signer)
+            except (ValueError,TypeError):
+                raise ValueError('invalid relayer credentials') from None
         client=SecureClient.create(private_key=key,wallet=c.wallet_address,
             credentials=ApiKeyCreds(key=c.key,secret=c.secret,passphrase=c.passphrase),api_key=relayer_key)
         key=None
