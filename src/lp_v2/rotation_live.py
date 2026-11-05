@@ -30,6 +30,9 @@ class RotationRunner:
             historical_identities = validate_histories(config.state_dir,current.sdk.owner)
             self.phase, self.reason = 'running', 'initial_market'
             self.switch_count = 0
+            self.entered_count = 0
+            self.blocker = None
+            self._clearance_blocker = None
             self._lock = Lock()
             self.exit_code = None
             identity = dict(owner=current.sdk.owner,wallet=current.sdk.wallet,signer=current.sdk.signer,
@@ -53,6 +56,8 @@ class RotationRunner:
                     self.current = self._runner_for_market(cid,tuple(active_identity['token_ids']))
                 self.phase, self.reason = last['phase'], last['reason']
                 self.switch_count = sum(record['phase'] == 'exiting' for _,record in events)
+                self.entered_count = sum(record['phase'] == 'running' and record['reason'] == 'entry_verified'
+                                         for _,record in events)
             else:
                 if action_id is not None and window_end is not None:
                     current.sdk.bind_entry(action_id=action_id,window_end=window_end,activation_id=action_id+':initial')
@@ -101,12 +106,17 @@ class RotationRunner:
         scan = self.scanner.latest()
         ranking = self._ranking(scan)
         report = self.current.snapshot()
+        stuck_minutes = None
+        if self.phase == 'exiting' and self.blocker is not None:
+            seconds = ((now or self.clock()) - self.blocker['since']).total_seconds()
+            if seconds >= 900:
+                stuck_minutes = seconds / 60
         rotation = dict(current=self.current.condition_id if self.phase in ('running','exiting') else None, candidate=ranking.leader.condition_id if ranking.leader else None,
-            phase=self.phase, reason=self.reason, score_version=SCORE_VERSION,
+            phase=self.phase, reason=self.reason, blocker=self.blocker, stuck_minutes=stuck_minutes, score_version=SCORE_VERSION,
             candidates=[dict(condition_id=c.condition_id,score=c.score,executable=c.reason is None,reason=c.reason)
                         for c in ranking.candidates],
             score_at=scan.scan['finished_at'] if scan else None, scan=scan.scan if scan else {},
-            switch_count=self.switch_count,cancel_count=sum(len(r.sdk.journal.events('cancel_intent')) for r in self._runners.values()))
+            switch_count=self.switch_count,entered_count=self.entered_count,cancel_count=sum(len(r.sdk.journal.events('cancel_intent')) for r in self._runners.values()))
         report['rotation'] = build_summary(self.config, self.current.ledger.snapshot().capital, rotation=rotation)['rotation']
         return report
 
@@ -170,6 +180,12 @@ class RotationRunner:
                     if not self.stop.is_set():
                         self.current.stop.clear()
                         self.current.exit_code = None
+        detail = self._clearance_blocker if self.phase == 'exiting' else self.current.blocker
+        if detail:
+            since = self.blocker['since'] if self.blocker and self.blocker['code'] == detail['code'] else now
+            self.blocker = dict(detail, since=since)
+        else:
+            self.blocker = None
         with self._lock:
             self._snapshot = self._build(now)
         return self.snapshot()
@@ -180,6 +196,10 @@ class RotationRunner:
         runner = runner or self.current
         sdk, ledger = runner.sdk, runner.ledger
         readback = False
+        self._clearance_blocker = None
+        def blocked(reason, code, *, order_id=None, detail=None):
+            self._clearance_blocker = detail or dict(code=code, order_tail=order_id[-8:] if order_id else None)
+            return reason
         try:
             with sdk.read_cycle(now=now):
                 runner._reconcile()
@@ -189,37 +209,40 @@ class RotationRunner:
         except Exception:
             state = ledger.snapshot()
         if state.pending:
-            return 'waiting_pending'
+            return blocked('waiting_pending', 'pending_order', detail=sdk.readback_blocker)
         profile = dict(identity=dict(wallet_address=sdk.wallet), trading=dict(market_condition_id=sdk.condition_id))
         expected = {p['request'].merge_id for _, p in sdk.journal.events('merge_intent')}
         if (expected != {r.request.merge_id for r in state.merges}
                 or merge_history_report(profile, state.merges)['status'] != 'PASS'):
-            return 'waiting_merge'
+            return blocked('waiting_merge', 'merge_unverified')
+        failure_code = 'inventory_readback_unavailable'
         try:
             inventory = self.observations.read_conditional_inventory(now,sdk.condition_id)
             quantities = inventory['quantities']
             if (inventory['condition_id'] != sdk.condition_id or tuple(inventory['token_ids']) != sdk.token_ids
                     or set(quantities) != set(sdk.token_ids) or inventory['as_of'] != now.isoformat()
                     or any(not isinstance(q, Decimal) or not q.is_finite() or q < 0 for q in quantities.values())):
-                return 'waiting_readback'
+                return blocked('waiting_readback', 'inventory_readback_invalid')
             recorded = {t:sum((p.quantity for p in state.positions if p.token_id == t),Decimal('0')) for t in sdk.token_ids}
             if recorded != quantities:
-                return 'waiting_readback'
+                return blocked('waiting_readback', 'inventory_mismatch')
             if any(quantities.values()):
-                return 'waiting_inventory'
-            if any(not o.authoritative or o.status == OrderStatus.LIVE for o in state.orders):
-                return 'waiting_orders'
+                return blocked('waiting_inventory', 'inventory_remaining', detail=sdk.readback_blocker)
+            uncertain = next((o for o in state.orders if not o.authoritative or o.status == OrderStatus.LIVE), None)
+            if uncertain is not None:
+                return blocked('waiting_orders', 'orders_unverified', order_id=uncertain.order_id, detail=sdk.readback_blocker)
             if not readback:
-                return 'waiting_readback'
+                return blocked('waiting_readback', 'reconciliation_unavailable', detail=sdk.readback_blocker)
             owned = set(sdk.known_order_ids())
+            failure_code = 'open_orders_unavailable'
             for page in sdk.client.list_open_orders():
                 for order in page.items:
                     if not isinstance(order.id, str) or not order.id:
-                        return 'waiting_readback'
+                        return blocked('waiting_readback', 'open_orders_invalid')
                     if order.id in owned:
-                        return 'waiting_orders'
+                        return blocked('waiting_orders', 'orders_remaining', order_id=order.id)
         except Exception:
-            return 'waiting_readback'
+            return blocked('waiting_readback', failure_code)
         return None
 
     def _transition(self, phase, reason, old, new, *, result='PASS', scan=None):
@@ -230,6 +253,8 @@ class RotationRunner:
             scan_finished_at=scan.scan['finished_at'] if scan else None,
             action_id=self.action_id,window_end=self.window_end,phase=phase,result=result,at=self.clock()))
         self.phase, self.reason = phase, reason
+        if phase == 'running' and reason == 'entry_verified':
+            self.entered_count += 1
 
     def _historical_clearance_reason(self, now):
         for historical in self._runners.values():

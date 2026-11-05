@@ -166,7 +166,7 @@ def test_live_factory_uses_pinned_sdk_and_frozen_identity(tmp_path,monkeypatch):
     (tmp_path/'state').mkdir(mode=0o700)
     ex=Exchange()
     ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=config.credentials.wallet_address;ex.sdk.signer=config.credentials.signer_address
-    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None,secure_clob=ex.sdk._ctx.secure_clob))
     seen=[]
     def create(**kwargs):
         seen.append(kwargs)
@@ -459,7 +459,7 @@ def test_live_factory_accepts_absent_in_play(tmp_path,monkeypatch,case):
     from pathlib import Path
     Path(config.state_dir).mkdir(mode=0o700)
     ex=Exchange();ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=config.credentials.wallet_address;ex.sdk.signer=config.credentials.signer_address
-    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None,secure_clob=ex.sdk._ctx.secure_clob))
     created=[]
     def create(**kwargs):
         created.append(kwargs)
@@ -503,7 +503,7 @@ def test_live_factory_selects_explicit_builder_credentials(tmp_path,monkeypatch,
     def create(**kw):
         seen.append(kw)
         ex=Exchange();ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=config.credentials.wallet_address;ex.sdk.signer=signer
-        object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+        object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None,secure_clob=ex.sdk._ctx.secure_clob))
         return ex.sdk
     monkeypatch.setattr(SecureClient,'create',create)
     for n,payload in enumerate([builder,dict(key='legacy-key',address=signer),dict(builder,address=signer.lower(),secret=builder['secret'].rstrip('='))]):
@@ -618,7 +618,7 @@ def test_factory_accepts_book_created_during_preflight(tmp_path,monkeypatch,case
     relay.write_text(json.dumps(dict(key='synthetic-relayer',address=config.credentials.signer_address)));relay.chmod(0o600)
     config=replace(config,started_at=AT,relayer_credentials_file=str(relay))
     ex=Exchange(condition_id=CID);ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=config.credentials.wallet_address;ex.sdk.signer=config.credentials.signer_address
-    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None,secure_clob=ex.sdk._ctx.secure_clob))
     created=[]
     def create(**kw):
         created.append(kw)

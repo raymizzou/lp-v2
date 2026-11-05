@@ -736,3 +736,37 @@ def test_live_rejects_clock_rollback_after_market_completion(tmp_path,monkeypatc
             assert report['markets'][0]['eligible'] is False
         assert all('observation_completed_at' not in row for row in report['markets'])
     finally:live.close();observations.close();public.close()
+
+
+@pytest.mark.parametrize('guard', ['expired_absent', 'still_open', 'unexpired', 'incomplete', 'no_cancel'])
+def test_expired_absent_cancel_does_not_spin(tmp_path, guard):
+    runner, ex, sdk, journal, obs = world(tmp_path)
+    step_at(runner, AT)
+    if guard != 'no_cancel':
+        for oid in sdk.known_order_ids():
+            sdk.cancel_order(oid, at=AT)
+    if guard != 'still_open':
+        ex.orders.clear()
+    else:
+        for oid, order in tuple(ex.orders.items()):
+            ex.orders[oid] = order.model_copy(update={'status': 'LIVE'})
+    if guard == 'incomplete':
+        ex.sdk.list_open_orders.side_effect = TimeoutError('synthetic secret')
+    ex.sdk.get_order.side_effect = TimeoutError('synthetic secret')
+    ex.cancel_unknown = True
+    start = AT + timedelta(seconds=10 if guard == 'unexpired' else 3720)
+    before = len(journal.events('cancel_intent'))
+    for seconds in range(0, 601, 10):
+        ex.now = start + timedelta(seconds=seconds)
+        runner.step(ex.now)
+    delta = len(journal.events('cancel_intent')) - before
+    if guard in ('expired_absent', 'no_cancel'):
+        for oid in sdk.known_order_ids():
+            assert sum(p['order_id'] == oid for _, p in journal.events('cancel_intent')[before:]) <= 1
+    else:
+        assert delta > 1
+    assert not sdk.orders_verified()
+    assert len(ex.posts) == 2
+    assert runner.ledger.snapshot().capital.total == D('10')
+    if guard == 'no_cancel':
+        assert delta == 2
