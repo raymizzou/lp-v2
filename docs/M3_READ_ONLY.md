@@ -26,8 +26,14 @@ responses remain unknown/excluded; they cannot establish an absent key. Internal
 unknown market state still prevents proposals, and all other eligibility checks
 remain independent. No live endpoint validation is claimed in this batch.
 Fee-enabled markets are excluded until their executable maker fee inputs/model
-are verified; no zero fee is inferred from absent fee data. Missing region
-proof also prevents proposals. These conservative exclusions may yield no
+are verified; no zero fee is inferred from absent fee data. Explicit region
+`ok` or `blocked` permits read-only observation and simulated proposals. For
+example, a Japan observation returning `blocked` remains visible as `blocked`
+in `/healthz`, `/summary` and the dashboard; it is never rewritten to `ok`.
+This permits only read-only planning and grants no trading or mutation access.
+UNKNOWN, an invalid region value, or a failed region read clears proposals and
+simulated reserves. Recovery computes a fresh proposal rather than replaying
+one cleared during uncertainty. These conservative exclusions may yield no
 proposals on live data, and are visible rather than hidden.
 
 Decisions run on ten-second boundaries, score snapshots/ranking on ten-minute
@@ -138,8 +144,12 @@ Before any future approved deployment:
 - The script fetches only its dedicated repo, verifies main ancestry, archives
   the exact commit into a new release, installs a venv, records completion,
   atomically switches `current`, restarts only `lp-v2.service`, and checks exact
-  SHA/capital/wallet tail/region. Health failure returns nonzero. A partial
-  installation is retained for diagnosis and cannot be used as a release.
+  SHA/capital/wallet tail/region. Health acceptance requires status `ok`, the
+  exact SHA, approved capital and wallet tail, and explicit region `ok` or
+  `blocked`; UNKNOWN, missing or invalid region still fails. Thus a known Japan
+  `blocked` observation alone does not fail read-only deployment health.
+  Health failure returns nonzero. A partial installation is retained for
+  diagnosis and cannot be used as a release.
 - CI success and `/healthz` identity do not prove 24-hour acceptance or grant
   deployment authority. Capture startup-to-health elapsed time; the five-minute
   operational target has not been demonstrated on a real host.

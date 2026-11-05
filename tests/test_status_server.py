@@ -273,3 +273,43 @@ def test_health_identity_available_during_catalog_read():
         release.set();watchdog.cancel();watchdog.join();thread.join(2)
     assert not thread.is_alive() and not errors
     assert request(handler)[2]['freshness']['decision_as_of']==AT.isoformat()
+
+
+def test_blocked_region_remains_visible_in_health_and_summary():
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from lp_v2.status_server import make_handler
+    from tests.test_readonly_runtime import BlockedRegionReads
+    from tests.test_readonly_sdk import step_at
+
+    class ObservedReads(BlockedRegionReads):
+        def read_orders(self, now):
+            self.calls.append(('orders', now))
+            return super().read_orders(now)
+
+        def wallet_tail(self):
+            self.calls.append(('wallet_tail', None))
+            return super().wallet_tail()
+
+        def transport_safety(self):
+            self.calls.append(('transport_safety', None))
+            return super().transport_safety()
+
+        def safety(self, since):
+            self.calls.append(('safety', since))
+            return super().safety(since)
+
+    sdk = ObservedReads()
+    runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk, code_sha='abc1234')
+    step_at(runner, AT)
+    calls = list(sdk.calls)
+    handler = make_handler(runner.config, runner)
+    status, _, health = request(handler, path='/healthz')
+    assert status == 200
+    assert health == dict(version='0.1.0', status='ok', code_sha='abc1234',
+                          capital_usdc='100', wallet_tail='a3F9', region_check='blocked')
+    status, _, summary = request(handler, path='/summary')
+    assert status == 200
+    assert summary['mode'] == 'read_only'
+    assert summary['run']['region_check'] == 'blocked'
+    assert summary == runner.snapshot()
+    assert sdk.calls == calls

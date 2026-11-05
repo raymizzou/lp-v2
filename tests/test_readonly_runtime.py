@@ -165,6 +165,72 @@ def test_excluded_market_keeps_known_score_and_reason():
     sdk.close()
 
 
+class BlockedRegionReads(ScriptedReads):
+    region = 'blocked'
+
+    def read_region(self):
+        self.calls.append(('region', None))
+        if isinstance(self.region, Exception):
+            raise self.region
+        return self.region
+
+    def read_markets(self, now):
+        rows = super().read_markets(now)
+        if now > AT:
+            p = rows[0]['plan']
+            rows[0]['plan'] = replace(
+                p, books=(replace(p.books[0], best_bid=D('0.45'), best_ask=D('0.47')),
+                          p.books[1]))
+        return rows
+
+
+def test_blocked_region_keeps_readonly_proposals():
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    sdk = BlockedRegionReads()
+    runner = ReadOnlyRunner(RunConfig(D('100'), AT), sdk)
+    proposal = dict(yes=dict(price='0.46', quantity='10'),
+                    no=dict(price='0.51', quantity='10'),
+                    pair_cost='0.97', safety_margin='0.03', reserved_usdc='10')
+    for seconds in (0, 10, 60):
+        d = step_at(runner, AT + timedelta(seconds=seconds))
+        expected = proposal if seconds < 60 else dict(
+            yes=dict(price='0.45', quantity='10'), no=dict(price='0.51', quantity='10'),
+            pair_cost='0.96', safety_margin='0.04', reserved_usdc='10')
+        assert d['markets'][0]['proposed'] == expected
+        assert d['run']['region_check'] == 'blocked'
+        assert d['mode'] == 'read_only' and d['capital']['proposed_reserve'] == '10'
+        assert all(d['capital'][key] == '0' for key in (
+            'inventory_cost', 'open_buys', 'pending_requests',
+            'hedge_reserve', 'fee_reserve', 'total'))
+        assert d['safety'] == dict(orders_sent=0, cancels_sent=0, since=AT.isoformat())
+
+
+def test_unknown_region_clears_proposals_without_replay():
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    sdk = BlockedRegionReads()
+    runner = ReadOnlyRunner(RunConfig(D('100'), AT), sdk)
+    first = step_at(runner, AT)
+    assert first['markets'][0]['proposed']['yes'] == dict(price='0.46', quantity='10')
+    for seconds, region in ((10, 'UNKNOWN'), (20, 'invalid'),
+                            (30, RuntimeError('region unavailable')), (40, 'blocked')):
+        sdk.region = region
+        d = step_at(runner, AT + timedelta(seconds=seconds))
+        assert d['run']['region_check'] == ('UNKNOWN' if isinstance(region, Exception) else region)
+        if seconds < 40:
+            assert all(row['proposed'] is None for row in d['markets'])
+            assert d['capital']['proposed_reserve'] == '0'
+        else:
+            assert d['markets'][0]['proposed'] == dict(
+                yes=dict(price='0.45', quantity='10'), no=dict(price='0.51', quantity='10'),
+                pair_cost='0.96', safety_margin='0.04', reserved_usdc='10')
+            assert d['capital']['proposed_reserve'] == '10'
+        assert d['mode'] == 'read_only'
+        assert all(d['capital'][key] == '0' for key in (
+            'inventory_cost', 'open_buys', 'pending_requests',
+            'hedge_reserve', 'fee_reserve', 'total'))
+        assert d['safety'] == dict(orders_sent=0, cancels_sent=0, since=AT.isoformat())
+
+
 def test_readonly_decision_uses_completed_market_time(monkeypatch):
     import httpx
     from polymarket import PublicClient
