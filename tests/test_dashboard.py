@@ -61,3 +61,20 @@ def test_served_dashboard_csp_allows_same_origin_assets():
         for name in ('object-src','base-uri','form-action'):
             assert directives.get(name)==["'none'"],(name,policy)
     assert request(handler,path='/dashboard.js')[0]==200
+
+
+def test_live_income_fourteen_columns():
+    from lp_v2.status_server import make_handler
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),ScriptedReads())
+    handler=make_handler(runner.config,runner)
+    html=request(handler,path='/dashboard')[2].decode()
+    js=request(handler,path='/dashboard.js')[2].decode()
+    payload=runner.step(AT)
+    payload['mode']='live';payload['safety']['orders_sent']=2
+    payload['markets'][0]['title']='<img src=x onerror=alert(1)>'
+    payload['markets'][0]['m4']=dict(lp_yield_pct_per_day='10',reward_today='2',rebate_today='1',reward_share='25',
+        paired_profit='0.20',unpaired_inventory='4',net_yield_pct_per_day='15',net_profit='3.00')
+    result=subprocess.run(['node',str(Path(__file__).with_name('dashboard_live_harness.cjs'))],
+        input=json.dumps(dict(html=html,js=js,payload=payload)),text=True,capture_output=True,timeout=15)
+    assert result.returncode==0,result.stdout+result.stderr

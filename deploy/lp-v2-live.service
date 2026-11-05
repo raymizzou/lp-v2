@@ -1,0 +1,28 @@
+# DRAFT. Installation, deployment and live operation each require explicit approval.
+[Unit]
+Description=lp-v2 fixed-market live executor (status 127.0.0.1:8765)
+After=network-online.target
+Wants=network-online.target
+Conflicts=lp-v2.service
+
+[Service]
+Type=simple
+User=lp-v2
+Group=lp-v2
+WorkingDirectory=/opt/lp-v2/current
+EnvironmentFile=/etc/lp-v2/run.env
+ExecStart=/opt/lp-v2/current/deploy/run-live
+ExecStop=/opt/lp-v2/current/.venv/bin/lp-v2 stop --state-dir /opt/lp-v2/state
+KillSignal=SIGTERM
+TimeoutStopSec=150
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/lp-v2/state
+
+[Install]
+WantedBy=multi-user.target

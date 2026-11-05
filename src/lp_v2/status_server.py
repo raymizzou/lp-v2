@@ -71,6 +71,8 @@ def make_handler(config: "RunConfig", ledger: Ledger) -> type[BaseHTTPRequestHan
 
 
 def serve(config: "RunConfig", *, runner=None) -> None:
+    if config.live:
+        return _serve_live(config,runner=runner)
     from threading import Thread, Event
     from lp_v2.readonly_runtime import ReadOnlyRunner
     if runner is None:
@@ -141,3 +143,33 @@ def build_summary(config, capital, *, as_of=None, run=None, freshness=None,
                                   ('get_attempts', 'rejected_non_get_attempts', 'status', 'monitor_started_at')},
                 capital={**{key: str(v) for key, v in asdict(capital).items()}, 'proposed_reserve': str(reserve)},
                 safety={key: value(safety.get(key)) for key in ('orders_sent', 'cancels_sent', 'since')}, markets=rows)
+
+
+def _serve_live(config, *, runner=None):
+    import signal
+    from threading import Thread
+    if runner is None:
+        from lp_v2.live_runtime import create_live_runner
+        runner = create_live_runner(config)
+    previous = {sig:signal.getsignal(sig) for sig in (signal.SIGTERM,signal.SIGINT)}
+    for sig in previous:
+        signal.signal(sig,lambda number,frame:runner.stop.set())
+    thread = Thread(target=runner.run,name='lp-v2-live')
+    try:
+        with HTTPServer(('127.0.0.1',8765),make_handler(config,runner)) as server:
+            server.timeout = 1
+            thread.start()
+            try:
+                while thread.is_alive() and not runner.stop.is_set():
+                    server.handle_request()
+            finally:
+                runner.stop.set()
+                thread.join()
+    finally:
+        if thread.ident is None:
+            runner.sdk.close()
+            if hasattr(runner.observations,'close'):
+                runner.observations.close()
+        for sig,handler in previous.items():
+            signal.signal(sig,handler)
+    return runner.exit_code if type(runner.exit_code) is int else 1

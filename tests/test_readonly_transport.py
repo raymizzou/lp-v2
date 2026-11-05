@@ -1,3 +1,4 @@
+from tests.test_readonly_sdk import clocked_sdk, read_at, step_at
 """Audit dispatch at real httpx transports, without socket networking."""
 from collections import Counter
 from datetime import UTC, datetime
@@ -68,7 +69,7 @@ def test_transport_counts_account_and_public_gets(monkeypatch):
             public = PublicClient() if injected else None
             http = httpx.Client() if injected else None
             before = datetime.now(UTC)
-            sdk = ReadOnlySDK(public=public, http=http, credentials=credentials())
+            sdk = clocked_sdk(public=public, http=http, credentials=credentials())
             after = datetime.now(UTC)
             try:
                 initial = sdk.transport_safety()
@@ -79,7 +80,7 @@ def test_transport_counts_account_and_public_gets(monkeypatch):
                 assert sdk.read_wallet(AT)['available_usdc'] == '182.4'
                 assert sdk.read_orders(AT)['legacy_order_count'] == 1
                 assert sdk.read_region() == 'ok'
-                assert sdk.read_markets(AT)[0]['plan'] is not None
+                assert read_at(sdk, 'read_markets', AT)[0]['plan'] is not None
                 assert Counter(r.url.path for r in seen) == {
                     '/balance-allowance': 1, '/data/orders': 1, '/api/geoblock': 1,
                     '/markets/keyset': 2, '/markets/' + CID: 1, '/book': 2}
@@ -90,7 +91,7 @@ def test_transport_counts_account_and_public_gets(monkeypatch):
                 assert all(r.method == 'GET' for r in seen)
                 assert sdk.safety(AT) == dict(orders_sent=0, cancels_sent=0, since=AT)
                 runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk)
-                runner.step(AT)
+                step_at(runner, AT)
                 summary = request(make_handler(runner.config, runner))[2]
                 assert summary['transport_safety'] == dict(
                     get_attempts=18, rejected_non_get_attempts=0, status='ok',
@@ -110,8 +111,8 @@ def test_transport_rejects_non_get_and_preserves_violation(monkeypatch):
     seen = []
     clients = install_external_transports(monkeypatch, seen)
     public, http = PublicClient(), httpx.Client()
-    sdk = ReadOnlySDK(public=public, http=http, credentials=credentials())
-    other = ReadOnlySDK(credentials=credentials())
+    sdk = clocked_sdk(public=public, http=http, credentials=credentials())
+    other = clocked_sdk(credentials=credentials())
     guarded_clients = clients[:5]
     try:
         attempts = 0
@@ -147,7 +148,7 @@ def test_transport_rejects_non_get_and_preserves_violation(monkeypatch):
         assert other.transport_safety()['status'] == 'ok'
         assert other.transport_safety()['get_attempts'] == other.transport_safety()['rejected_non_get_attempts'] == 0
         runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk)
-        runner.step(AT)
+        step_at(runner, AT)
         summary = request(make_handler(runner.config, runner))[2]
         assert summary['transport_safety']['status'] == 'violation'
         assert summary['transport_safety']['rejected_non_get_attempts'] == 72
@@ -170,7 +171,7 @@ def test_missing_transport_instrumentation_is_unknown_and_disables_reads(monkeyp
     # Simulate a future SDK shape that no longer exposes an auditable client.
     data_client = public._ctx.data._client
     public._ctx.data._client = object()
-    sdk = ReadOnlySDK(public=public, http=http, credentials=credentials())
+    sdk = clocked_sdk(public=public, http=http, credentials=credentials())
     try:
         assert sdk.transport_safety() == dict(
             get_attempts='UNKNOWN', rejected_non_get_attempts='UNKNOWN',
@@ -180,9 +181,9 @@ def test_missing_transport_instrumentation_is_unknown_and_disables_reads(monkeyp
         assert sdk.read_orders(AT) == dict(legacy_order_count='UNKNOWN', as_of=None)
         assert sdk.read_region() == 'UNKNOWN'
         with pytest.raises(RuntimeError, match='^read-only transport audit unavailable$'):
-            sdk.read_markets(AT)
+            read_at(sdk, 'read_markets', AT)
         runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk)
-        summary = runner.step(AT)
+        summary = step_at(runner, AT)
         assert summary['transport_safety']['status'] == 'UNKNOWN'
         assert summary['safety']['orders_sent'] == summary['safety']['cancels_sent'] == 'UNKNOWN'
         assert summary['markets'] == [] and seen == []
@@ -201,7 +202,7 @@ def test_failed_get_attempt_is_still_measured(monkeypatch):
         seen.append(req)
         raise httpx.ReadTimeout('synthetic-secret')
     http._transport = httpx.MockTransport(timeout)
-    sdk = ReadOnlySDK(http=http, credentials=credentials())
+    sdk = clocked_sdk(http=http, credentials=credentials())
     try:
         assert sdk.read_region() == 'UNKNOWN'
         assert len(seen) == sdk.transport_safety()['get_attempts'] == 1

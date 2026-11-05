@@ -15,9 +15,9 @@
 <body>
 <a class="skip" href="#dashboard">跳到看板</a>
 <main class="page">
-<header class="masthead"><div class="wordmark"><div class="mark" aria-hidden="true">lp</div><div><h1>lp_v2 看板</h1><p class="subtitle">独立观察页 · 东京只读试运行</p></div></div><div class="standalone"><strong id="source-label">实时只读 / 本地服务</strong><a href="?demo=1">离线演示四态</a></div></header>
+<header class="masthead"><div class="wordmark"><div class="mark" aria-hidden="true">lp</div><div><h1>lp_v2 看板</h1><p class="subtitle">独立观察页 · 本地状态</p></div></div><div class="standalone"><strong id="source-label">实时状态 / 本地服务</strong><a href="?demo=1">离线演示四态</a></div></header>
 <section class="switcher" id="demo-controls" hidden aria-label="Mock 场景"><div class="switcher-label"><strong>场景预览</strong><span class="muted">切换以检查数据异常时的表现</span></div><div class="switch-buttons" role="group" aria-label="四态切换器"><button type="button" data-state="normal" aria-pressed="true">正常</button><button type="button" data-state="wallet" aria-pressed="false">钱包读不到</button><button type="button" data-state="unreachable" aria-pressed="false">接口不可达</button><button type="button" data-state="stale" aria-pressed="false">数据过期</button></div></section>
-<section class="card" id="dashboard" aria-label="lp_v2 只读看板"></section>
+<section class="card" id="dashboard" aria-label="lp_v2 看板"></section>
 <section class="reference" aria-labelledby="reference-heading"><div><div class="eyebrow">Data contract</div><h2 id="reference-heading">缺字段 → UNKNOWN</h2><p>已知为零，显示 0。<br>未知或读取失败，明确留白为 UNKNOWN。</p></div><table class="reference-table"><thead><tr><th scope="col">情况</th><th scope="col">卡片表现</th></tr></thead><tbody><tr><td>lp_v2 不可达（整个接口失败）</td><td>显示「lp_v2 不可达」；数据全部 UNKNOWN，保留表结构</td></tr><tr><td>钱包余额读不到</td><td>钱包可用 UNKNOWN；真实占用和拟挂预留照常显示</td></tr><tr><td>某市场估分缺失</td><td>该行估分 UNKNOWN，状态「不挂：估分缺失」</td></tr><tr><td>M3 阶段的 m4 字段</td><td>第 8–14 列全为 UNKNOWN，灰底标「M4 起」</td></tr><tr><td>接口版本较新</td><td>提示「接口版本较新，部分字段未显示」；已认识的字段照常显示</td></tr><tr><td>数据过期</td><td>红色提示，数值保留；决策停滞时拟挂列变灰，估分过期独立标记</td></tr></tbody></table></section>
 <footer class="footer"><span>今日 = 北京时间 08:00 起（UTC 00:00）；缺数据显示 UNKNOWN，不显示 0。</span><span>schema 1 · 只读观察</span></footer>
 </main>

@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "name": "tokyo",
+  "revision": 1,
+  "target": {
+    "ssh_host": "synthetic-tokyo",
+    "host_key_sha256": "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  "release": {
+    "root": "/opt/lp-v2",
+    "expected_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "trading": {
+    "market_condition_id": "0x1111111111111111111111111111111111111111111111111111111111111111",
+    "capital_usdc": "100"
+  },
+  "identity": {
+    "wallet_address": "0x2222222222222222222222222222222222222222",
+    "signer_address": "0x3333333333333333333333333333333333333333",
+    "signature_type": 1
+  },
+  "files": {
+    "signing_key": "/etc/lp-v2/signing-key",
+    "l2_credentials": "/etc/lp-v2/credentials.json",
+    "relayer_credentials": "/etc/lp-v2/relayer.json",
+    "run_env": "/etc/lp-v2/run.env",
+    "state_dir": "/opt/lp-v2/state"
+  },
+  "services": {
+    "user": "lp-v2",
+    "readonly_unit": "lp-v2.service",
+    "live_unit": "lp-v2-live.service",
+    "status_port": 8765
+  },
+  "metadata": {
+    "updated_at": "2026-11-03T00:00:00+00:00",
+    "sources": {
+      "target.ssh_host": {
+        "source": "local.trusted_ssh_and_live_strict_handshake",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "target.host_key_sha256": {
+        "source": "local.trusted_ssh_and_live_strict_handshake",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "release.root": {
+        "source": "target.current_release_and_four_source_hashes",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "release.expected_sha": {
+        "source": "target.current_release_and_four_source_hashes",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "trading.market_condition_id": {
+        "source": "target.run_env",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "trading.capital_usdc": {
+        "source": "target.run_env",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "identity.wallet_address": {
+        "source": "target.l2_public_identity",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "identity.signer_address": {
+        "source": "target.l2_public_identity",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "identity.signature_type": {
+        "source": "target.l2_public_identity",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "files.signing_key": {
+        "source": "target.lstat_and_service_environment",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "files.l2_credentials": {
+        "source": "target.lstat_and_service_environment",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "files.relayer_credentials": {
+        "source": "target.lstat_and_service_environment",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "files.run_env": {
+        "source": "target.lstat_and_service_environment",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "files.state_dir": {
+        "source": "target.lstat_and_service_environment",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "services.user": {
+        "source": "target.systemd_show_and_hash_verified_status_server",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "services.readonly_unit": {
+        "source": "target.systemd_show_and_hash_verified_status_server",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "services.live_unit": {
+        "source": "target.systemd_show_and_hash_verified_status_server",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      },
+      "services.status_port": {
+        "source": "target.systemd_show_and_hash_verified_status_server",
+        "observed_at": "2026-11-03T00:00:00+00:00"
+      }
+    }
+  }
+}

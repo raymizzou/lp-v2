@@ -23,6 +23,7 @@ class ReadOnlyRunner:
         self.__rows = []
         self.__next = {}
         self.__scores = {}
+        self.__score_started_at = None
         self.__proposals = {}
         self.__engine = Engine(Ledger("lp-v2:simulation", config.capital_usdc))
         self.__wallet = {}
@@ -63,7 +64,8 @@ class ReadOnlyRunner:
                 self.__wallet_orders.update(legacy_order_count=count, as_of=now, last_success_at=now)
             except Exception:
                 self.__wallet_orders.update(legacy_order_count=UNKNOWN, as_of=None)
-        score_at = self.__freshness.get('scores_as_of')
+        score_at = self.__score_started_at
+        round_started = now
         score_due = score_at is None or (now - score_at).total_seconds() >= 600
         if not due('decision', 10):
             return self.snapshot()
@@ -79,6 +81,16 @@ class ReadOnlyRunner:
             with self.__lock:
                 self.__snapshot = self.__build(now)
             rows = self.sdk.read_markets(now)
+            completed = self.clock()
+            if (not isinstance(completed,datetime) or completed.tzinfo is None or completed.utcoffset() is None or completed < now):
+                raise ValueError('local observation clock unavailable or backward')
+            for row in rows:
+                if row.get('plan') is not None:
+                    observed = row.get('observation_completed_at')
+                    if (not isinstance(observed,datetime) or observed.tzinfo is None
+                            or observed.utcoffset() is None or not now <= observed <= completed):
+                        raise ValueError('market observation completion unavailable or discontinuous')
+            now = completed
         except Exception:
             self.__run['region_check'] = UNKNOWN
             for entry in self.__proposals.values():
@@ -102,6 +114,7 @@ class ReadOnlyRunner:
             self.__scores = scores
             if scores or not rows:
                 self.__freshness['scores_as_of'] = now
+                self.__score_started_at = round_started
         for row in rows:
             row['score'] = self.__scores.get(row['condition_id'], UNKNOWN)
         # A new simulation per round avoids carrying unexecuted pending orders

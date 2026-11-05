@@ -20,6 +20,8 @@ class ReadOnlyTransportAudit:
         self.__dispatched = Counter()
         self.__rejected = 0
         self.__ready = False
+        self.__fee_wires = {}
+        self.__public = public
         try:
             from polymarket import PublicClient
             from polymarket.clients._transport import SyncTransport
@@ -70,6 +72,40 @@ class ReadOnlyTransportAudit:
                 raise RuntimeError('read-only transport rejected non-GET')
             self.__dispatched[request.method] += 1
 
+    def record_response(self, request, response):
+        if request.url.path == '/markets/keyset' and response.status_code == 200:
+            response.read()
+            try:
+                rows = response.json()['markets']
+                self.__fee_wires = {str(r['conditionId']): {
+                    'feesEnabled': r.get('feesEnabled'), 'feeSchedule': r.get('feeSchedule')
+                } for r in rows}
+            except Exception:
+                self.__fee_wires = {}
+
+    def fee_wire(self, condition_id):
+        return self.__fee_wires.get(condition_id, {})
+
+    def fixed_market_wires(self, condition_id):
+        """Pinned SDK raw GET, retaining independent facts when typed parsing fails."""
+        self.require_ready()
+        rows, cursor, seen = [], None, set()
+        for _ in range(5):
+            params = dict(condition_ids=[condition_id], include_tag=True, limit=20)
+            if cursor is not None:
+                params['after_cursor'] = cursor
+            page = self.__public._ctx.gamma.get_json('/markets/keyset', params=params)
+            if not isinstance(page, dict) or not isinstance(page.get('markets'), list):
+                raise ValueError('public market unavailable')
+            rows.extend(page['markets'])
+            cursor = page.get('next_cursor')
+            if cursor is None:
+                return rows
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                break
+            seen.add(cursor)
+        raise ValueError('public market pagination incomplete')
+
     def snapshot(self):
         with self.__lock:
             return dict(get_attempts=self.__dispatched['GET'] if self.__ready else UNKNOWN,
@@ -90,7 +126,9 @@ class _AuditedTransport(httpx.BaseTransport):
 
     def handle_request(self, request):
         self.__audit.dispatch(request)
-        return self.__inner.handle_request(request)
+        response = self.__inner.handle_request(request)
+        self.__audit.record_response(request, response)
+        return response
 
     def close(self):
         self.__inner.close()

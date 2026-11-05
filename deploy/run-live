@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# DRAFT. A future explicitly authorized live launch; this script provisions nothing.
+set -euo pipefail
+release=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+exec "$release/.venv/bin/lp-v2" run --live \
+  --capital-usdc "${LP_V2_CAPITAL_USDC:?set approved frozen capital}" \
+  --market "${LP_V2_MARKET:?set the one approved condition id}" \
+  --code-sha "${LP_V2_CODE_SHA:?set the exact approved release SHA}" \
+  --private-key-file /etc/lp-v2/signing-key \
+  --credentials-file /etc/lp-v2/credentials.json \
+  --relayer-credentials-file /etc/lp-v2/relayer.json \
+  --state-dir /opt/lp-v2/state
