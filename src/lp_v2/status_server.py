@@ -102,7 +102,7 @@ M4_FIELDS = ('lp_yield_pct_per_day', 'reward_today', 'rebate_today', 'reward_sha
 
 
 def build_summary(config, capital, *, as_of=None, run=None, freshness=None,
-                  wallet=None, wallet_orders=None, safety=None, transport_safety=None, markets=()):
+                  wallet=None, wallet_orders=None, safety=None, transport_safety=None, markets=(), rotation=None):
     """Serialize supplied facts without reading clocks, I/O, or mutating inputs."""
     from copy import deepcopy
     from datetime import datetime
@@ -112,16 +112,27 @@ def build_summary(config, capital, *, as_of=None, run=None, freshness=None,
             return UNKNOWN
         if isinstance(v, datetime):
             return v.isoformat()
+        if isinstance(v, dict):
+            return {k: value(item) for k, item in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [value(item) for item in v]
         if isinstance(v, Decimal):
             return str(v)
         return v
     run, freshness, wallet, safety = run or {}, freshness or {}, wallet or {}, safety or {}
     wallet_orders = wallet_orders or {}
     transport_safety = transport_safety or {}
+    rotation = deepcopy(rotation or {})
+    scan = rotation.get('scan') or {}
+    rotation['coverage_label'] = '政治类完整扫描第一' if scan.get('reached_end') is True and not scan.get('errors') else '已扫范围内第一'
+    serialized_rotation = value(rotation)
+    for key in ('current', 'candidate'):
+        if key in rotation and rotation[key] is None:
+            serialized_rotation[key] = None
     rows = []
     reserve = Decimal('0')
     for market in markets:
-        row = {key: value(market.get(key)) for key in ('title', 'condition_id', 'score', 'eligible', 'skip_reason')}
+        row = {key: value(market.get(key)) for key in ('title', 'condition_id', 'score', 'eligible', 'skip_reason', 'books_as_of')}
         row['skip_reason'] = market.get('skip_reason')
         row['proposed'] = deepcopy(market.get('proposed')) if row['eligible'] is True else None
         if row['score'] == UNKNOWN:
@@ -142,7 +153,7 @@ def build_summary(config, capital, *, as_of=None, run=None, freshness=None,
                 transport_safety={key: value(transport_safety.get(key)) for key in
                                   ('get_attempts', 'rejected_non_get_attempts', 'status', 'monitor_started_at')},
                 capital={**{key: str(v) for key, v in asdict(capital).items()}, 'proposed_reserve': str(reserve)},
-                safety={key: value(safety.get(key)) for key in ('orders_sent', 'cancels_sent', 'since')}, markets=rows)
+                safety={key: value(safety.get(key)) for key in ('orders_sent', 'cancels_sent', 'since')}, markets=rows, rotation=serialized_rotation)
 
 
 def _serve_live(config, *, runner=None):

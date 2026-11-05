@@ -18,6 +18,12 @@ class ScriptedReads:
         p=replace(p,market=replace(p.market,fees_enabled=False,rewards_daily_rate=self.reward),fee_per_share=(D('0'),D('0')))
         return [dict(title='央行',condition_id='m',plan=p,eligible=True,skip_reason=None,observation_completed_at=now),
                 dict(title='缺失',condition_id='missing',plan=None,eligible=False,score='UNKNOWN',skip_reason='市场安全数据缺失或无效')]
+    def new_scan_sdk(self):return self
+    def scan_markets(self,now):
+        from lp_v2.rotation_scan import ScanRound
+        rows=self.read_markets(now)
+        return ScanRound(tuple(rows),dict(started_at=now,finished_at=now,duration_s=0,directory_duration_s=0,
+            market_duration_s=0,pages=1,rows=len(rows),requests=1,prescreened=len(rows),reached_end=True,errors=[]))
     def read_wallet(self,now):
         self.calls.append(('wallet',now))
         return dict(available_usdc='UNKNOWN',as_of=None) if self.fail else dict(available_usdc='182.4',as_of=now)
@@ -36,7 +42,7 @@ class ScriptedReads:
 
 
 def test_day_of_proposals_never_sends_orders():
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     sdk=ScriptedReads(); runner=ReadOnlyRunner(RunConfig(D('100'),AT),sdk,code_sha='abc1234')
     for n in range(8640):
         d=step_at(runner, AT+timedelta(seconds=n*10))
@@ -53,13 +59,13 @@ def test_day_of_proposals_never_sends_orders():
 
 
 def test_refresh_cadence_and_failures():
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     sdk=ScriptedReads(); runner=ReadOnlyRunner(RunConfig(D('100'),AT),sdk)
     at=lambda n: AT+timedelta(seconds=n)
     first=step_at(runner, at(0)); score=first['markets'][0]['score']; sdk.reward=200.
     for n in (9,10,29,30,599):
         d=step_at(runner, at(n))
-        assert d['markets'][0]['score']==score
+        assert (d['markets'][0]['score']==score) is (n==9)
         if n==9:
             assert d['freshness']['decision_as_of']==at(0).isoformat()
         if n==29:
@@ -89,7 +95,7 @@ def test_refresh_cadence_and_failures():
 
 
 def test_proposal_reprice_waits_sixty_seconds():
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     class ChangingReads(ScriptedReads):
         change='safe'
         def read_markets(self,now):
@@ -132,7 +138,7 @@ def test_proposal_reprice_waits_sixty_seconds():
 
 
 def test_excluded_market_keeps_known_score_and_reason():
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     from lp_v2.readonly_sdk import ReadOnlySDK
     from tests.test_readonly_sdk import market_wire,external_sdk
     import httpx
@@ -151,7 +157,7 @@ def test_excluded_market_keeps_known_score_and_reason():
     assert first['markets'][1]['score']=='UNKNOWN'
     assert first['markets'][1]['skip_reason']=='缺少奖励输入'
     sdk.score='39.9'
-    assert step_at(runner, AT+timedelta(seconds=590))['markets'][0]['score']=='38.2'
+    assert step_at(runner, AT+timedelta(seconds=590))['markets'][0]['score']=='39.9'
     d=step_at(runner, AT+timedelta(seconds=600))
     assert d['markets'][0]['score']=='39.9'
     assert d['markets'][0]['skip_reason']=='中间价 0.93 超出 0.10–0.90'
@@ -235,12 +241,13 @@ def test_readonly_decision_uses_completed_market_time(monkeypatch):
     import httpx
     from polymarket import PublicClient
     from lp_v2.readonly_sdk import ReadOnlySDK
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     from tests.test_live_cli import timed_preflight_world
     public,seen,current=timed_preflight_world(monkeypatch)
     sdk=ReadOnlySDK(public=PublicClient(),http=httpx.Client())
     runner=ReadOnlyRunner(RunConfig(D('100'),AT),sdk,clock=lambda:current[0])
     try:
+        runner.scanner.scan_once(AT)
         report=runner.step(AT)
         assert report['freshness']['decision_as_of']=='2026-11-02T00:00:03+00:00'
         assert report['freshness']['scores_as_of']=='2026-11-02T00:00:03+00:00'
@@ -250,8 +257,10 @@ def test_readonly_decision_uses_completed_market_time(monkeypatch):
         assert report['safety']==dict(orders_sent=0,cancels_sent=0,since=AT.isoformat())
         assert runner.config.started_at==AT
         current[0]=AT+timedelta(seconds=10)
+        runner.scanner.scan_once(current[0])
         assert runner.step(current[0])['freshness']['decision_as_of']=='2026-11-02T00:00:13+00:00'
         current[0]=AT+timedelta(seconds=600)
+        runner.scanner.scan_once(current[0])
         later=runner.step(current[0])
         assert later['freshness']['scores_as_of']=='2026-11-02T00:10:03+00:00'
         assert all(method=='GET'  for method,_ in seen)
@@ -263,21 +272,23 @@ def test_readonly_rejects_clock_rollback_after_market_completion(monkeypatch,dec
     import httpx
     from polymarket import PublicClient
     from lp_v2.readonly_sdk import ReadOnlySDK
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     from tests.test_live_cli import timed_preflight_world
     public,seen,current=timed_preflight_world(monkeypatch)
     final={'rollback2':AT+timedelta(seconds=2),'rollback-half':AT+timedelta(milliseconds=500),
            'equal':AT+timedelta(seconds=3),'forward':AT+timedelta(seconds=4),
            'missing':None,'invalid':'unproven','naive':AT.replace(tzinfo=None)}[decision]
     samples=[]
-    values=iter([AT+timedelta(seconds=2),AT+timedelta(seconds=3),AT+timedelta(seconds=3),final])
+    expected_samples=[AT,AT,AT+timedelta(seconds=2),AT+timedelta(seconds=3),AT+timedelta(seconds=3),AT+timedelta(seconds=3),final]
+    values=iter(expected_samples)
     def clock():
         value=next(values);samples.append(value);return value
     sdk=ReadOnlySDK(public=PublicClient(),http=httpx.Client(),clock=clock)
     runner=ReadOnlyRunner(RunConfig(D('100'),AT),sdk,clock=clock)
     try:
+        runner.scanner.scan_once(AT)
         report=runner.step(AT)
-        assert samples==[AT+timedelta(seconds=2),AT+timedelta(seconds=3),AT+timedelta(seconds=3),final]
+        assert samples==expected_samples
         assert len([url for method,url in seen if '/book?' in url])==2
         valid=decision in ('equal','forward')
         assert (report['capital']['proposed_reserve']=='10') is valid

@@ -25,6 +25,11 @@ def step_at(runner, at):
     runner.clock=lambda:at
     for sdk in (getattr(runner,'sdk',None),getattr(runner,'observations',None)):
         if hasattr(sdk,'test_clock'):sdk.test_clock[0]=at
+    if hasattr(runner,'scanner') and not hasattr(runner,'current'):
+        scan=runner.scanner.latest()
+        previous=scan.scan.get('started_at') if scan else None
+        if previous is None or (at-runner.config.started_at).total_seconds()//10 > (previous-runner.config.started_at).total_seconds()//10:
+            runner.scanner.scan_once(at)
     return runner.step(at)
 
 
@@ -200,6 +205,85 @@ def test_fixed_market_recovery_keeps_opening_ineligible_plan(tmp_path,dropped):
             read_at(observations, 'read_fixed_market', AT+timedelta(seconds=70), CID)
     finally:
         live.close();observations.close()
+
+
+@pytest.mark.parametrize('case', ['accepting_orders_false', 'in_play_true', 'rewards_disabled',
+                                 'book_timeout', 'in_play_unknown', 'active_false',
+                                 'closed_true', 'order_book_disabled'])
+def test_fixed_market_rotation_distinguishes_confirmed_invalid_and_unknown(tmp_path, case):
+    from datetime import timedelta
+    from lp_v2.cli import RunConfig
+    from lp_v2.live_runtime import LiveRunner
+    from lp_v2.live_sdk import LiveSDK
+    from lp_v2.rotation_live import RotationRunner
+    from lp_v2.rotation_scan import ScanWorker
+    from lp_v2.rotation_state import open_market_journal
+    from tests.fakes.live_exchange import Exchange
+    from tests.test_live_sdk import OWNER, WALLET, SIGNER, TOKENS
+
+    wire = market_wire()
+    armed = [False]
+    public, _ = external_sdk([wire])
+    book_read = public.get_order_book
+    def books(**kwargs):
+        if armed[0] and case == 'book_timeout':
+            raise httpx.ReadTimeout('SECRET_SENTINEL')
+        return book_read(**kwargs)
+    public.get_order_book = books
+    def http(request):
+        assert request.method == 'GET'
+        in_play = (True if case == 'in_play_true' else None if case == 'in_play_unknown' else False) if armed[0] else False
+        return httpx.Response(200, json=dict(in_play=in_play, blocked=False, country='US'))
+    observations = clocked_sdk(public=public, http=httpx.Client(transport=httpx.MockTransport(http)))
+    clock = observations.test_clock
+    ex = Exchange(condition_id=CID)
+    identity = dict(owner=OWNER, condition_id=CID, token_ids=TOKENS)
+    journal = open_market_journal(tmp_path, identity)
+    live = LiveSDK(ex.sdk, journal, **identity, wallet=WALLET, signer=SIGNER, clock=lambda: clock[0])
+    config = RunConfig(D('100'), AT, state_dir=str(tmp_path), market=CID)
+    current = LiveRunner(config, live, observations, clock=lambda: clock[0])
+    scanner = ScanWorker(observations, clock=lambda: clock[0])
+    rotation = RotationRunner(config, current, scanner, action_id='on-action',
+        window_end=AT + timedelta(seconds=5), clock=lambda: clock[0])
+    try:
+        scanner.scan_once(AT)
+        assert scanner.latest().complete
+        rotation.step(AT)
+        original = set(ex.orders)
+        assert len(original) == 2
+        assert all(ex.orders[oid].status == 'LIVE' for oid in original)
+        armed[0] = True
+        if case == 'accepting_orders_false':
+            wire['acceptingOrders'] = False
+        elif case == 'rewards_disabled':
+            wire['clobRewards'] = []
+        elif case == 'active_false':
+            wire['active'] = False
+        elif case == 'closed_true':
+            wire['closed'] = True
+        elif case == 'order_book_disabled':
+            wire['enableOrderBook'] = False
+        clock[0] = AT + timedelta(seconds=10)
+        if case != 'rewards_disabled':
+            with pytest.raises(ValueError) as error:
+                observations.read_fixed_market(clock[0], CID)
+            assert str(error.value) == 'fixed market validation unavailable'
+            assert 'SECRET_SENTINEL' not in str(error.value)
+        signatures = ex.sdk.create_limit_order.call_count
+        report = rotation.step(clock[0])
+        confirmed = case in ('accepting_orders_false', 'in_play_true', 'rewards_disabled',
+                             'active_false', 'closed_true', 'order_book_disabled')
+        assert report['rotation']['switch_count'] == (1 if confirmed else 0)
+        assert report['rotation']['phase'] == ('exiting' if confirmed else 'running')
+        invalid_exits = [event for _, event in rotation.journal.events('rotation')
+                         if event['phase'] == 'exiting' and event['reason'] == 'current_invalid']
+        assert len(invalid_exits) == (1 if confirmed else 0)
+        assert report['rotation']['current'] == CID
+        assert all(ex.orders[oid].status == 'CANCELED' for oid in original)
+        assert ex.sdk.create_limit_order.call_count == signatures
+        assert len(ex.posts) == 2
+    finally:
+        rotation.close()
 
 
 def taker_fee_wire(**overrides):
@@ -410,3 +494,10 @@ def test_market_reads_validate_books_at_completion(monkeypatch,method,case):
                 assert [b.observed_at for b in rows[0]['plan'].books]==[AT+timedelta(seconds=1 if case=='normal' else 0)]*2
         assert all(method=='GET' for method,_ in seen)
     finally:sdk.close();public.close()
+
+
+def scanned_runner(config,sdk,**kwargs):
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from lp_v2.rotation_scan import ScanWorker
+    clock=kwargs.get('clock',lambda:getattr(sdk,'test_clock',[config.started_at])[0])
+    return ReadOnlyRunner(config,sdk,scanner=ScanWorker(sdk,clock=clock),**kwargs)

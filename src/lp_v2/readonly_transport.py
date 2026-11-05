@@ -19,6 +19,7 @@ class ReadOnlyTransportAudit:
         self.__started_at = datetime.now(UTC)
         self.__dispatched = Counter()
         self.__rejected = 0
+        self.__active = self.__maximum = 0
         self.__ready = False
         self.__fee_wires = {}
         self.__public = public
@@ -71,6 +72,20 @@ class ReadOnlyTransportAudit:
                 self.__rejected += 1
                 raise RuntimeError('read-only transport rejected non-GET')
             self.__dispatched[request.method] += 1
+            self.__active += 1
+            self.__maximum = max(self.__maximum,self.__active)
+
+    def completed(self):
+        with self.__lock:
+            self.__active -= 1
+
+    def begin_scan(self):
+        with self.__lock:
+            self.__maximum = self.__active
+
+    def scan_max_inflight(self):
+        with self.__lock:
+            return self.__maximum
 
     def record_response(self, request, response):
         if request.url.path == '/markets/keyset' and response.status_code == 200:
@@ -126,9 +141,12 @@ class _AuditedTransport(httpx.BaseTransport):
 
     def handle_request(self, request):
         self.__audit.dispatch(request)
-        response = self.__inner.handle_request(request)
-        self.__audit.record_response(request, response)
-        return response
+        try:
+            response = self.__inner.handle_request(request)
+            self.__audit.record_response(request, response)
+            return response
+        finally:
+            self.__audit.completed()
 
     def close(self):
         self.__inner.close()

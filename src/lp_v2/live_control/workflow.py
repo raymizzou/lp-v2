@@ -154,7 +154,12 @@ def on(profile, *, action_id=None, window_end=None, prepare_env=False):
         prior=read_json(path)
         if prior.get('action')!='on' or prior.get('profile')!=profile: return dict(status='UNKNOWN',reason='ACTION_IDENTITY_MISMATCH')
         started=request(prior['profile'],'result',action_id=action_id,expected_action='on')
-        return verify_start(prior['profile'],started,action_id=action_id) if started.get('status')=='ACCEPTED' else dict(status='UNKNOWN',reason='REMOTE_OUTCOME_UNKNOWN')
+        if started.get('status') == 'ACCEPTED':
+            result = prior.get('result')
+            if isinstance(result,dict) and result.get('status') == 'PASS' and result.get('run_id') == started.get('run_id'):
+                return result
+            return verify_start(prior['profile'],started,action_id=action_id)
+        return dict(status='UNKNOWN',reason='REMOTE_OUTCOME_UNKNOWN')
     if not window_end or timestamp(window_end)<=datetime.now(UTC):
         return dict(status='UNKNOWN',reason='CONFIRMATION_REQUIRED')
     report=check(profile)
@@ -220,7 +225,16 @@ def verify_start(profile,started,*,action_id):
         if moment is not None and (previous is None or all(value>old for value,old in zip(moment,previous))):
             rounds+=1; previous=moment
             if rounds==2:
-                return dict(status='PASS',run_id=run_id,action_id=action_id,verified_rounds=2)
+                if 'startup_verification' in snapshot and snapshot['startup_verification'].get('status')!='PASS':
+                    break
+                result = dict(status='PASS',run_id=run_id,action_id=action_id,verified_rounds=2)
+                from lp_v2.live_control.profiles import read_json
+                operation = config_root()/'operations'/(action_id+'.json')
+                prior = read_json(operation)
+                if prior.get('action') != 'on' or prior.get('profile') != profile:
+                    raise ValueError('operation identity mismatch')
+                atomic_json(operation,dict(prior,result=result))
+                return result
         if moment is None:
             rounds=0;previous=None
         if attempt<11:

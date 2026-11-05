@@ -82,6 +82,8 @@ class LiveSDK:
         order, outcome, diagnostic = None, Outcome.UNKNOWN, 'ambiguous submission'
         dispatched = False
         try:
+            signed_at = self.clock()
+            authorization = self._signature_authorization(signed_at)
             signed = self.client.create_limit_order(token_id=q.token_id, price=q.price, size=q.quantity,
                 side='BUY', post_only=True, expiration=int(request.expires_at.timestamp()))
             if (signed.token_id != q.token_id or signed.side != 'BUY' or signed.post_only is not True
@@ -92,7 +94,7 @@ class LiveSDK:
             self.journal.append('signed', dict(request_id=request.request_id, salt=signed.salt, token_id=signed.token_id,
                 maker=signed.maker, signer=signed.signer, maker_amount=signed.maker_amount,
                 taker_amount=signed.taker_amount, expiration=signed.expiration, timestamp=signed.timestamp,
-                order_ids=signed_ids))
+                order_ids=signed_ids, signed_at=signed_at, **authorization))
             dispatched = True
             response = self.client.post_order(signed)
             if isinstance(response, AcceptedOrder) and response.order_id:
@@ -111,6 +113,26 @@ class LiveSDK:
         if outcome != Outcome.SUCCESS:
             self.journal.append('diagnostic', dict(request_id=request.request_id, reason=diagnostic, at=at))
         return result
+
+    def bind_entry(self, *, action_id, window_end, activation_id):
+        if (not isinstance(action_id, str) or not action_id or not isinstance(activation_id, str) or not activation_id
+                or not isinstance(window_end, datetime) or window_end.tzinfo is None):
+            raise ValueError('unproven entry authorization')
+        record = dict(action_id=action_id,window_end=window_end,activation_id=activation_id)
+        previous = self.journal.events('entry_window')
+        if not previous or previous[-1][1] != record:
+            self.journal.append('entry_window',record)
+
+    def _signature_authorization(self, now):
+        windows = self.journal.events('entry_window')
+        if not windows:
+            return {}
+        authorization = windows[-1][1]
+        activated = any(p.get('activation_id') == authorization['activation_id'] for _,p in self.journal.events('signed'))
+        if (not isinstance(now, datetime) or now.tzinfo is None
+                or (not activated and now >= authorization['window_end'])):
+            raise ValueError('entry authorization window expired')
+        return dict(authorization, entry_signature=not activated)
 
     def _history(self):
         requests = {p['request'].request_id: p['request'] for _, p in self.journal.events('intent')}
@@ -137,8 +159,8 @@ class LiveSDK:
             raise ValueError('terminal cumulative quantity regressed')
         filled = max(raw.size_matched,prior) if status == OrderStatus.LIVE else raw.size_matched
         order = Order(oid,r,filled,q.quantity-filled if status == OrderStatus.LIVE else D('0'),
-                      status,previous.observed_at,not uncertain,cancels.get(oid))
-        return OrderResult(r,Outcome.UNKNOWN if uncertain else Outcome.SUCCESS,order,previous.observed_at)
+                      status,self._now(),not uncertain,cancels.get(oid))
+        return OrderResult(r,Outcome.UNKNOWN if uncertain else Outcome.SUCCESS,order,self._now())
 
     def _missing_order(self, previous, candidates, cancels):
         # Iterator exhaustion is required: a later-page failure cannot prove absence.
@@ -178,9 +200,30 @@ class LiveSDK:
         results = self._history()
         signed = {p['request_id']:p for _,p in self.journal.events('signed')}
         cancels = {p['order_id']:p['at'] for _,p in self.journal.events('cancel_intent')}
+        trades = None
         for key,previous in results.items():
-            if (previous.outcome == Outcome.FAILED and previous.order is None
-                    or previous.order is not None and previous.order.authoritative and previous.order.status != OrderStatus.LIVE):
+            if previous.outcome == Outcome.FAILED and previous.order is None:
+                continue
+            if previous.order is not None and previous.order.authoritative and previous.order.status != OrderStatus.LIVE:
+                # A cancellation snapshot can precede delivery of an authenticated
+                # trade. Refresh only when complete trade provenance proves growth;
+                # ordinary terminal history still needs no repeated order reads.
+                if trades is None:
+                    trades = self._trade_facts()
+                total = sum((f.quantity for f in trades.values() if f.request_id == key),D('0'))
+                if total <= previous.order.filled_quantity:
+                    continue
+                raw = self._order_readback(previous.order.order_id)
+                if raw is None or raw is _UNAVAILABLE:
+                    raise ValueError('late fill requires authoritative order readback')
+                updated = self._observed_order(raw,previous.order.order_id,previous,cancels)
+                if (not updated.order.authoritative or updated.order.filled_quantity != total
+                        or updated.order.status == OrderStatus.LIVE):
+                    raise ValueError('late fill does not reconcile with terminal history')
+                self.journal.append('order_result',updated)
+                self.journal.append('late_fill_reconciliation',dict(request_id=key,previous=previous,
+                    current=updated,trade_ids=tuple(f.trade_id for f in trades.values() if f.request_id == key),at=self._now()))
+                results[key] = updated
                 continue
             candidates = (previous.order.order_id,) if previous.order else signed.get(key,{}).get('order_ids',())
             found, missing = [], []

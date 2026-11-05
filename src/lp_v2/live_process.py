@@ -69,7 +69,19 @@ class ProcessLock:
             identity=process_identity(os.getpid())
             if identity is None:
                 raise ValueError('Linux process identity unavailable')
-            self.record=dict(pid=os.getpid(),identity=identity,run_id=uuid4().hex)
+            from lp_v2.rotation_state import recoverable_run
+            from lp_v2.live_control.profiles import read_json,fingerprint
+            try:previous=read_json(self.path/'process.json')
+            except Exception:previous={}
+            recovered=recoverable_run(self.path,previous)
+            self.record=dict(pid=os.getpid(),identity=identity,run_id=recovered['run_id'] if recovered else uuid4().hex,
+                             lease_id=uuid4().hex)
+            try:
+                control=read_json(self.path/'live-control-run.json')
+                self.record.update(action_id=control['action_id'],profile_sha256=fingerprint(control['profile']))
+            except Exception:
+                pass
+            if recovered is not None:self.record['recovered_from']=recovered
             _write(self.path/'process.json',self.record)
             return self
         except BaseException:
@@ -78,12 +90,18 @@ class ProcessLock:
             raise
 
     def finish(self,code):
-        _write(self.path/'stop-result.json',dict(run_id=self.record['run_id'],exit_code=code))
+        _write(self.path/'stop-result.json',dict(run_id=self.record['run_id'],lease_id=self.record['lease_id'],exit_code=code))
 
     def __exit__(self,*args):
         if self.fd is not None:
             os.close(self.fd)
             self.fd=None
+
+
+def stop_result_matches(process,result):
+    """A logical on may survive restart; final evidence belongs to one lease."""
+    return (result.get('run_id')==process.get('run_id')
+            and ('lease_id' not in process or result.get('lease_id')==process['lease_id']))
 
 
 def stop_process(path,*,timeout_s=110,monotonic=real_monotonic,wait=sleep):
@@ -111,7 +129,7 @@ def stop_process(path,*,timeout_s=110,monotonic=real_monotonic,wait=sleep):
                 try:
                     with owner_file(path/'stop-result.json') as source:
                         result=json.load(source)
-                    if result['run_id'] == record['run_id'] and type(result['exit_code']) is int:
+                    if stop_result_matches(record,result) and type(result['exit_code']) is int:
                         return result['exit_code']
                 except (OSError,ValueError,KeyError):
                     pass

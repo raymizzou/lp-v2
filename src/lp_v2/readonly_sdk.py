@@ -29,6 +29,10 @@ class _Excluded(ValueError):
     """Only application-authored, identity-free reasons may reach the summary."""
 
 
+class FixedMarketIneligible(_Excluded):
+    """Confirmed fixed-market state, distinct from unavailable observations."""
+
+
 
 class ReadOnlyPort(Protocol):
     def read_markets(self, now): ...
@@ -51,6 +55,15 @@ class ReadOnlySDK:
         self.__stop = stop
         from lp_v2.readonly_transport import ReadOnlyTransportAudit
         self.__audit = ReadOnlyTransportAudit(self.__public, self.__http)
+
+    def new_scan_sdk(self):
+        # Independent public clients and audit state: no sharing mutable fee/clock data.
+        from threading import Event
+        return ReadOnlySDK(stop=Event(), clock=self.__clock)
+
+    def request_stop(self):
+        if self.__stop is not None:
+            self.__stop.set()
 
     def observation_time(self, previous):
         """Independent local UTC observation; fail closed on unproven/backward time."""
@@ -86,30 +99,96 @@ class ReadOnlySDK:
         self.__http.close()
 
     def read_markets(self, now):
-        """Bounded political catalog scan; retain every discovered exclusion."""
+        return list(self.scan_markets(now).rows)
+
+    def scan_markets(self, now):
+        """Complete sequential politics keyset scan; ranking books never authorize entry."""
+        from lp_v2.rotation_scan import ScanRound
+        from decimal import Decimal
+        from polymarket._internal.actions.gamma import list_markets_spec
+        from lp_v2.scoring import score_market
         self.__audit.require_ready()
-        from itertools import islice
-        rows = []
-        for page in islice(self.__public.list_markets(closed=False, tag_id=2, include_tag=True, page_size=20), 5):
+        if not isinstance(now, _DateTime) or now.tzinfo is None:
+            raise ValueError('UTC scan start unavailable')
+        started = now
+        before = self.transport_safety()['get_attempts']
+        self.__audit.begin_scan()
+        scan = dict(started_at=started, pages=0, rows=0, prescreened=0, reached_end=False, errors=[])
+        raw_rows, cursor, seen = [], None, set()
+        while True:
             if self.__stop is not None and self.__stop.is_set():
                 raise InterruptedError('stopping')
-            for market in page.items:
-                if self.__stop is not None and self.__stop.is_set():
-                    raise InterruptedError('stopping')
-                row = dict(title=market.question or UNKNOWN, condition_id=str(market.condition_id or UNKNOWN),
-                           score=UNKNOWN, eligible=False, skip_reason='市场安全数据缺失或无效', plan=None)
-                try:
-                    from lp_v2.scoring import score_market
-                    metadata = self.__metadata_market(market, now)
-                    row['score'] = str(score_market(metadata).score)
-                    row.update(self.__map_market(market, now, metadata))
-                except _Excluded as error:
-                    row['skip_reason'] = str(error)
-                except Exception:
-                    # Never propagate raw transport exceptions/account identity to logs.
-                    pass
-                rows.append(row)
-        return rows
+            params = dict(closed=False, tag_id=2, include_tag=True, limit=100)
+            if cursor is not None:
+                params['after_cursor'] = cursor
+            try:
+                page = self.__public._ctx.gamma.get_json('/markets/keyset', params=params)
+                if (not isinstance(page, dict) or not isinstance(page.get('markets'), list)
+                        or any(not isinstance(row, dict) for row in page['markets'])):
+                    raise ValueError('directory shape')
+            except Exception:
+                scan['errors'].append(dict(page=scan['pages']+1, reason='directory_request_failed'))
+                break
+            raw_rows.extend(page['markets'])
+            scan['pages'] += 1
+            scan['rows'] += len(page['markets'])
+            cursor = page.get('next_cursor')
+            if 'next_cursor' in page and cursor is None:
+                scan['reached_end'] = True
+                break
+            if not isinstance(cursor, str) or not cursor or cursor in seen:
+                scan['errors'].append(dict(page=scan['pages'], reason='cursor_invalid'))
+                break
+            seen.add(cursor)
+        try:
+            directory_end = self.observation_time(started)
+        except ValueError:
+            directory_end = None
+            scan['errors'].append(dict(reason='scan_clock_unavailable'))
+        rows = []
+        for wire in raw_rows:
+            if self.__stop is not None and self.__stop.is_set():
+                raise InterruptedError('stopping')
+            row = dict(title=wire.get('question') or UNKNOWN, condition_id=str(wire.get('conditionId') or UNKNOWN),
+                       score=UNKNOWN, eligible=False, skip_reason='市场安全数据缺失或无效', plan=None)
+            observing_market = False
+            try:
+                parsed = list_markets_spec().parse_page(dict(markets=[wire], next_cursor=None))
+                market = parsed.items[0]
+                metadata = self.__metadata_market(market, started, fee_wire=wire)
+                row['score'] = str(score_market(metadata).score)
+                # Cheap metadata exclusions precede the three market GETs.
+                st = market.state
+                midpoint = (metadata.best_bid+metadata.best_ask)/2
+                if (st.active is not True or st.closed is not False or st.accepting_orders is not True
+                        or st.enable_order_book is not True or not metadata.political):
+                    raise _Excluded('市场状态或政治分类缺失或不合格')
+                if not 0.10 <= midpoint <= 0.90:
+                    raise _Excluded(f'中间价 {(Decimal(str(metadata.best_bid))+Decimal(str(metadata.best_ask)))/2} 超出 0.10–0.90')
+                if metadata.liquidity_num < 1000:
+                    raise _Excluded('流动性低于 1000')
+                scan['prescreened'] += 1
+                observing_market = True
+                row.update(self.__map_market(market, self.observation_time(started), metadata))
+            except _Excluded as error:
+                row['skip_reason'] = str(error)
+            except Exception:
+                if observing_market:
+                    scan['errors'].append(dict(condition_id=row['condition_id'],reason='market_observation_failed'))
+            rows.append(row)
+        try:
+            finished = self.observation_time(directory_end or started)
+        except ValueError:
+            finished = None
+            scan['errors'].append(dict(reason='scan_clock_unavailable'))
+        scan.update(finished_at=finished, duration_s=(finished-started).total_seconds() if finished else None,
+                    directory_duration_s=(directory_end-started).total_seconds() if directory_end else None,
+                    market_duration_s=(finished-directory_end).total_seconds() if finished and directory_end else None,
+                    requests=self.transport_safety()['get_attempts']-before,
+                    max_inflight=self.__audit.scan_max_inflight())
+        if scan['max_inflight'] > 1:
+            scan['errors'].append(dict(reason='concurrent_scan_request'))
+        return ScanRound(tuple(rows), scan)
 
     def __metadata_market(self, raw, now, *, recovery=False, fee_wire=None):
         """Score facts are independent of whether a proposal can safely exist."""
@@ -151,6 +230,9 @@ class ReadOnlySDK:
         from lp_v2.models import Book, MarketPlan
         from lp_v2.scoring import eligible_market, score_market
         cid, st = m.condition_id, raw.state
+        if recovery and (st.active is False or st.closed is True
+                         or st.accepting_orders is False or st.enable_order_book is False):
+            raise FixedMarketIneligible('市场状态已确认不合格')
         if not (st.active is True and st.closed is False and st.accepting_orders is True
                 and st.enable_order_book is True and m.political is True):
             raise _Excluded('市场状态或政治分类缺失或不合格')
@@ -163,6 +245,8 @@ class ReadOnlySDK:
         response = self.__http.get('https://clob.polymarket.com/markets/' + cid)
         response.raise_for_status()
         state=response.json()
+        if recovery and isinstance(state, dict) and state.get('in_play') is True:
+            raise FixedMarketIneligible('市场正在进行中')
         if not isinstance(state,dict) or ('in_play' in state and state['in_play'] is not False):
             raise _Excluded('进行中状态未验证')
         books = []
@@ -188,6 +272,7 @@ class ReadOnlySDK:
         eligible = eligible_market(m)
         midpoint = (books[0].best_bid + books[0].best_ask) / 2
         return dict(score=str(score_market(m).score), eligible=eligible, observation_completed_at=completed,
+                    books_as_of=min(book.observed_at for book in books),
                     skip_reason=None if eligible else f'中间价 {midpoint} 或流动性不符合条件',
                     plan=MarketPlan(m, tuple(books), max(m.min_order_size, m.rewards_min_size), (D('0'), D('0'))) if eligible or recovery else None)
 
@@ -249,6 +334,8 @@ class ReadOnlySDK:
     def read_fixed_market(self, now, condition_id):
         try:
             return self.__fixed_market(now, condition_id)
+        except FixedMarketIneligible:
+            raise FixedMarketIneligible("fixed market validation unavailable") from None
         except Exception:
             raise ValueError("fixed market validation unavailable") from None
 
@@ -259,14 +346,15 @@ class ReadOnlySDK:
             for raw in page.items:
                 if str(raw.condition_id) != condition_id:
                     raise ValueError('fixed market identity mismatch')
-                m=self.__metadata_market(raw,now,recovery=True)
-                from lp_v2.scoring import score_market
-                row=dict(title=raw.question or UNKNOWN,condition_id=condition_id,score=str(score_market(m).score))
-                row.update(self.__map_market(raw,now,m,recovery=True))
-                found.append(row)
+                found.append((raw, self.__audit.fee_wire(condition_id)))
         if len(found) != 1:
             raise ValueError('fixed market unavailable or ambiguous')
-        return found
+        raw, fee_wire = found[0]
+        m=self.__metadata_market(raw,now,recovery=True,fee_wire=fee_wire)
+        from lp_v2.scoring import score_market
+        row=dict(title=raw.question or UNKNOWN,condition_id=condition_id,score=str(score_market(m).score))
+        row.update(self.__map_market(raw,now,m,recovery=True))
+        return [row]
 
     def read_region_policy(self):
         self.__audit.require_ready()

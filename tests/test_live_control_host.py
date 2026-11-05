@@ -164,6 +164,7 @@ def combined_world(target, config_home, monkeypatch):
     class Clock(datetime):
         @classmethod
         def now(cls,tz=None):return world.clock.astimezone(tz) if tz else world.clock.replace(tzinfo=None)
+    world.clock=Clock.fromisoformat(world.clock.isoformat())
     monkeypatch.setattr(cli,'datetime',Clock)
     from lp_v2 import readonly_sdk
     monkeypatch.setattr(readonly_sdk,'datetime',Clock)
@@ -321,14 +322,20 @@ def combined_world(target, config_home, monkeypatch):
                 previous_umask=os.umask(0o077)
                 try:
                     world.lease=ProcessLock(target['files']['state_dir']).__enter__()
-                    journal=Journal(Path(target['files']['state_dir'])/'journal.sqlite')
-                    if not journal.events('identity'):
+                    if getattr(world,'runtime_factory',None) is not None:
+                        world.runtime=world.runtime_factory()
+                        world.runtime.step(world.clock)
+                    journal=Journal(Path(target['files']['state_dir'])/'journal.sqlite') if not getattr(world,'runtime',None) else None
+                    if journal is not None and not journal.events('identity'):
                         journal.append('identity',dict(owner='lp-v2:'+target['identity']['wallet_address'].lower(),condition_id=target['trading']['market_condition_id'],token_ids=('101','102')))
-                    journal.append('occupation',dict(at=world.clock));journal.close()
+                    if journal is not None:journal.append('occupation',dict(at=world.clock));journal.close()
                 finally:os.umask(previous_umask)
             elif world.lease is not None:
-                journal=Journal(Path(target['files']['state_dir'])/'journal.sqlite')
-                journal.append('stop_result',dict(at=world.clock,exit_code=0,orders=[],pending=[],positions=[],merges=[],inventory=[],reconciliation='SUCCESS',accounting_as_of=world.clock));journal.close()
+                if getattr(world,'runtime',None):
+                    assert world.runtime.drain(timeout_s=0)==0
+                    world.runtime.close()
+                journal=Journal(Path(target['files']['state_dir'])/'journal.sqlite') if not getattr(world,'runtime',None) else None
+                if journal is not None:journal.append('stop_result',dict(at=world.clock,exit_code=0,orders=[],pending=[],positions=[],merges=[],inventory=[],reconciliation='SUCCESS',accounting_as_of=world.clock));journal.close()
                 world.lease.finish(0);world.lease.__exit__(None,None,None);world.lease=None;world.running_argv=None
             return subprocess.CompletedProcess(argv,0,'','')
         if argv[0]=='ss':
@@ -380,6 +387,12 @@ def combined_world(target, config_home, monkeypatch):
                 run=dict(code_sha=target['release']['expected_sha'],wallet_tail=target['identity']['wallet_address'][-4:]),
                 accounting=dict(status='SUCCESS',as_of=world.clock.isoformat()),freshness=dict(decision_as_of=world.clock.isoformat()),
                 markets=[dict(condition_id=target['trading']['market_condition_id'],eligible=True,skip_reason=None)])
+            if world.lease and getattr(world,'runtime',None):
+                world.runtime.clock=lambda:world.clock
+                world.runtime.current.clock=lambda:world.clock
+                world.runtime.current.sdk.clock=lambda:world.clock
+                world.runtime.step(world.clock)
+                data=world.runtime.snapshot()
             if world.lease and getattr(world,'pause',None)=='protective':
                 data['markets'][0].update(eligible=False,skip_reason='protective pause')
             if world.lease and getattr(world,'pause',None)=='missing':

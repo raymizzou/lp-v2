@@ -177,7 +177,7 @@ def test_live_factory_uses_pinned_sdk_and_frozen_identity(tmp_path,monkeypatch):
     monkeypatch.setattr(SecureClient,'create',create)
     public,_=external_sdk(rows=[market_wire()])
     http=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'in_play':False,'blocked':False,'country':'US'})))
-    runner=create_live_runner(config,public=public,http=http)
+    runner=create_live_runner(config,public=public,http=http,clock=lambda:AT)
     assert runner.condition_id==market_id and runner.sdk.token_ids==('101','102')
     assert len(seen)==1
     runner.sdk.close();runner.observations.close()
@@ -216,7 +216,7 @@ def test_factory_rejects_identity_before_sdk_wallet_setup(tmp_path,monkeypatch,i
     public,_=external_sdk(rows=[market_wire()])
     http=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'in_play':False})))
     with pytest.raises(ValueError,match='identity|signing'):
-        create_live_runner(replace(config,market=market_id),public=public,http=http)
+        create_live_runner(replace(config,market=market_id),public=public,http=http,clock=lambda:AT)
     assert constructed==[]
 
 
@@ -470,7 +470,7 @@ def test_live_factory_accepts_absent_in_play(tmp_path,monkeypatch,case):
     public,_=external_sdk([taker_fee_wire()])
     http=httpx.Client(transport=httpx.MockTransport(lambda request:in_play_http_response(request,case)))
     if case in ('missing','false'):
-        runner=create_live_runner(config,public=public,http=http)
+        runner=create_live_runner(config,public=public,http=http,clock=lambda:AT)
         try:
             assert len(created)==1 and runner.config==config
             assert runner.condition_id==CID and runner.sdk.condition_id==CID and runner.sdk.token_ids==('101','102')
@@ -480,7 +480,7 @@ def test_live_factory_accepts_absent_in_play(tmp_path,monkeypatch,case):
             ex.sdk.create_limit_order.assert_not_called();ex.sdk.cancel_order.assert_not_called()
         finally:runner.sdk.close();runner.observations.close()
     else:
-        with pytest.raises(MarketCheckFailure):create_live_runner(config,public=public,http=http)
+        with pytest.raises(MarketCheckFailure):create_live_runner(config,public=public,http=http,clock=lambda:AT)
         assert created==[] and not (Path(config.state_dir)/'journal.sqlite').exists()
 
 
@@ -511,7 +511,7 @@ def test_live_factory_selects_explicit_builder_credentials(tmp_path,monkeypatch,
         state=tmp_path/f'valid-{n}';state.mkdir(mode=0o700)
         public,_=external_sdk([market_wire()])
         http=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'in_play':False})))
-        runner=create_live_runner(replace(config,state_dir=str(state)),public=public,http=http)
+        runner=create_live_runner(replace(config,state_dir=str(state)),public=public,http=http,clock=lambda:AT)
         key=seen[-1]['api_key']
         assert type(key) is (BuilderApiKey if n!=1 else RelayerApiKey)
         assert key.key==payload['key']
@@ -532,7 +532,7 @@ def test_live_factory_selects_explicit_builder_credentials(tmp_path,monkeypatch,
         public,_=external_sdk([market_wire()])
         http=httpx.Client(transport=httpx.MockTransport(lambda r:httpx.Response(200,json={'in_play':False})))
         with pytest.raises(ValueError,match='^invalid relayer credentials$') as error:
-            create_live_runner(replace(config,state_dir=str(state)),public=public,http=http)
+            create_live_runner(replace(config,state_dir=str(state)),public=public,http=http,clock=lambda:AT)
         assert 'sentinel' not in str(error.value)
         assert not state.exists() and len(seen)==3
     assert 'sentinel' not in str(capsys.readouterr())
@@ -628,12 +628,12 @@ def test_factory_accepts_book_created_during_preflight(tmp_path,monkeypatch,case
     try:
         if case=='normal':
             Path(config.state_dir).mkdir(mode=0o700)
-            runner=create_live_runner(config,public=PublicClient(),http=httpx.Client())
+            runner=create_live_runner(config,public=PublicClient(),http=httpx.Client(),clock=lambda:current[0])
             assert len(created)==1 and runner.sdk.token_ids==('101','102') and runner.config.started_at==AT
             assert runner.sdk.wallet==config.credentials.wallet_address and runner.sdk.signer==config.credentials.signer_address
             runner.sdk.close();runner.observations.close()
         else:
-            with pytest.raises(MarketCheckFailure):create_live_runner(config,public=PublicClient(),http=httpx.Client())
+            with pytest.raises(MarketCheckFailure):create_live_runner(config,public=PublicClient(),http=httpx.Client(),clock=lambda:current[0])
             assert created==[] and not (Path(config.state_dir)/'journal.sqlite').exists()
         assert ex.posts==[] and all(method=='GET' for method,_ in seen)
     finally:public.close()
