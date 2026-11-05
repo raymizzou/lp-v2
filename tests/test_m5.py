@@ -11,7 +11,8 @@ import subprocess
 import pytest
 
 from lp_v2.cli import RunConfig, parse_run
-from tests.test_live_cli import live_args
+from tests.test_live_cli import live_args, historical_market_clock
+from tests.test_readonly_sdk import step_at
 from tests.test_live_sdk import AT, CID, TOKENS, OWNER, WALLET, SIGNER
 
 CIDS = (CID, '0x'+'b'*64, '0x'+'c'*64)
@@ -189,7 +190,7 @@ def test_multimarket_execution_safety(tmp_path):
     ex.orders['order-5']=original
     obs.region={}
     before=len(ex.posts)
-    runner.step(AT+timedelta(seconds=10))
+    step_at(runner,AT+timedelta(seconds=10))
     assert len(ex.posts)==before
     assert set(c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list) <= set(ex.orders)
     assert all(o.status!='LIVE' for o in ex.orders.values())
@@ -234,7 +235,7 @@ def factory_inputs(tmp_path, monkeypatch):
     from tests.fakes.live_exchange import Exchange
     from tests.test_readonly_sdk import market_wire
     args,_=live_args(tmp_path)
-    relay=tmp_path/'relay.json';relay.write_text(json.dumps(dict(key='synthetic',address=SIGNER)));relay.chmod(0o600)
+    relay=tmp_path/'relay.json';relay.write_text(json.dumps(dict(key='synthetic',address=parse_run(args).credentials.signer_address)));relay.chmod(0o600)
     args+=['--relayer-credentials-file',str(relay)]
     config=replace(parse_run(args),started_at=AT)
     Path(config.state_dir).mkdir()
@@ -362,7 +363,7 @@ def test_multimarket_summary_and_baselines(tmp_path):
     now=AT+timedelta(seconds=100)
     obs.plans=tuple(replace(p,books=tuple(replace(b,best_bid=D(mid)-D('.01'),best_ask=D(mid)+D('.01'),observed_at=now) for b in p.books)) for p,mid in zip(obs.plans,('.40','.30','.55')))
     obs.region={}
-    result=runner.step(now)
+    result=step_at(runner,now)
     metrics=[r['m4'] for r in result['markets']]
     assert [D(m['net_profit']) for m in metrics]==[D('3.00'),D('6.00'),D('8.55')]
     assert [D(m['net_yield_pct_per_day']) for m in metrics]==[D('15'),D('20'),D('21.375')]
@@ -381,7 +382,7 @@ def test_multimarket_summary_and_baselines(tmp_path):
     assert [{k:D(v) for k,v in m.items()} for m in restarted]==[{k:D(v) for k,v in m.items()} for m in metrics]
     tomorrow=AT+timedelta(days=1)
     obs.plans=tuple(replace(p,books=tuple(replace(b,observed_at=tomorrow) for b in p.books)) for p in obs.plans)
-    next_result=restart.step(tomorrow)
+    next_result=step_at(restart,tomorrow)
     assert all(r['m4']['net_profit']=='UNKNOWN' for r in next_result['markets'])
     baselines=[p for _,p in journal.events('day_baseline') if p['day']==tomorrow.date().isoformat()]
     assert {p['condition_id'] for p in baselines}==set(CIDS)
@@ -399,7 +400,7 @@ def test_multimarket_summary_and_baselines(tmp_path):
     selected.http=httpx.Client(transport=httpx.MockTransport(income))
     o.plans=(obs.plans[1],);o.region={}
     switched=LiveRunner(RunConfig(D('100'),now),selected,o)
-    metrics=switched.step(now)['markets'][0]['m4']
+    metrics=step_at(switched,now)['markets'][0]['m4']
     assert D(metrics['reward_today'])==D('5') and D(metrics['net_profit'])==D('5.5')
     assert metrics['net_yield_pct_per_day']=='UNKNOWN'
     j.close()

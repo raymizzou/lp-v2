@@ -31,6 +31,14 @@ class ReportConfig:
     credentials: object = field(default=None,repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class PreflightConfig:
+    capital_usdc: Decimal
+    started_at: datetime
+    market: str
+    code_sha: str
+
+
 @dataclass(frozen=True,slots=True)
 class StopConfig:
     state_dir: str
@@ -46,9 +54,13 @@ def _positive_capital(value: str) -> Decimal:
     return capital
 
 
-def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | ReportConfig:
+def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | ReportConfig | PreflightConfig:
     parser = argparse.ArgumentParser(prog="lp-v2")
     commands = parser.add_subparsers(dest="command", required=True)
+    preflight = commands.add_parser("preflight")
+    preflight.add_argument("--market", required=True)
+    preflight.add_argument("--capital-usdc", required=True, type=_positive_capital)
+    preflight.add_argument("--code-sha", required=True)
     stop = commands.add_parser("stop")
     stop.add_argument("--state-dir",required=True)
     report = commands.add_parser('report',description='Read-only UTC daily CSV + JSON outside state; missing facts and unset safety thresholds remain UNKNOWN. See docs/M5_REPORT.md for provenance.')
@@ -87,6 +99,12 @@ def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | ReportConf
     import re
     if args.code_sha != 'UNKNOWN' and not re.fullmatch('[0-9a-f]{40}', args.code_sha):
         parser.error('--code-sha must be an exact 40-character SHA')
+    if args.command == 'preflight':
+        if not re.fullmatch('0x[0-9a-fA-F]{64}', args.market):
+            parser.error('preflight requires an exact --market condition id')
+        if args.code_sha == 'UNKNOWN':
+            parser.error('preflight requires an exact code SHA')
+        return PreflightConfig(args.capital_usdc,datetime.now(UTC),args.market,args.code_sha)
     if args.live:
         markets = tuple(dict.fromkeys(args.market or ()))
         if not 1 <= len(markets) <= 3 or any(not re.fullmatch('0x[0-9a-fA-F]{64}', cid) for cid in markets):
@@ -138,6 +156,11 @@ def owner_file(path):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    import sys
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["live"]:
+        from lp_v2.live_control import main as live_main
+        return live_main(argv[1:])
     config = parse_run(argv)
     if isinstance(config,ReportConfig):
         from lp_v2.report import write_report
@@ -148,6 +171,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         print('Report CSV and JSON written; consult notes and safety UNKNOWN reasons.')
         return 0
+    if isinstance(config,PreflightConfig):
+        import json
+        from lp_v2.preflight import run_preflight
+        result = run_preflight(config)
+        print(json.dumps(result))
+        return 0 if result["status"] == "PASS" else 2
     if isinstance(config,StopConfig):
         from lp_v2.live_process import stop_process
         return stop_process(config.state_dir)
@@ -157,11 +186,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if config.live:
         from lp_v2.live_process import ProcessLock
+        from lp_v2.live_runtime import MarketCheckFailure
         try:
             with ProcessLock(config.state_dir) as lease:
                 result=serve(config)
                 lease.finish(result if type(result) is int else 1)
                 return result if type(result) is int else 1
+        except MarketCheckFailure as error:
+            print(f'Live startup failed: stage={error.stage} reason_code={error.reason_code} market={error.market}')
+            return 1
         except Exception:
             print('Live startup or shutdown failed; inspect protected local journal.')
             return 1

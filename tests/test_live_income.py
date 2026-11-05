@@ -1,3 +1,4 @@
+from tests.test_readonly_sdk import step_at
 from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal as D
@@ -77,7 +78,7 @@ def test_income_formula_and_unknown(tmp_path):
     p=replace(p,books=tuple(replace(b,observed_at=AT+timedelta(seconds=100)) for b in p.books))
     obs=Observations((p,));obs.region={}
     runner=LiveRunner(RunConfig(D('100'),AT),live,obs,clock=lambda:ex.now)
-    result=runner.step(AT+timedelta(seconds=100))
+    result=step_at(runner, AT+timedelta(seconds=100))
     fields=result['markets'][0]['m4']
     assert result['schema_version']==1
     assert D(fields['paired_profit'])==D('.20')
@@ -87,13 +88,13 @@ def test_income_formula_and_unknown(tmp_path):
     assert D(fields['lp_yield_pct_per_day'])==D('10')
     # Restart keeps today's baseline and time-weighted occupation.
     restarted=LiveRunner(RunConfig(D('100'),AT+timedelta(seconds=100)),live,obs,clock=lambda:ex.now)
-    assert restarted.step(AT+timedelta(seconds=100))['markets'][0]['m4']==fields
+    assert step_at(restarted, AT+timedelta(seconds=100))['markets'][0]['m4']==fields
     ex.sdk.list_user_earnings_for_day.side_effect=ValueError('unavailable')
-    missing=restarted.step(AT+timedelta(seconds=160))['markets'][0]['m4']
+    missing=step_at(restarted, AT+timedelta(seconds=160))['markets'][0]['m4']
     assert missing['net_profit']=='UNKNOWN'
     assert missing['lp_yield_pct_per_day']=='UNKNOWN'
     # A UTC rollover cannot silently attribute yesterday's realized profit to today.
-    next_day=restarted.step(AT+timedelta(days=1))['markets'][0]['m4']
+    next_day=step_at(restarted, AT+timedelta(days=1))['markets'][0]['m4']
     assert D(next_day['paired_profit'])==0
     assert next_day['net_yield_pct_per_day']=='UNKNOWN'
 
@@ -121,23 +122,23 @@ def test_continuous_utc_rollover_keeps_daily_income(tmp_path,gap):
     books(start,'.40')
     runner=LiveRunner(RunConfig(D('100'),start),live,obs,clock=lambda:ex.now)
     ex.reject_tokens.add('102')
-    runner.step(start)
+    step_at(runner, start)
     ex.fill('order-1','2','.40',at=start+timedelta(seconds=1))
     # This valuation/cadence fixture stays eligible; deny/cancel behavior has its own regression.
     midnight=AT+timedelta(days=1)
     seconds=25 if gap=='failed' else 12 if gap=='restart' else gap
     before=midnight-timedelta(seconds=seconds)
     books(before,'.40')
-    runner.step(before)
+    step_at(runner, before)
     if gap=='restart':
         runner=LiveRunner(RunConfig(D('100'),midnight),live,obs,clock=lambda:ex.now)
     if gap=='failed':
         original=ex.sdk.list_account_trades.side_effect
         ex.sdk.list_account_trades.side_effect=TimeoutError('unavailable')
-        runner.step(midnight-timedelta(seconds=12))
+        step_at(runner, midnight-timedelta(seconds=12))
         ex.sdk.list_account_trades.side_effect=original
     books(midnight,'.42')
-    runner.step(midnight)
+    step_at(runner, midnight)
     baseline=[p for _,p in journal.events('day_baseline') if p['day']=='2026-11-03'][-1]
     observed=gap not in (61,'restart','failed')
     assert baseline['inventory_pnl']==(D('.06') if observed else None)
@@ -145,7 +146,7 @@ def test_continuous_utc_rollover_keeps_daily_income(tmp_path,gap):
     assert baseline['mark_at']==(midnight if observed else None)
     assert baseline['source']==('observed_boundary' if observed else 'UNKNOWN')
     books(midnight+timedelta(seconds=10),'.43')
-    metrics=runner.step(midnight+timedelta(seconds=10))['markets'][0]['m4']
+    metrics=step_at(runner, midnight+timedelta(seconds=10))['markets'][0]['m4']
     assert D(metrics['reward_today'])==2 and D(metrics['rebate_today'])==1
     assert D(metrics['paired_profit'])==0
     if observed:
@@ -163,13 +164,13 @@ def test_failed_round_does_not_republish_old_income_as_current(tmp_path,rollover
     live,journal,ex,calls=income_world(tmp_path)
     obs=Observations((inputs(),))
     runner=LiveRunner(RunConfig(D('100'),AT),live,obs,clock=lambda:ex.now)
-    runner.step(AT)
-    before=runner.step(AT+timedelta(seconds=10))
+    step_at(runner, AT)
+    before=step_at(runner, AT+timedelta(seconds=10))
     assert D(before['markets'][0]['m4']['net_profit'])==3
     assert D(before['markets'][0]['m4']['net_yield_pct_per_day'])==30
     ex.sdk.list_account_trades.side_effect=TimeoutError('unavailable')
     when=AT+timedelta(days=1) if rollover else AT+timedelta(seconds=20)
-    failed=runner.step(when)
+    failed=step_at(runner, when)
     assert failed['as_of']==when.isoformat()
     assert set(failed['markets'][0]['m4'].values())=={'UNKNOWN'}
     assert failed['freshness']['decision_as_of']==(AT+timedelta(seconds=10)).isoformat()

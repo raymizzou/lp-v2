@@ -52,6 +52,19 @@ claimed. Browser visual QA remains separate from offline behavior verification.
 
 ## M4 explicit live entry (draft)
 
+Keep the read-only service running while checking a candidate market:
+
+```sh
+.venv/bin/lp-v2 preflight --market <condition_id> --capital-usdc 100 --code-sha <40-character-SHA>
+```
+
+This public GET-only command prints structured checks and exits 0 only for public PASS
+(2 for BLOCKED/UNKNOWN). Private identity, relayer and allowance remain NOT_CHECKED.
+PASS is not live authorization or private readiness. Switching and rollback remain
+explicit operator actions; see the [M4 guide](docs/M4_LIVE.md). Verified taker-only
+fee schedules preserve `feesEnabled=true` while maker plans carry explicit zero costs.
+Actual nonzero maker fill fees remain unsupported.
+
 The separate `run --live --market <condition_id>` path (repeat `--market` for up to three approved markets) connects the existing engine
 and ledger to the pinned SDK through an append-only SQLite journal. It includes
 owned-order drain/stop, restart reconciliation, receipt-gated Proxy merge, and
@@ -65,6 +78,24 @@ and records per-market occupation and income. The read-only `lp-v2 report --stat
 command writes daily CSV/JSON with explicit UNKNOWN reasons and safety evidence; see the [M5 report guide](docs/M5_REPORT.md).
 No deployment, live operation, key provisioning or field acceptance is claimed.
 
+## Live-control wrapper
+
+The new `lp-v2 live profile show tokyo` and `lp-v2 live check` consume an existing
+v1 default profile. Setup and edits save local expectations; on/off add explicit
+confirmation, same-run readback and owned drain around the existing executor.
+See the [live-control operator guide](docs/operations/live-control.md) for commands,
+installation prerequisites, recovery and concrete required startup proofs.
+Actual submitted/confirmed merge remains separately NOT_RUN runtime acceptance.
+These offline capabilities do not claim deployment or target readiness.
+
 Do not place trades or deploy until Ray explicitly authorizes each milestone.
 
 【LLM：Codex@Air｜模型=gpt-6-astra｜effort=xhigh｜fast=否】
+
+The live controller binds the installed launcher/unit and actual process arguments
+to the checked private-file references and full derived account identity. Its
+pre-switch handoff requires an inactive/disabled known legacy service, no alternate
+local live executor, zero open orders and exact selected-token inventory proof
+(including explicit two-token zero balances for new state). Incomplete evidence
+blocks startup; this covers one host and selected market, not distributed wallet
+exclusivity. See the [operator guide](docs/operations/live-control.md).

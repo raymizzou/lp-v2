@@ -5,6 +5,51 @@
 实际启动前仍需逐项满足 #5 的门禁并获得 Ray 对目标主机、钱包、市场、上限和窗口的明文批准。
 既有 `run --capital-usdc`、`lp-v2.service` 和 `deploy/deploy-lp-v2` 继续是只读路径。
 
+## 公开市场预检与人工切换
+
+保持只读服务运行，先在候选代码环境单独执行：
+
+```sh
+lp-v2 preflight --market <完整condition_id> --capital-usdc 100 --code-sha <40位SHA>
+```
+
+该命令仅发公开 GET，不读取签名/L2 文件，不创建 SecureClient、进程锁、状态目录或 journal，
+不调用 systemctl。JSON 输出含 `scope=public_market`、代码/市场/上限/UTC 时间和逐项
+`status`、`reason_code`。所有必需公开检查 PASS 才退出 0；BLOCKED 或 UNKNOWN 退出 2。
+身份不符时依赖该身份的检查保留 UNKNOWN，不使用返回的外来 token 查询订单簿。
+簿时效以本机独立 UTC 为准：每本返回时及两本共同读取完成时，原始时间戳的年龄
+都须在 0–60 秒内（含 60 秒）。读取期间生成的合格簿可通过；收到时仍在未来、
+慢读导致第一本过期、无效/缺失时间或时钟倒退均不放行。保留原始簿时间，不加容差，
+不借交易所 Date 头、改写时间或自动重试制造新鲜证据。
+预检 `as_of` 与开仓诊断时间对应完成观察时刻；运行轮次在行情返回后采样决策/估值时间，
+决策采样还须不早于本轮已验证的行情联合完成时刻；缺失或无效的完成证明也拒绝。
+账户核对、成交和回执保留原时间，启动身份和 10/30/600 秒调度口径保持独立。
+这些离线验证不保证未来市场持续就绪，现场检查仍须使用获授权部署的准确版本。
+已能独立核验的费用、接单状态、奖励、政治分类、in_play、tick/最小量和簿时效分别报告。
+公开 CLOB 市场读取成功且返回 JSON 对象时，`in_play` 为布尔 `false` 或对象没有此键，
+均通过该项；显式 `true`、`null`、数字和字符串仍拒绝。读取失败、坏 JSON、非对象
+不能视为缺键。预检、SDK 固定市场与扫描读取使用同一规则，其余身份、费用、簿和账户门禁独立。
+`PUBLIC_READ_UNAVAILABLE` 表示未能读回；`FEE_POLICY_UNPROVEN`、`MARKET_STATE_INVALID`、
+`BOOK_IDENTITY_CONSTRAINTS_OR_FRESHNESS` 等是稳定的脱敏拒绝原因，不输出原始异常或载荷。
+
+公开 PASS 不证明私有身份、Relayer 或 allowance 就绪；这些明确为 NOT_CHECKED，
+也不授予实盘权限。不得因 PASS 自动停止只读或启动实盘。获批后由操作员人工切换；
+回退仍由操作员按已批准的 stop/读回流程停止实盘，再明确恢复只读服务。
+本命令不执行切换、回滚或服务启动。
+
+`feesEnabled=true` 说明市场有费用，不等于 post-only maker 必须支付费用。
+仅接受完整、可验证的 taker-only feeSchedule：有限非负 rate、exponent=1、
+明确 takerOnly=true、rebateRate 在 [0,1]，并保留真实费用开关。
+例如 rate=.05 映射为 taker_fee_bps=500，rebateRate=.25；maker 计划费用显式为 (0,0)。
+明确关闭费用且没有费率表的市场仍支持；缺失、矛盾或不支持的费率数据不会默认为零。
+潜在返佣仅用于排名，实际收益仍依赖独立实际证据。
+当前成交适配器仍拒绝 maker.fee_rate_bps 非零或未落定成交，不能拿当前费率表推断历史成交成本。
+
+启动时市场校验失败输出白名单诊断：`stage=market_check`、
+`reason_code=MARKET_VALIDATION_UNAVAILABLE` 与完整公开 market。
+其他启动/停止错误仍只输出固定安全信息；不打印原始异常、凭据或响应体。
+签名身份核验仍先于可能产生副作用的 SDK 初始化。
+
 ## 启动输入与凭据
 
 只支持 Linux、Python 3.12+ 和固定 `polymarket-client==0.2.0`，钱包必须为既有
@@ -20,7 +65,13 @@ Git、stdout 或 journal：
 | --- | --- |
 | `/etc/lp-v2/signing-key` | 仅该钱包的签名私钥文本，独立于 L2 文件 |
 | `/etc/lp-v2/credentials.json` | 既有 L2 `key`、`secret`、`passphrase`、`signer_address`、`wallet_address`、`signature_type` |
-| `/etc/lp-v2/relayer.json` | 既有 Relayer API 的 `key` 与 `address`，供 SDK Proxy 免 gas merge 使用 |
+| `/etc/lp-v2/relayer.json` | 既有 legacy `{key,address}` 或显式 Builder `{kind,key,secret,passphrase,address}`，供 SDK Proxy 免 gas merge 使用 |
+
+Builder 文件的 `kind` 必须为 `builder`，`address` 必须是与签名文件一致的完整
+20 字节 signer 地址（十六进制大小写可不同）。`secret` 为 SDK 支持的标准或 URL-safe
+base64，可省略 padding；所有字符串必须非空且不能含 CR/LF/NUL，拒绝未知或额外字段。
+legacy 文件仍严格只含 `key`、`address`。检查、实际 SDK 工厂和启动文件连续性证明
+使用同一解析规则；不根据 401 猜测格式、回退认证或创建凭据。
 
 L2 凭据不能替代 Relayer 凭据。模板只留路径，不创建、分发或申请任何凭据。
 真实凭据的准备与投放另需授权。
@@ -149,7 +200,7 @@ lp_yield_pct_per_day = 当日实际奖励 / 同一平均占用 × 100
 
 配对毛利润与库存毛成本排除费用，费用仅扣一次；Ledger 原有资金和已实现利润仍使用
 包含费用的成本。真实适配器目前只接受已验证零 maker fee 的已确认成交；费用不明、
-未结算成交或费用市场不参与乐观计算。不是用配置的潜在奖励率代替实际奖励。
+未结算成交不参与乐观计算；当前市场有 taker 费用不等于 maker 成交费用非零。不是用配置的潜在奖励率代替实际奖励。
 
 平均占用按已记录轮次间的占用作阶梯积分，属于观察频率下的时间加权估计，
 不是每个链上事件的连续精确积分。分母缺失或为零时收益率 UNKNOWN，不能拿启动上限代替。
@@ -180,3 +231,30 @@ UNKNOWN 清单，失败轮次也记录。导出证据应脱敏，不把私有状
 `occupation` 用种类索引和当天序号下界读取；重启重新确定下界，UTC 换日清除旧下界。
 不跨轮缓存订单、持仓或 UNKNOWN 事实。按天的 CSV/JSON、只读边界与缺证据说明见
 [M5 日报](M5_REPORT.md)。合成七天负载验证不替代 M4/M5 真实运行验收。
+
+## 统一运维入口
+
+新增 `lp-v2 live check / on / off` 运维编排层，兼容已保存的 v1 默认 profile。
+[操作说明](operations/live-control.md)列出本地设置、严格 SSH 信任、确认与版本绑定、
+两轮读回、同 run 排空、断线不重放及只读恢复。底层 run/stop、交易账本和部署模板的
+原有合同继续适用。启动前分别要求新鲜的公开/账户事实、受支持的 Proxy 配置证明和既有操作员
+sudo 路线；应用读写与进程身份仍使用 lp-v2 用户，只对两个固定 unit 的有限操作临时提权，
+不安装 sudoers/polkit。鉴权与配置证明不能证明实际提交或完成 merge；后者属于 #5 运行验收，
+CLI 单列 NOT_RUN/UNKNOWN。缺少任何必需启动证据仍阻止开启，离线测试不替代部署、
+真实启停授权或现场验收。
+
+统一入口还核对已安装 launcher 的固定字节、有效 unit/环境/文件引用，并从实际 PID 参数与
+文件重新导出完整身份。交接只证明本机与所选市场：旧服务 inactive/disabled、无其他本机
+实盘执行器、订单为零，且两个 token 的新鲜鉴权余额与完整已停止自有快照一致；新状态需
+明确双零余额。未知或不匹配不自动接管、清空或导入持仓；控制锁内再次核验后才切换。
+不声称跨主机互斥、其他市场全局库存或对抗同 UID 恶意替换的进程证明。
+
+### Opening eligibility diagnostics
+
+Public preflight exposes allowlisted `checks.opening_eligibility.details` with
+finite decimal strings for proven liquidity and executable-book midpoint, fixed
+thresholds `1000` and `0.10`–`0.90`, observation time and authored liquidity/midpoint
+blockers. Unknown source numbers are omitted; existing status/reason and all
+independent checks remain authoritative. `live check` preserves these details only
+with the matching code, market, capital and fresh observation. These diagnostics
+do not waive in-play, region, fee or authentication gates.

@@ -1,3 +1,4 @@
+from tests.test_readonly_sdk import clocked_sdk, step_at
 """Observe the real adapter through HTTP boundaries and the real status handler."""
 import base64
 from datetime import timedelta
@@ -36,7 +37,7 @@ def observing_runner(order_results):
             return httpx.Response(200, json={'blocked': False})
         return httpx.Response(200, json={'in_play': False})
     public, public_seen = external_sdk([market_wire()])
-    sdk = ReadOnlySDK(public=public, http=httpx.Client(transport=httpx.MockTransport(handle)),
+    sdk = clocked_sdk(public=public, http=httpx.Client(transport=httpx.MockTransport(handle)),
                       credentials=credentials())
     runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk)
     return runner, sdk, seen, public_seen
@@ -55,7 +56,7 @@ def test_orders_readback_is_periodic_and_observational():
             legacy_order_count='UNKNOWN', as_of='UNKNOWN', last_success_at='UNKNOWN')
         proposal = None
         for seconds, count, observed_at in [(0, 2, 0), (10, 2, 0), (29, 2, 0), (30, 0, 30)]:
-            runner.step(AT + timedelta(seconds=seconds))
+            step_at(runner, AT + timedelta(seconds=seconds))
             summary = request(handler)[2]
             expected_time = (AT + timedelta(seconds=observed_at)).isoformat()
             assert summary['wallet_orders'] == dict(
@@ -94,9 +95,9 @@ def test_orders_failure_is_unknown_and_recovers():
             failure, complete([])])
         handler = make_handler(runner.config, runner)
         try:
-            runner.step(AT)
+            step_at(runner, AT)
             assert request(handler)[2]['wallet_orders']['legacy_order_count'] == 2
-            runner.step(AT + timedelta(seconds=30))
+            step_at(runner, AT + timedelta(seconds=30))
             summary = request(handler)[2]
             assert summary['wallet_orders'] == dict(
                 legacy_order_count='UNKNOWN', as_of='UNKNOWN', last_success_at=AT.isoformat())
@@ -106,7 +107,7 @@ def test_orders_failure_is_unknown_and_recovers():
             assert all(secret not in serialized for secret in (
                 'synthetic', 'legacy-private', credentials().signer_address, credentials().wallet_address))
             assert summary['capital']['total'] == '0' and summary['markets'][0]['proposed']
-            runner.step(AT + timedelta(seconds=60))
+            step_at(runner, AT + timedelta(seconds=60))
             recovered_at = (AT + timedelta(seconds=60)).isoformat()
             assert request(handler)[2]['wallet_orders'] == dict(
                 legacy_order_count=0, as_of=recovered_at, last_success_at=recovered_at)
@@ -128,8 +129,8 @@ def test_orders_pagination_never_publishes_partial_counts():
             complete([{'id': 'good'}]), *pages, complete([])])
         handler = make_handler(runner.config, runner)
         try:
-            runner.step(AT)
-            runner.step(AT + timedelta(seconds=30))
+            step_at(runner, AT)
+            step_at(runner, AT + timedelta(seconds=30))
             summary = request(handler)[2]
             assert summary['wallet_orders'] == dict(
                 legacy_order_count='UNKNOWN', as_of='UNKNOWN', last_success_at=AT.isoformat())
@@ -137,7 +138,7 @@ def test_orders_pagination_never_publishes_partial_counts():
             assert [p for _, p in seen].count('/data/orders') == 1 + len(pages)
             assert summary['capital']['total'] == '0'
             assert 'legacy-private' not in json.dumps(summary)
-            runner.step(AT + timedelta(seconds=60))
+            step_at(runner, AT + timedelta(seconds=60))
             assert request(handler)[2]['wallet_orders']['legacy_order_count'] == 0
         finally:
             sdk.close()
@@ -150,10 +151,10 @@ def test_orders_without_credentials_remain_unknown():
         seen.append(req.url.path)
         assert req.url.path == '/api/geoblock'
         return httpx.Response(200, json={'blocked': False})
-    sdk = ReadOnlySDK(public=public, http=httpx.Client(transport=httpx.MockTransport(handle)))
+    sdk = clocked_sdk(public=public, http=httpx.Client(transport=httpx.MockTransport(handle)))
     runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk)
     try:
-        runner.step(AT)
+        step_at(runner, AT)
         summary = request(make_handler(runner.config, runner))[2]
         assert summary['wallet_orders'] == dict(
             legacy_order_count='UNKNOWN', as_of='UNKNOWN', last_success_at='UNKNOWN')
@@ -171,8 +172,8 @@ def test_orders_port_rejects_boolean_negative_and_malformed_counts():
                 return dict(legacy_order_count=invalid if now > AT else 2, as_of=now,
                             raw_order='private-order')
         runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), OrdersBoundary())
-        runner.step(AT)
-        runner.step(AT + timedelta(seconds=30))
+        step_at(runner, AT)
+        step_at(runner, AT + timedelta(seconds=30))
         summary = request(make_handler(runner.config, runner))[2]
         assert summary['wallet_orders'] == dict(
             legacy_order_count='UNKNOWN', as_of='UNKNOWN', last_success_at=AT.isoformat())

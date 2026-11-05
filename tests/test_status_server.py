@@ -225,16 +225,17 @@ def test_runtime_snapshot_served_without_network():
     from lp_v2.readonly_runtime import ReadOnlyRunner
     from lp_v2.status_server import make_handler
     from tests.test_readonly_runtime import ScriptedReads
+    from tests.test_readonly_sdk import step_at
     from datetime import timedelta
     sdk=ScriptedReads(); runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),sdk,code_sha='abc1234')
-    runner.step(AT); calls=list(sdk.calls)
+    step_at(runner,AT); calls=list(sdk.calls)
     handler=make_handler(runner.config,runner)
     d=request(handler)[2]
     assert d==runner.snapshot() and d['markets'][0]['proposed']['yes']['price']=='0.46'
     assert request(handler,path='/healthz')[2]==dict(version='0.1.0',status='ok',code_sha='abc1234',capital_usdc='100',wallet_tail='a3F9',region_check='ok')
     for _ in range(3): request(handler)
     assert sdk.calls==calls
-    runner.step(AT+timedelta(seconds=10))
+    step_at(runner,AT+timedelta(seconds=10))
     assert request(handler)[2]['freshness']['decision_as_of']=='2026-11-02T00:00:10+00:00'
 
 
@@ -251,7 +252,7 @@ def test_health_identity_available_during_catalog_read():
             entered.set()
             if not release.wait(3): raise AssertionError('catalog watchdog expired')
             return super().read_markets(now)
-    runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),BlockingReads(),code_sha='abc1234')
+    runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),BlockingReads(),code_sha='abc1234',clock=lambda:AT)
     handler=make_handler(runner.config,runner)
     assert request(handler,path='/healthz')[2]['code_sha']=='abc1234'
     def stepping():

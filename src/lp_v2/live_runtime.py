@@ -92,6 +92,17 @@ class LiveRunner:
                             self.ledger.apply_order(self.sdk.cancel_order(order.order_id,at=now))
                 else:
                     self._rows = [r for r in self.observations.read_markets(now) if r['condition_id'] in self._markets]
+                accounting_at = now
+                completed = self.clock()
+                if (not isinstance(completed,datetime) or completed.tzinfo is None or completed.utcoffset() is None or completed < now):
+                    raise ValueError('local observation clock unavailable or backward')
+                for row in self._rows:
+                    if row.get('plan') is not None:
+                        observed = row.get('observation_completed_at')
+                        if (not isinstance(observed,datetime) or observed.tzinfo is None
+                                or observed.utcoffset() is None or not now <= observed <= completed):
+                            raise ValueError('market observation completion unavailable or discontinuous')
+                now = completed
                 plans = tuple(r['plan'] for r in self._rows if r.get('plan') is not None)
                 self._last_plans = plans
                 if any(tuple(t.token_id for t in p.market.tokens) != self._markets.get(p.market.condition_id) for p in plans):
@@ -124,7 +135,7 @@ class LiveRunner:
                 samples.sort(key=lambda p:p['at'])
                 self._m4_by_market = {cid:self._income_fields(now,plans,cid,samples) for cid in self._markets}
                 self._m4 = self._m4_by_market[self.condition_id]
-                self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=now)
+                self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
             except Exception:
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
@@ -359,11 +370,21 @@ class LiveRunner:
                     self.observations.close()
 
 
+class MarketCheckFailure(ValueError):
+    """Only application-authored diagnostics, with a validated public identity."""
+    def __init__(self, market):
+        import re
+        self.market = market if isinstance(market,str) and re.fullmatch('0x[0-9a-fA-F]{64}',market) else 'UNKNOWN'
+        self.stage = 'market_check'
+        self.reason_code = 'MARKET_VALIDATION_UNAVAILABLE'
+        super().__init__(self.reason_code)
+
+
 def create_live_runner(config, *, public=None, http=None):
     import json
     from pathlib import Path
     from polymarket import SecureClient
-    from polymarket.auth import RelayerApiKey
+    from lp_v2.relayer_credentials import parse_relayer_credentials
     from polymarket.models.clob.api_key import ApiKeyCreds
     from lp_v2.cli import owner_file
     from lp_v2.journal import Journal
@@ -393,11 +414,17 @@ def create_live_runner(config, *, public=None, http=None):
             raise ValueError('invalid frozen market list')
         markets = {}
         for cid in selected:
-            rows=observations.read_fixed_market(config.started_at,cid)
+            try:
+                rows=observations.read_fixed_market(config.started_at,cid)
+            except Exception:
+                raise MarketCheckFailure(cid) from None
             markets[cid]=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
         tokens=markets[selected[0]]
         with owner_file(config.relayer_credentials_file) as source:
-            relayer_key=RelayerApiKey(**json.load(source))
+            try:
+                relayer_key=parse_relayer_credentials(json.load(source),signer)
+            except (ValueError,TypeError):
+                raise ValueError('invalid relayer credentials') from None
         client=SecureClient.create(private_key=key,wallet=c.wallet_address,
             credentials=ApiKeyCreds(key=c.key,secret=c.secret,passphrase=c.passphrase),api_key=relayer_key)
         key=None

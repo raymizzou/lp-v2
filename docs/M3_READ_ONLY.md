@@ -18,9 +18,13 @@ Books older than sixty seconds are excluded. Every discovered excluded market
 retains a row/reason; a failed catalog read clears proposals and retains old
 last-success timestamps. The bounded scan is not a complete exchange catalog.
 
-The typed Gamma model omits `in_play`. The adapter therefore requires explicit
-`in_play: false` from the fixed public CLOB market endpoint. If it is absent,
-that market is excluded. No live endpoint validation is claimed in this batch.
+The typed Gamma model omits `in_play`. For a successful HTTP read of a JSON
+object from the fixed public CLOB market endpoint, the adapter accepts either
+`in_play: false` or an absent `in_play` key for this check. Explicit `true`, `null`,
+numbers and strings remain excluded. Failed reads, invalid JSON and non-object
+responses remain unknown/excluded; they cannot establish an absent key. Internal
+unknown market state still prevents proposals, and all other eligibility checks
+remain independent. No live endpoint validation is claimed in this batch.
 Fee-enabled markets are excluded until their executable maker fee inputs/model
 are verified; no zero fee is inferred from absent fee data. Missing region
 proof also prevents proposals. These conservative exclusions may yield no
