@@ -304,6 +304,12 @@ def test_rotation_scan_summary():
     assert result['coverage_label'] == '已扫范围内第一'
     assert result['score_at'] == AT.isoformat()
     assert 'plan' not in json.dumps(result)
+    scan['reached_end'] = True
+    with_errors = build_summary(RunConfig(D('100'),AT), CapitalBreakdown(*(D('0') for _ in range(6))), rotation=rotation)
+    assert with_errors['rotation']['coverage_label'] == '已扫范围内第一'
+    scan['errors'] = []
+    complete = build_summary(RunConfig(D('100'),AT), CapitalBreakdown(*(D('0') for _ in range(6))), rotation=rotation)
+    assert complete['rotation']['coverage_label'] == '政治类完整扫描第一'
 
 
 def test_blocked_region_remains_visible_in_health_and_summary():

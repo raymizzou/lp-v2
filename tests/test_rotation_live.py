@@ -1172,3 +1172,59 @@ def test_process_restart_resumes_same_on_without_replay(tmp_path,monkeypatch,pha
             identifiers += [p['request'].request_id for _,p in journal.events('intent')]
             journal.close()
         assert len(identifiers)==len(set(identifiers))
+
+
+def test_real_terminal_page_allows_rotation(tmp_path):
+    from lp_v2.rotation_scan import ScanWorker
+    from tests.test_rotation_scan import scan_boundary
+    from tests.test_readonly_sdk import market_wire
+
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    wires = [market_wire(CID), market_wire(BID, clobTokenIds=['201', '202'])]
+    wires[1]['clobRewards'][0].update(conditionId=BID, rewardsDailyRate='200')
+    sdk, scan_clock, seen, concurrency = scan_boundary(pages=111, terminal_rows=54, eligible_wires=wires)
+    rotation.scanner = ScanWorker(sdk, clock=lambda:clock[0])
+    try:
+        rotation.step(AT)
+        ex.orders['foreign'] = ex.orders['order-1'].model_copy(update={'id':'foreign'})
+        ex.cancel_unknown = True
+        clock[0] = AT+timedelta(seconds=10)
+        scan_clock[0] = clock[0]
+        result = rotation.scanner.scan_once(clock[0])
+        assert result.complete
+        assert result.scan['pages'] == 111 and result.scan['rows'] == 11054
+        assert result.scan['errors'] == [] and result.scan['reached_end'] is True
+        assert len(seen) == 117 and concurrency['maximum'] == 1
+        clock[0] = scan_clock[0]
+        report = rotation.step(clock[0])
+        assert report['rotation']['phase'] == 'exiting'
+        assert report['rotation']['switch_count'] == 1
+        assert report['rotation']['current'] == CID
+        assert report['rotation']['reason'] == 'waiting_orders'
+        exiting = [e for _, e in rotation.journal.events('rotation') if e['phase']=='exiting']
+        assert len(exiting) == 1
+        assert exiting[0]['reason'] == 'higher_score'
+        assert exiting[0]['old_market'] == CID and exiting[0]['new_market'] == BID
+        assert {s.token_id for s in ex.posts} == set(TOKENS)
+        ex.cancel_unknown = False
+        clock[0] += timedelta(seconds=10)
+        report = rotation.step(clock[0])
+        assert report['rotation']['current'] == BID
+        assert report['rotation']['phase'] == 'running'
+        assert report['rotation']['switch_count'] == 1
+        events = [e for _, e in rotation.journal.events('rotation')]
+        assert [e['phase'] for e in events] == ['running','exiting','cleared','revalidating','running']
+        assert events[-1]['old_market'] == CID and events[-1]['new_market'] == BID
+        assert events[-1]['result'] == 'PASS'
+        assert ('books', BID, clock[0]) in obs.reads
+        assert ('public_check', BID, clock[0]) in obs.reads
+        assert ('account_check', None, clock[0]) in obs.reads
+        assert {s.token_id for s in ex.posts[2:]} == {'201','202'}
+        assert ex.orders['foreign'].status == 'LIVE'
+        assert {call.kwargs['order_id'] for call in ex.sdk.cancel_order.call_args_list} == {'order-1','order-2'}
+        assert (tmp_path/'rotation.sqlite').exists()
+        assert (tmp_path/'markets'/CID/'journal.sqlite').exists()
+        assert (tmp_path/'markets'/BID/'journal.sqlite').exists()
+    finally:
+        rotation.close()
+        sdk.close()
