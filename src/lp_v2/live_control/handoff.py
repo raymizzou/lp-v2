@@ -10,7 +10,9 @@ def inventory_handoff(profile,balances):
     from lp_v2.models import Position,Order,OrderStatus
     from lp_v2.live_control.identity import same_identity,single_market_tokens
     try:
-        market=profile['trading']['market_condition_id'];tokens=balances['token_ids'];quantities=balances['quantities']
+        from lp_v2.rotation_state import control_market_profile,run_journal_sequence
+        active_profile=control_market_profile(profile)
+        market=active_profile['trading']['market_condition_id'];tokens=balances['token_ids'];quantities=balances['quantities']
         if (not fresh(balances['as_of']) or balances['condition_id']!=market or len(tokens)!=2 or len(set(tokens))!=2
                 or set(quantities)!=set(tokens) or any(not money(q) for q in quantities.values())):raise ValueError()
         state=Path(profile['files']['state_dir'])
@@ -25,11 +27,12 @@ def inventory_handoff(profile,balances):
         control=read_json(state/'live-control-run.json');process=read_json(state/'process.json');final=read_json(state/'stop-result.json')
         run_id=control['run_id']
         import re
+        from lp_v2.live_process import stop_result_matches
         if (not isinstance(run_id,str) or not re.fullmatch('[0-9a-f]{32}',run_id)
-                or process['run_id']!=run_id or final['run_id']!=run_id
+                or process['run_id']!=run_id or not stop_result_matches(process,final)
                 or type(process['pid']) is not int or process['pid']<=1 or not isinstance(process['identity'],str) or not process['identity']
                 or not same_identity(control['profile']['identity'],profile['identity'])
-                or control['profile']['trading']['market_condition_id']!=market
+                or control_market_profile(control['profile'])['trading']['market_condition_id']!=market
                 or Path(control['profile']['files']['state_dir']).resolve()!=state.resolve()
                 or type(final['exit_code']) is not int or final['exit_code']!=0):raise ValueError()
         # stop_result is the authoritative final financial snapshot. Any later event
@@ -39,12 +42,12 @@ def inventory_handoff(profile,balances):
         if not occupations or kind!='stop_result':raise ValueError()
         occupation_seq,occupation=occupations[-1]
         started=timestamp(control['started_at']);at=timestamp(drain['at'].isoformat());accounting=timestamp(drain['accounting_as_of'].isoformat())
-        if (type(control['journal_seq']) is not int or not control['journal_seq']<occupation_seq<seq
+        if (not run_journal_sequence(control,market)<occupation_seq<seq
                 or timestamp(occupation['at'].isoformat())<started or not started<accounting<=at
                 or type(drain['exit_code']) is not int or drain['exit_code']!=0 or drain['reconciliation']!='SUCCESS'
                 or not isinstance(drain['pending'],(list,tuple)) or drain['pending']
                 or not isinstance(drain['orders'],(list,tuple)) or not isinstance(drain['positions'],(list,tuple))
-                or merge_history_report(profile,drain.get('merges'))['status']!='PASS'):raise ValueError()
+                or merge_history_report(active_profile,drain.get('merges'))['status']!='PASS'):raise ValueError()
         for merge in drain['merges']:
             if (merge.request.yes_token_id,merge.request.no_token_id)!=tuple(tokens) or merge.observed_at>drain['at']:raise ValueError()
         for order in drain['orders']:

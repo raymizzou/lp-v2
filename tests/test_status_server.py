@@ -222,7 +222,7 @@ def test_build_summary_unknown_is_not_zero():
 
 
 def test_runtime_snapshot_served_without_network():
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     from lp_v2.status_server import make_handler
     from tests.test_readonly_runtime import ScriptedReads
     from tests.test_readonly_sdk import step_at
@@ -242,7 +242,7 @@ def test_runtime_snapshot_served_without_network():
 def test_health_identity_available_during_catalog_read():
     from threading import Event,Thread,Timer
     from time import monotonic
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     from lp_v2.status_server import make_handler
     from tests.test_readonly_runtime import ScriptedReads
     entered,release=Event(),Event()
@@ -256,7 +256,9 @@ def test_health_identity_available_during_catalog_read():
     handler=make_handler(runner.config,runner)
     assert request(handler,path='/healthz')[2]['code_sha']=='abc1234'
     def stepping():
-        try: runner.step(AT)
+        try:
+            runner.scanner.start(AT)
+            runner.step(AT)
         except BaseException as error: errors.append(error)
     thread=Thread(target=stepping);thread.start()
     watchdog=Timer(2,release.set);watchdog.start()
@@ -272,4 +274,73 @@ def test_health_identity_available_during_catalog_read():
     finally:
         release.set();watchdog.cancel();watchdog.join();thread.join(2)
     assert not thread.is_alive() and not errors
-    assert request(handler)[2]['freshness']['decision_as_of']==AT.isoformat()
+    assert runner.scanner.join(2)
+    from datetime import timedelta
+    ready_at=AT+timedelta(seconds=10)
+    runner.clock=lambda:ready_at
+    runner.step(ready_at)
+    assert request(handler)[2]['freshness']['decision_as_of']==ready_at.isoformat()
+    assert runner.scanner.stop(2)
+
+
+def test_rotation_scan_summary():
+    from decimal import Decimal as D
+    from lp_v2.models import CapitalBreakdown
+    from lp_v2.status_server import build_summary
+    from lp_v2.cli import RunConfig
+    from datetime import timedelta
+    import json
+
+    scan = dict(started_at=AT, finished_at=AT+timedelta(seconds=115), duration_s=115,
+        directory_duration_s=100, market_duration_s=15, pages=115, rows=11411,
+        requests=130, prescreened=5, reached_end=False, errors=[dict(page=116,reason='cursor_invalid')])
+    rotation = dict(current='a', candidate='b', phase='exiting', reason='waiting_inventory',
+        score_version='lp-v2-score-1', score_at=AT, switch_count=3, cancel_count=6, scan=scan)
+    summary = build_summary(RunConfig(D('100'),AT), CapitalBreakdown(*(D('0') for _ in range(6))), rotation=rotation)
+    result = json.loads(json.dumps(summary))['rotation']
+    assert result['scan'] == dict(scan,started_at=AT.isoformat(),finished_at=(AT+timedelta(seconds=115)).isoformat())
+    assert {k:result[k] for k in ('current','candidate','phase','reason','switch_count','cancel_count')} == dict(
+        current='a',candidate='b',phase='exiting',reason='waiting_inventory',switch_count=3,cancel_count=6)
+    assert result['coverage_label'] == '已扫范围内第一'
+    assert result['score_at'] == AT.isoformat()
+    assert 'plan' not in json.dumps(result)
+
+
+def test_blocked_region_remains_visible_in_health_and_summary():
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from lp_v2.status_server import make_handler
+    from tests.test_readonly_runtime import BlockedRegionReads
+    from tests.test_readonly_sdk import step_at
+
+    class ObservedReads(BlockedRegionReads):
+        def read_orders(self, now):
+            self.calls.append(('orders', now))
+            return super().read_orders(now)
+
+        def wallet_tail(self):
+            self.calls.append(('wallet_tail', None))
+            return super().wallet_tail()
+
+        def transport_safety(self):
+            self.calls.append(('transport_safety', None))
+            return super().transport_safety()
+
+        def safety(self, since):
+            self.calls.append(('safety', since))
+            return super().safety(since)
+
+    sdk = ObservedReads()
+    runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), sdk, code_sha='abc1234')
+    step_at(runner, AT)
+    calls = list(sdk.calls)
+    handler = make_handler(runner.config, runner)
+    status, _, health = request(handler, path='/healthz')
+    assert status == 200
+    assert health == dict(version='0.1.0', status='ok', code_sha='abc1234',
+                          capital_usdc='100', wallet_tail='a3F9', region_check='blocked')
+    status, _, summary = request(handler, path='/summary')
+    assert status == 200
+    assert summary['mode'] == 'read_only'
+    assert summary['run']['region_check'] == 'blocked'
+    assert summary == runner.snapshot()
+    assert sdk.calls == calls

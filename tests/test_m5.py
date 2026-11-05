@@ -336,7 +336,7 @@ def factory_inputs(tmp_path, monkeypatch):
         for name in ('gamma','clob'):
             getattr(p._ctx,name).close()
             p._ctx=replace(p._ctx,**{name:SyncTransport(base_url='https://'+name+'.polymarket.com',client=httpx.Client(base_url='https://'+name+'.polymarket.com',transport=httpx.MockTransport(handle)))})
-        return dict(public=p,http=httpx.Client(transport=httpx.MockTransport(handle)))
+        return dict(public=p,http=httpx.Client(transport=httpx.MockTransport(handle)),clock=lambda:ex.now)
     return config,ex,sources
 
 
@@ -402,6 +402,26 @@ def test_identity_market_transition(tmp_path,monkeypatch,mode):
     else:
         with pytest.raises(ValueError):create_live_runner(selected,**kwargs)
     assert not ex.posts and ex.sdk.cancel_order.call_count==0
+
+
+def test_frozen_identity_can_shrink_to_one_market(tmp_path,monkeypatch):
+    from lp_v2.live_runtime import LiveRunner,create_live_runner
+    config,ex,sources=factory_inputs(tmp_path,monkeypatch)
+    runner=create_live_runner(replace(config,markets=CIDS),**sources())
+    history=runner.sdk.journal.events()
+    runner.sdk.close();runner.observations.close()
+    (Path(config.state_dir)/'journal.sqlite').chmod(0o600)
+    runner=create_live_runner(replace(config,market=CIDS[1],markets=CIDS[1:2]),**sources())
+    try:
+        assert isinstance(runner,LiveRunner)
+        assert Path(runner.sdk.journal.path)==Path(config.state_dir)/'journal.sqlite'
+        assert dict(runner.sdk.markets)=={CIDS[1]:PAIRS[1]}
+        assert runner.sdk.journal.events()[:len(history)]==history
+        assert len(runner.sdk.journal.events('identity'))==2
+        assert not (Path(config.state_dir)/'rotation.sqlite').exists()
+        assert not ex.posts and ex.sdk.cancel_order.call_count==0
+    finally:
+        runner.sdk.close();runner.observations.close()
 
 
 def seed_financial_day(journal, *, owner=OWNER, day=AT):

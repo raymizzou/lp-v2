@@ -73,7 +73,7 @@ from decimal import Decimal
 h=json.load(sys.stdin)
 assert h.get("status")=="ok" and h.get("code_sha")==sys.argv[1]
 assert Decimal(h["capital_usdc"])==Decimal(sys.argv[2])
-assert h.get("wallet_tail")==sys.argv[3] and h.get("region_check")=="ok"
+assert h.get("wallet_tail")==sys.argv[3] and h.get("region_check") in ("ok", "blocked")
 ' "$sha" "$LP_V2_CAPITAL_USDC" "$LP_V2_WALLET_TAIL"; then healthy=1; break; fi
  # Wait only for readiness; failed identity stays a failure after bounded retries.
  sleep 1

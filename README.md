@@ -33,8 +33,9 @@ Tests prohibit socket networking, including loopback. HTTP tests exercise the ac
 `--capital-usdc` is required, finite and positive. Startup freezes the cap and
 UTC timestamp and serves **127.0.0.1:8765**. Stop with Ctrl-C. The independent
 read-only runtime reads market data and proposes pairs every ten seconds;
-scores refresh every ten minutes and wallet reads every thirty seconds.
-Live execution is a separate explicit opt-in; configuration remains frozen during each run.
+an independent public scanner refreshes ranking after each completed politics scan,
+and wallet reads refresh every thirty seconds.
+Live execution is a separate explicit opt-in; capital and account identity remain frozen during each run.
 
 - GET `/dashboard` (or `/`): standalone page, polling `/summary` every five seconds.
 - GET `/dashboard?demo=1`: explicit offline four-state demo.
@@ -65,7 +66,11 @@ explicit operator actions; see the [M4 guide](docs/M4_LIVE.md). Verified taker-o
 fee schedules preserve `feesEnabled=true` while maker plans carry explicit zero costs.
 Actual nonzero maker fill fees remain unsupported.
 
-The separate `run --live --market <condition_id>` path (repeat `--market` for up to three approved markets) connects the existing engine
+The separate `run --live --market <condition_id>` path accepts one to three approved markets.
+A single market is the startup seed for serial rotation; repeating `--market` for two or three
+markets selects the frozen M5 multi-market runner. Existing M5 journal histories stay on
+the frozen runner even when reduced to one market. Existing rotation state cannot be
+opened by the frozen multi-market path. Both paths connect the existing engine
 and ledger to the pinned SDK through an append-only SQLite journal. It includes
 owned-order drain/stop, restart reconciliation, receipt-gated Proxy merge, and
 actual UTC income in the existing dashboard. Read the [M4 operator guide](docs/M4_LIVE.md)
@@ -99,3 +104,24 @@ local live executor, zero open orders and exact selected-token inventory proof
 (including explicit two-token zero balances for new state). Incomplete evidence
 blocks startup; this covers one host and selected market, not distributed wallet
 exclusivity. See the [operator guide](docs/operations/live-control.md).
+
+## Scored single-market rotation
+
+Both modes scan politics (tag 2) to the end of the keyset catalog, with 100 rows
+per page and sequential public GET requests. Scans run separately from the
+10-second decision loop. `/summary.rotation` and the dashboard report coverage,
+scan timing, candidate exclusions, current market, waiting reasons and counters.
+An incomplete scan is labelled **已扫范围内第一** and cannot initiate rotation.
+
+A complete scan with a strictly higher executable score starts exit-only recovery;
+a tie holds. There is no debounce. Recovery cancels owned opening orders promptly,
+continues cost-bounded hedges and receipt-gated merges, and requires independent
+zero-risk proof before another market can enter. If the current market becomes
+ineligible, recovery starts without waiting for a complete scan.
+
+Automatic entry requires the existing confirmed `live on` action and its persisted
+window. After expiry, a valid current market continues; a new market cannot sign.
+A direct `run --live` without a bound on action grants no automatic-entry window.
+See the [rotation operator notes](docs/operations/live-control.md#single-market-rotation)
+for retained journals, restart and off behavior. This implementation is offline
+verified; deployment, live operation and field acceptance require separate authorization.

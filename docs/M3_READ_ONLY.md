@@ -10,13 +10,17 @@ The immutable startup cap changes only by stopping and re-running the command
 startup cap and restarting this service). There is no config reload, trading
 mode, mutation route, or service-changing restart CLI.
 
-The reader scans at most five SDK catalog pages of twenty political markets.
+A separate read-only worker scans political markets to the end of the SDK
+keyset catalog, using pages of 100 and sequential GET requests. Decision rounds
+consume completed snapshot copies and do not wait for the catalog.
 The official `polymarket-client==0.2.0` PublicClient returns typed Gamma markets,
 keyset paginators and typed CLOB order books. Book prices are Decimals, and both
 condition and token identities, constraints and exchange timestamps must match.
 Books older than sixty seconds are excluded. Every discovered excluded market
 retains a row/reason; a failed catalog read clears proposals and retains old
-last-success timestamps. The bounded scan is not a complete exchange catalog.
+last-success timestamps. Partial directory rounds retain discovered rows and
+coverage/errors, labelled **已扫范围内第一**. A completed politics scan covers that
+category only; it is not a claim to cover every exchange category.
 
 The typed Gamma model omits `in_play`. For a successful HTTP read of a JSON
 object from the fixed public CLOB market endpoint, the adapter accepts either
@@ -26,19 +30,25 @@ responses remain unknown/excluded; they cannot establish an absent key. Internal
 unknown market state still prevents proposals, and all other eligibility checks
 remain independent. No live endpoint validation is claimed in this batch.
 Fee-enabled markets are excluded until their executable maker fee inputs/model
-are verified; no zero fee is inferred from absent fee data. Missing region
-proof also prevents proposals. These conservative exclusions may yield no
+are verified; no zero fee is inferred from absent fee data. Explicit region
+`ok` or `blocked` permits read-only observation and simulated proposals. For
+example, a Japan observation returning `blocked` remains visible as `blocked`
+in `/healthz`, `/summary` and the dashboard; it is never rewritten to `ok`.
+This permits only read-only planning and grants no trading or mutation access.
+UNKNOWN, an invalid region value, or a failed region read clears proposals and
+simulated reserves. Recovery computes a fresh proposal rather than replaying
+one cleared during uncertainty. These conservative exclusions may yield no
 proposals on live data, and are visible rather than hidden.
 
-Decisions run on ten-second boundaries, score snapshots/ranking on ten-minute
-boundaries, and wallet plus legacy-order reads on thirty-second boundaries. Safe existing simulated
+Decisions run on ten-second boundaries, score snapshots/ranking update with
+each completed scan, and wallet plus legacy-order reads on thirty-second boundaries. Safe existing simulated
 quote pairs retain their prices for at least sixty seconds before repricing.
 Every round rechecks identity, quantity, post-only ask, reward band, fees,
 safety cushion and aggregate capital/risk limits; unsafe pairs are withdrawn
 immediately instead of being kept alive by that timer. This is only proposal
 state, with no actual submissions or occupation. Known scores and precise
 source exclusion reasons remain visible for excluded markets and follow the
-same ten-minute score cadence. Missing score inputs remain UNKNOWN. A new simulation
+same completed-scan cadence. Missing score inputs remain UNKNOWN. A new simulation
 ledger receives every Engine.decide round; all returned intents remain local
 proposals and are never replayed/submitted. Real lp-v2 occupation is known zero
 because this read-only process has no submission capability. Old wallet orders
@@ -138,8 +148,12 @@ Before any future approved deployment:
 - The script fetches only its dedicated repo, verifies main ancestry, archives
   the exact commit into a new release, installs a venv, records completion,
   atomically switches `current`, restarts only `lp-v2.service`, and checks exact
-  SHA/capital/wallet tail/region. Health failure returns nonzero. A partial
-  installation is retained for diagnosis and cannot be used as a release.
+  SHA/capital/wallet tail/region. Health acceptance requires status `ok`, the
+  exact SHA, approved capital and wallet tail, and explicit region `ok` or
+  `blocked`; UNKNOWN, missing or invalid region still fails. Thus a known Japan
+  `blocked` observation alone does not fail read-only deployment health.
+  Health failure returns nonzero. A partial installation is retained for
+  diagnosis and cannot be used as a release.
 - CI success and `/healthz` identity do not prove 24-hour acceptance or grant
   deployment authority. Capture startup-to-health elapsed time; the five-minute
   operational target has not been demonstrated on a real host.

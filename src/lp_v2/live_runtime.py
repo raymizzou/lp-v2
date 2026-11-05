@@ -15,6 +15,7 @@ class LiveRunner:
         self.config, self.sdk, self.observations, self.clock = config, sdk, observations, clock
         self._condition_id = sdk.condition_id
         self._markets = sdk.markets
+        self._reconciled_late_fills = 0
         self.ledger = Ledger(sdk.owner, config.capital_usdc)
         self.engine = Engine(self.ledger)
         self.stop = stop if stop is not None else Event()
@@ -26,6 +27,7 @@ class LiveRunner:
         self._accounting_status = UNKNOWN
         self._income_at = None
         self._safety_cancels = {}
+        self._opening_cancels = {}
         self._region = UNKNOWN
         self._m4 = {key: UNKNOWN for key in (*M4_FIELDS,"net_profit")}
         self._freshness = {}
@@ -60,7 +62,7 @@ class LiveRunner:
         with self._lock:
             return deepcopy(self._snapshot)
 
-    def step(self, now=None):
+    def step(self, now=None, *, allow_open=True, opening_policy=None):
         now = self.clock() if now is None else now
         if self._next is not None and (now-self._next).total_seconds() < 10:
             return self.snapshot()
@@ -70,18 +72,22 @@ class LiveRunner:
             self._region = UNKNOWN
             plans = ()
             try:
-                self.ledger.reconcile(self.sdk)
+                self._reconcile()
                 reconciled = self.sdk.orders_verified()
                 if not reconciled:
                     raise ValueError('owned order readback remains uncertain')
                 self._accounting_at = now
                 unavailable = set()
+                market_ineligible = False
                 if hasattr(self.observations,'read_fixed_market'):
                     rows = []
                     for cid in self._markets:
                         try:
                             current = self.observations.read_fixed_market(now,cid)
-                        except Exception:
+                        except Exception as error:
+                            from lp_v2.readonly_sdk import FixedMarketIneligible
+                            if isinstance(error, FixedMarketIneligible):
+                                market_ineligible = True
                             unavailable.add(cid)
                             current = [dict(condition_id=cid,title=next((r['title'] for r in self._rows if r['condition_id']==cid),UNKNOWN),
                                 eligible=False,skip_reason='市场读回不可用，暂停下单')]
@@ -117,17 +123,42 @@ class LiveRunner:
                 blocked = region.get('blocked')
                 country = region.get('country')
                 self._region = 'ok' if blocked is False else 'blocked' if blocked is True else UNKNOWN
-                allowed = (type(blocked) is bool and isinstance(country, str) and len(country) == 2
-                           and (blocked is False or (country == 'JP' and self.sdk.client.get_closed_only_mode() is False)))
+                region_valid = None
+                if type(blocked) is bool and isinstance(country, str) and len(country) == 2:
+                    if blocked is False:
+                        region_valid = True
+                    elif country == 'JP':
+                        closed_only = self.sdk.client.get_closed_only_mode()
+                        if type(closed_only) is bool:
+                            region_valid = not closed_only
+                    else:
+                        region_valid = False
+                allowed = region_valid is True
                 if not allowed:
                     self._cancel_owned(now.timestamp(),self._safety_cancels,at=now)
                     self.sdk.journal.append('region_denied', dict(at=now,region_check=self._region))
                     for row in self._rows:
                         row.update(eligible=False,skip_reason='地区检查未通过或未知')
-                decision = self.engine.decide(plans, now=now) if allowed and not self.stop.is_set() else None
+                if opening_policy is not None:
+                    from lp_v2.scoring import eligible_market
+                    # Only affirmative ineligibility can request rotation exit.
+                    # Missing observations still deny opening without ending the run.
+                    valid = (False if market_ineligible or region_valid is False or any(not eligible_market(p.market) for p in plans)
+                             else True if allowed and plans else None)
+                    allow_open = opening_policy(valid, now)
+                decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
                 if decision is not None:
                     for c in decision.cancel:
+                        self._opening_cancels[c.order_id] = now.timestamp()
                         self.ledger.apply_order(self.sdk.cancel_order(c.order_id, at=now))
+                    if not allow_open:
+                        from lp_v2.models import OrderStatus
+                        for order in self.ledger.snapshot().orders:
+                            if (order.request.purpose == 'opening'
+                                    and (not order.authoritative or order.status == OrderStatus.LIVE)
+                                    and now.timestamp()-self._opening_cancels.get(order.order_id,float('-inf')) >= 5):
+                                self._opening_cancels[order.order_id] = now.timestamp()
+                                self.ledger.apply_order(self.sdk.cancel_order(order.order_id,at=now))
                     for request in decision.place:
                         self.ledger.apply_order(self.sdk.place_order(request, at=now))
                     for request in decision.merge:
@@ -143,7 +174,10 @@ class LiveRunner:
                 self._m4 = self._m4_by_market[self.condition_id]
                 self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
-            except Exception:
+            except Exception as error:
+                if opening_policy is not None:
+                    from lp_v2.readonly_sdk import FixedMarketIneligible
+                    opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
                 self._valuation_at = self._income_at = None
                 self._valuations.clear()
@@ -157,6 +191,25 @@ class LiveRunner:
             with self._lock:
                 self._snapshot = self._build(now)
             return self.snapshot()
+
+    def _reconcile(self):
+        """Rebuild only from a newly authenticated, complete late-fill revision.
+
+        Ledger's direct contradictory-terminal guards remain intact. A fresh
+        ledger must independently reconcile every order, trade, merge and chain
+        balance before replacing the previous owned snapshot.
+        """
+        try:
+            self.ledger.reconcile(self.sdk)
+        except ValueError:
+            revisions = len(self.sdk.journal.events('late_fill_reconciliation'))
+            if revisions <= self._reconciled_late_fills:
+                raise
+            candidate = Ledger(self.sdk.owner,self.config.capital_usdc)
+            candidate.reconcile(self.sdk)
+            self.ledger = candidate
+            self.engine.ledger = candidate
+        self._reconciled_late_fills = len(self.sdk.journal.events('late_fill_reconciliation'))
 
     def _audit(self, now, reconciled, plans=()):
         from lp_v2.models import Outcome,OrderStatus
@@ -335,7 +388,7 @@ class LiveRunner:
                 # Current own presence overrides stale terminal history, even if other reads fail.
                 self._cancel_owned(monotonic(),attempted,active=active)
                 try:
-                    self.ledger.reconcile(self.sdk)
+                    self._reconcile()
                     if not opens_verified:
                         raise ValueError('incomplete open order readback')
                     reconciled = True
@@ -386,7 +439,7 @@ class MarketCheckFailure(ValueError):
         super().__init__(self.reason_code)
 
 
-def create_live_runner(config, *, public=None, http=None):
+def create_live_runner(config, *, public=None, http=None, clock=None):
     import json
     from pathlib import Path
     from polymarket import SecureClient
@@ -412,8 +465,9 @@ def create_live_runner(config, *, public=None, http=None):
             raise ValueError('identity mismatch')
     except Exception:
         raise ValueError('signing and L2/Proxy identity mismatch') from None
-    observations=ReadOnlySDK(public=public,http=http)
-    client=journal=None
+    clock = clock or (lambda: datetime.now(UTC))
+    observations=ReadOnlySDK(public=public,http=http,credentials=c,clock=clock)
+    client=journal=scanner=None
     try:
         selected = config.markets or (config.market,)
         if not 1 <= len(selected) <= 3 or len(set(selected)) != len(selected):
@@ -428,7 +482,8 @@ def create_live_runner(config, *, public=None, http=None):
         tokens=markets[selected[0]]
         with owner_file(config.relayer_credentials_file) as source:
             try:
-                relayer_key=parse_relayer_credentials(json.load(source),signer)
+                relayer_payload=json.load(source)
+                relayer_key=parse_relayer_credentials(relayer_payload,signer)
             except (ValueError,TypeError):
                 raise ValueError('invalid relayer credentials') from None
         client=SecureClient.create(private_key=key,wallet=c.wallet_address,
@@ -437,16 +492,46 @@ def create_live_runner(config, *, public=None, http=None):
         if (client.wallet_type != 'POLY_PROXY' or str(client.wallet).lower() != c.wallet_address.lower()
                 or str(client.signer).lower() != c.signer_address.lower()):
             raise ValueError('signing and L2 identities disagree')
-        journal=Journal(Path(config.state_dir)/'journal.sqlite')
-        owner='lp-v2:'+c.wallet_address.lower()
-        sdk=LiveSDK(client,journal,owner=owner,condition_id=selected[0],token_ids=tokens,
-            markets=markets,wallet=c.wallet_address,signer=c.signer_address)
-        _adopt_identity(sdk,at=config.started_at)
+        identity=dict(owner='lp-v2:'+c.wallet_address.lower(),condition_id=selected[0],token_ids=tokens)
+        shared_path=Path(config.state_dir)/'journal.sqlite'
+        frozen_markets = len(selected) > 1
+        if not frozen_markets and shared_path.exists():
+            previous=Journal(shared_path,readonly=True)
+            try:
+                frozen_markets = any('markets' in row for _,row in previous.events('identity'))
+            finally:
+                previous.close()
+        if frozen_markets:
+            if any(path.exists() or path.is_symlink() for path in
+                   (Path(config.state_dir)/'rotation.sqlite',Path(config.state_dir)/'markets')):
+                raise ValueError('rotation history cannot be opened as frozen markets')
+            journal=Journal(shared_path)
+            sdk=LiveSDK(client,journal,**identity,markets=markets,wallet=c.wallet_address,signer=c.signer_address,clock=clock)
+            _adopt_identity(sdk,at=config.started_at)
+        else:
+            from lp_v2.rotation_state import carry_legacy_journal,open_market_journal,read_control_window
+            action_id,window_end = read_control_window(config)
+            carry_legacy_journal(config.state_dir,identity)
+            journal=open_market_journal(config.state_dir,identity)
+            sdk=LiveSDK(client,journal,**identity,wallet=c.wallet_address,signer=c.signer_address,clock=clock)
         sdk.rpc,sdk.relayer=client._ctx.rpc,client._ctx.relayer
         import httpx
         sdk.http=httpx.Client(timeout=5,trust_env=False,follow_redirects=False)
-        return LiveRunner(config,sdk,observations)
+        current = LiveRunner(config,sdk,observations,clock=clock)
+        if frozen_markets:
+            return current
+        from lp_v2.live_control.profiles import read_json
+        control_run_id=read_json(Path(config.state_dir)/'process.json')['run_id'] if action_id is not None else None
+        from lp_v2.rotation_live import RotationRunner
+        from lp_v2.rotation_scan import ScanWorker
+        scanner = ScanWorker(observations.new_scan_sdk(),clock=clock)
+        return RotationRunner(config,current,scanner,action_id=action_id,window_end=window_end,clock=clock,
+            account_identity=dict(signer_address=c.signer_address,wallet_address=c.wallet_address,signature_type=c.signature_type),
+            relayer=relayer_payload,control_run_id=control_run_id)
     except BaseException:
+        if scanner is not None:
+            scanner.stop(0)
+            scanner.sdk.close()
         if journal is not None:
             journal.close()
         if client is not None:

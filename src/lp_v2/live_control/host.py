@@ -81,7 +81,9 @@ def account_checks(profile):
             try:
                 from lp_v2.readonly_sdk import ConditionalIdentityUnavailable
                 from lp_v2.live_control.handoff import inventory_handoff
-                quantities=sdk.read_conditional_inventory(datetime.now(UTC),profile['trading']['market_condition_id'])
+                from lp_v2.rotation_state import control_market_profile
+                active_profile=control_market_profile(profile)
+                quantities=sdk.read_conditional_inventory(datetime.now(UTC),active_profile['trading']['market_condition_id'])
                 result['inventory_handoff']=inventory_handoff(profile,quantities)
             except ConditionalIdentityUnavailable:
                 result['inventory_handoff']=fact('UNKNOWN','CONDITIONAL_IDENTITY_UNAVAILABLE')
@@ -146,10 +148,20 @@ def process_stopped(profile):
         return False
 
 
+def journal_path(profile):
+    from lp_v2.rotation_state import control_market_profile, market_path
+    state = Path(profile['files']['state_dir'])
+    active = control_market_profile(profile)['trading']['market_condition_id']
+    path = market_path(state,active)
+    if (state/'rotation.sqlite').exists() or path.exists() or path.is_symlink():
+        return path
+    return state/'journal.sqlite'
+
+
 def journal_present(profile):
     """Do not mistake interrupted sidecars for new state or recover them on read."""
     import os
-    path=Path(profile['files']['state_dir'])/'journal.sqlite'
+    path=journal_path(profile)
     try:
         path.lstat();present=True
     except FileNotFoundError:
@@ -170,7 +182,7 @@ def journal_present(profile):
 def journal_rows(profile,kind=None):
     import sqlite3
     from lp_v2.journal import decode
-    path=Path(profile['files']['state_dir'])/'journal.sqlite'
+    path=journal_path(profile)
     # No Journal constructor, pragmas or database creation on observational reads.
     if not journal_present(profile):raise ValueError('journal missing')
     with owner_file(path): pass
@@ -266,14 +278,16 @@ def off(request):
     try:
         seq,drain=journal_rows(profile,'stop_result')[-1]
         inventory=inventory_report(drain['inventory'])
-        merges=merge_history_report(profile,drain.get('merges'))
+        from lp_v2.rotation_state import control_market_profile,run_journal_sequence
+        merges=merge_history_report(control_market_profile(profile),drain.get('merges'))
         final=read_json(state/'stop-result.json')
-        if (final['run_id']==record['run_id'] and type(final['exit_code']) is int and final['exit_code']==0
+        from lp_v2.live_process import stop_result_matches
+        if (stop_result_matches(process,final) and type(final['exit_code']) is int and final['exit_code']==0
                 and type(drain['exit_code']) is int and drain['exit_code']==0 and drain['reconciliation']=='SUCCESS'
-                and seq>record['journal_seq'] and timestamp(drain['at'].isoformat())>timestamp(record['started_at'])
+                and seq>run_journal_sequence(record,control_market_profile(profile)['trading']['market_condition_id']) and timestamp(drain['at'].isoformat())>timestamp(record['started_at'])
                 and merges['status']=='PASS' and not drain['pending'] and all(order.authoritative and order.status.value in ('filled','cancelled') for order in drain['orders'])):
             drained='PASS'
-        elif final['run_id']==record['run_id'] and final['exit_code']!=0:
+        elif stop_result_matches(process,final) and final['exit_code']!=0:
             drained='FAIL'
     except Exception:
         pass
@@ -421,8 +435,10 @@ def filesystem_checks(profile):
         if journal_present(profile):
             from lp_v2.live_control.identity import single_market_tokens
             identities=journal_rows(profile,'identity')
+            from lp_v2.rotation_state import control_market_profile
+            active_profile=control_market_profile(profile)
             tokens=[single_market_tokens(row,'lp-v2:'+profile['identity']['wallet_address'].lower(),
-                profile['trading']['market_condition_id']) for _,row in identities]
+                active_profile['trading']['market_condition_id']) for _,row in identities]
             good=bool(tokens) and all(pair==tokens[0] for pair in tokens)
             checks['state_identity']=fact('PASS' if good else 'FAIL','JOURNAL_FROZEN_IDENTITY')
         else:
@@ -525,10 +541,53 @@ def observe(request):
     import httpx
     with httpx.Client(timeout=5,trust_env=False,follow_redirects=False) as client:
         response=client.get('http://127.0.0.1:8765/summary');response.raise_for_status();row=response.json()
-    return dict(schema_version=1,run_id=record['run_id'],executor_running=identity is not None and identity==process['identity']
+    result=dict(schema_version=1,run_id=record['run_id'],executor_running=identity is not None and identity==process['identity']
                 and str(process['pid'])==live.get('MainPID') and live.get('ActiveState')=='active',
                 readonly_stopped=readonly.get('MainPID')=='0' and readonly.get('ActiveState')=='inactive',
                 identity=derived['identity'],summary=safe_summary(row))
+
+    result['startup_verification']=record_start_observation(request,result)
+    return result
+
+
+def record_start_observation(request,snapshot):
+    """Persist the existing two-seed-round proof under the control record lock."""
+    import fcntl,os,stat
+    from lp_v2.live_control.profiles import atomic_json,timestamp
+    from lp_v2.live_control.workflow import valid_round
+    profile=request['profile'];state=Path(profile['files']['state_dir'])
+    fd=None
+    try:
+        secure_directory(state)
+        fd=os.open(state/'control.lock',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        info=os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or stat.S_IMODE(info.st_mode)!=0o600:
+            raise ValueError('control lock identity')
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        record=read_json(state/'live-control-run.json');process=read_json(state/'process.json')
+        if (record['profile']!=profile or record['run_id']!=request['run_id'] or process['run_id']!=record['run_id']
+                or request.get('action_id',record['action_id'])!=record['action_id'] or not record['window_end']):
+            raise ValueError('startup proof run mismatch')
+        bound=dict(action_id=record['action_id'],run_id=record['run_id'],window_end=record['window_end'],
+                   seed_market=profile['trading']['market_condition_id'])
+        prior=record.get('startup_verified',{})
+        if all(prior.get(key)==value for key,value in bound.items()) and prior.get('verified_rounds')==2:
+            return dict(status='PASS',verified_rounds=2)
+        moment=valid_round(profile,record['run_id'],snapshot,record['started_at'])
+        samples=record.get('startup_samples',[])
+        if moment is None:
+            samples=[]
+        elif not samples or all(new>timestamp(old) for new,old in zip(moment,samples[-1])):
+            samples=[*samples,[value.isoformat() for value in moment]][-2:]
+        record['startup_samples']=samples
+        if len(samples)==2:
+            record['startup_verified']=dict(bound,verified_rounds=2,moments=samples,verified_at=now())
+        atomic_json(state/'live-control-run.json',record)
+        return dict(status='PASS' if len(samples)==2 else 'PENDING',verified_rounds=len(samples))
+    except Exception:
+        return dict(status='UNKNOWN',verified_rounds=0)
+    finally:
+        if fd is not None:os.close(fd)
 
 
 def start(request):
@@ -541,11 +600,15 @@ def start(request):
     if not confirmed(request,'on'): return dict(status='UNKNOWN',reason='CONFIRMATION_EXPIRED')
     existing=read_json(state/'process.json') if (state/'process.json').exists() else {}
     previous=existing.get('run_id')
-    seq=max((seq for seq,_ in journal_rows(profile,'occupation')),default=0) if (state/'journal.sqlite').exists() else 0
+    seq=max((seq for seq,_ in journal_rows(profile,'occupation')),default=0) if journal_present(profile) else 0
+    from lp_v2.rotation_state import journal_start_sequences
+    journal_seqs=journal_start_sequences(profile)
+    if (state/'journal.sqlite').exists() and not journal_seqs:
+        journal_seqs[profile['trading']['market_condition_id']]=seq
     from lp_v2.live_control.invocation import binding,file_snapshot
     invocation=dict(argv=binding(profile,system_properties(profile['services']['live_unit'],prove_exec=True),env_values(profile),run),
                     snapshot=file_snapshot(profile))
-    record=dict(profile=profile,run_id=None,started_at=now(),journal_seq=seq,action_id=request['action_id'],invocation=invocation)
+    record=dict(profile=profile,run_id=None,started_at=now(),journal_seq=seq,journal_seqs=journal_seqs,action_id=request['action_id'],window_end=request['window_end'],invocation=invocation)
     atomic_json(state/'live-control-run.json',record)
     if run(['systemctl','stop',profile['services']['readonly_unit']]).returncode:
         return dict(status='UNKNOWN',reason='READONLY_STOP_FAILED')
@@ -556,7 +619,14 @@ def start(request):
             process=read_json(state/'process.json')
             from lp_v2.live_process import process_identity
             if process['run_id']!=previous and process_identity(process['pid']) is not None and process_identity(process['pid'])==process['identity']:
-                record['run_id']=process['run_id'];atomic_json(state/'live-control-run.json',record)
+                latest=read_json(state/'live-control-run.json')
+                if latest['profile']!=profile or latest['action_id']!=request['action_id']:
+                    raise ValueError('on record changed during start')
+                record=dict(latest,run_id=process['run_id'])
+                if 'lease_id' in process:
+                    from lp_v2.rotation_state import physical_binding
+                    record['process_binding']=physical_binding(process)
+                atomic_json(state/'live-control-run.json',record)
                 return dict(status='ACCEPTED',run_id=record['run_id'],started_at=record['started_at'])
         except Exception:
             pass

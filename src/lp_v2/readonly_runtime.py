@@ -13,8 +13,10 @@ from lp_v2.status_server import build_summary, UNKNOWN
 
 
 class ReadOnlyRunner:
-    def __init__(self, config, sdk, *, code_sha=UNKNOWN, clock=lambda: datetime.now(UTC), stop=None):
+    def __init__(self, config, sdk, *, code_sha=UNKNOWN, clock=lambda: datetime.now(UTC), stop=None, scanner=None):
         self.config, self.sdk, self.clock = config, sdk, clock
+        from lp_v2.rotation_scan import ScanWorker
+        self.scanner = scanner or ScanWorker(sdk.new_scan_sdk(), clock=clock)
         self.stop = stop if stop is not None else Event()
         self.__lock = Lock()
         self.__run = dict(code_sha=code_sha, wallet_tail=sdk.wallet_tail(), region_check=UNKNOWN)
@@ -28,6 +30,7 @@ class ReadOnlyRunner:
         self.__engine = Engine(Ledger("lp-v2:simulation", config.capital_usdc))
         self.__wallet = {}
         self.__wallet_orders = {}
+        self.__rotation = {}
         self.__snapshot = self.__build(None)
 
     def __build(self, now):
@@ -35,7 +38,7 @@ class ReadOnlyRunner:
                              freshness=self.__freshness, wallet=self.__wallet,
                              wallet_orders=self.__wallet_orders,
                              transport_safety=self.sdk.transport_safety(),
-                             safety=self.sdk.safety(self.config.started_at), markets=self.__rows)
+                             safety=self.sdk.safety(self.config.started_at), markets=self.__rows, rotation=self.__rotation)
 
     def snapshot(self):
         with self.__lock:
@@ -64,14 +67,11 @@ class ReadOnlyRunner:
                 self.__wallet_orders.update(legacy_order_count=count, as_of=now, last_success_at=now)
             except Exception:
                 self.__wallet_orders.update(legacy_order_count=UNKNOWN, as_of=None)
-        score_at = self.__score_started_at
-        round_started = now
-        score_due = score_at is None or (now - score_at).total_seconds() >= 600
         if not due('decision', 10):
             return self.snapshot()
         try:
             self.__run['region_check'] = self.sdk.read_region()
-            if self.__run['region_check'] != 'ok':
+            if self.__run['region_check'] not in ('ok', 'blocked'):
                 for entry in self.__proposals.values():
                     entry['quotes'] = None
                 for row in self.__rows:
@@ -80,7 +80,21 @@ class ReadOnlyRunner:
             # Decision/score success times remain untouched until computation.
             with self.__lock:
                 self.__snapshot = self.__build(now)
-            rows = self.sdk.read_markets(now)
+            scan = self.scanner.latest()
+            if scan is None:
+                with self.__lock:
+                    self.__snapshot = self.__build(now)
+                return self.snapshot()
+            if not scan.rows and scan.scan.get('errors'):
+                raise ValueError('scan unavailable')
+            rows = list(scan.rows)
+            score_token = (scan.scan.get('started_at'),scan.scan.get('finished_at'))
+            score_due = self.__score_started_at != score_token
+            from lp_v2.rotation import rank_candidates
+            ranking = rank_candidates([r['plan'] for r in rows if r.get('plan') is not None], startup_cap=self.config.capital_usdc)
+            self.__rotation = dict(current=None, candidate=ranking.leader.condition_id if ranking.leader else None,
+                phase='read_only', reason='ranking_only', score_version=ranking.score_version,
+                score_at=scan.scan['finished_at'] if scan else None, scan=scan.scan if scan else {}, switch_count=0, cancel_count=0)
             completed = self.clock()
             if (not isinstance(completed,datetime) or completed.tzinfo is None or completed.utcoffset() is None or completed < now):
                 raise ValueError('local observation clock unavailable or backward')
@@ -88,7 +102,7 @@ class ReadOnlyRunner:
                 if row.get('plan') is not None:
                     observed = row.get('observation_completed_at')
                     if (not isinstance(observed,datetime) or observed.tzinfo is None
-                            or observed.utcoffset() is None or not now <= observed <= completed):
+                            or observed.utcoffset() is None or observed > completed):
                         raise ValueError('market observation completion unavailable or discontinuous')
             now = completed
         except Exception:
@@ -114,14 +128,15 @@ class ReadOnlyRunner:
             self.__scores = scores
             if scores or not rows:
                 self.__freshness['scores_as_of'] = now
-                self.__score_started_at = round_started
+                self.__score_started_at = score_token
+                self.__engine = Engine(self.__engine.ledger)
         for row in rows:
             row['score'] = self.__scores.get(row['condition_id'], UNKNOWN)
         # A new simulation per round avoids carrying unexecuted pending orders
         # forward as reality. This ledger is never exposed as actual occupation.
         ledger = Ledger('lp-v2:simulation', self.config.capital_usdc,
                         balance=Balance(self.config.capital_usdc, now))
-        plans = [r['plan'] for r in rows if r.get('plan') is not None and r.get('eligible') is True and r['score'] != UNKNOWN and self.__run['region_check'] == 'ok']
+        plans = [r['plan'] for r in rows if r.get('plan') is not None and r.get('eligible') is True and r['score'] != UNKNOWN and self.__run['region_check'] in ('ok', 'blocked')]
         self.__engine.ledger = ledger
         decision = self.__engine.decide(plans, now=now)
         occupied = risk = Decimal('0')
@@ -139,10 +154,11 @@ class ReadOnlyRunner:
                     previous['quotes'] = None
                 continue
             fresh = tuple(r.quote for r in decision.place if r.quote.condition_id == cid)
-            waiting = previous is not None and (now-previous['at']).total_seconds() < 60
+            waiting = (previous is not None and previous['quotes'] is not None
+                       and (now-previous['at']).total_seconds() < 60)
             pair = previous['quotes'] if waiting else fresh
             allowed = (row.get('eligible') is True and row['score'] != UNKNOWN
-                       and self.__run['region_check'] == 'ok' and self.__safe_pair(pair, p))
+                       and self.__run['region_check'] in ('ok', 'blocked') and self.__safe_pair(pair, p))
             if allowed:
                 quantity = pair[0].quantity
                 pair_risk = max((q.price + fee) * quantity for q, fee in zip(pair, p.fee_per_share))
@@ -199,7 +215,10 @@ class ReadOnlyRunner:
     def run(self):
         try:
             while not self.stop.is_set():
+                self.scanner.start()
                 self.step()
                 self.stop.wait(1)
         finally:
+            if self.scanner.stop(30):
+                self.scanner.sdk.close()
             self.sdk.close()

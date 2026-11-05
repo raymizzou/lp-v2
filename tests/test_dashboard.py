@@ -9,7 +9,7 @@ from tests.test_readonly_runtime import ScriptedReads
 
 def test_standalone_dashboard_contract():
     from lp_v2.status_server import make_handler
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),ScriptedReads())
     handler=make_handler(runner.config,runner)
     code,headers,html=request(handler,path='/dashboard')
@@ -24,7 +24,7 @@ def test_standalone_dashboard_contract():
 
 def test_poll_pending_and_out_of_order_remain_truthful():
     from lp_v2.status_server import make_handler
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),ScriptedReads())
     handler=make_handler(runner.config,runner)
     html=request(handler,path='/dashboard')[2].decode()
@@ -36,7 +36,7 @@ def test_poll_pending_and_out_of_order_remain_truthful():
 def test_served_dashboard_csp_allows_same_origin_assets():
     from html.parser import HTMLParser
     from lp_v2.status_server import make_handler
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),ScriptedReads())
     handler=make_handler(runner.config,runner)
     status,headers,body=request(handler,path='/dashboard?demo=1')
@@ -65,16 +65,40 @@ def test_served_dashboard_csp_allows_same_origin_assets():
 
 def test_live_income_fourteen_columns():
     from lp_v2.status_server import make_handler
-    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     runner=ReadOnlyRunner(RunConfig(Decimal('100'),AT),ScriptedReads())
     handler=make_handler(runner.config,runner)
     html=request(handler,path='/dashboard')[2].decode()
     js=request(handler,path='/dashboard.js')[2].decode()
-    payload=runner.step(AT)
+    from tests.test_readonly_sdk import step_at
+    payload=step_at(runner,AT)
     payload['mode']='live';payload['safety']['orders_sent']=2
     payload['markets'][0]['title']='<img src=x onerror=alert(1)>'
     payload['markets'][0]['m4']=dict(lp_yield_pct_per_day='10',reward_today='2',rebate_today='1',reward_share='25',
         paired_profit='0.20',unpaired_inventory='4',net_yield_pct_per_day='15',net_profit='3.00')
     result=subprocess.run(['node',str(Path(__file__).with_name('dashboard_live_harness.cjs'))],
         input=json.dumps(dict(html=html,js=js,payload=payload)),text=True,capture_output=True,timeout=15)
+    assert result.returncode==0,result.stdout+result.stderr
+
+
+def test_rotation_coverage_and_waiting():
+    js=Path('src/lp_v2/dashboard/dashboard.js').read_text()
+    html=Path('src/lp_v2/dashboard/index.html').read_text()
+    program=r'''
+const vm=require('node:vm'),fs=require('node:fs'),assert=require('node:assert/strict');
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+const base=JSON.parse(input.html.match(/id="summary-data">([\s\S]*?)<\/script>/)[1]);
+const target={innerHTML:''};
+const document={getElementById:id=>id==='summary-data'?{textContent:JSON.stringify(base)}:target,querySelectorAll:()=>[],documentElement:{dataset:{}}};
+const context=vm.createContext({document,structuredClone,Intl,Date,Number,URLSearchParams,location:{search:'?demo=1',hash:''},history:{replaceState(){}}});
+vm.runInContext(input.js,context);
+context.payload={...base,rotation:{current:'market-A',candidate:'<market-B>',phase:'exiting',reason:'waiting_inventory',switch_count:3,cancel_count:6,scan:{started_at:base.as_of,finished_at:base.as_of,duration_s:115,directory_duration_s:100,market_duration_s:15,pages:115,rows:11411,requests:130,prescreened:5,reached_end:false,errors:[{page:116,reason:'cursor_invalid'}]}}};
+vm.runInContext("render('normal',payload)",context);
+for(const expected of ['已扫范围内第一','market-A','&lt;market-B&gt;','waiting_inventory','115','11411','130','100','15','切换 3','撤单 6'])assert.ok(target.innerHTML.includes(expected),expected);
+assert.ok(!target.innerHTML.includes('政治类完整扫描第一'));
+context.payload.rotation.scan.reached_end=true;context.payload.rotation.scan.errors=[];
+vm.runInContext("render('normal',payload)",context);
+assert.ok(target.innerHTML.includes('政治类完整扫描第一'));
+'''
+    result=subprocess.run(['node','-e',program],input=json.dumps(dict(js=js,html=html)),text=True,capture_output=True,timeout=10)
     assert result.returncode==0,result.stdout+result.stderr

@@ -19,7 +19,7 @@ class Engine:
         self._ranked_at = None
         self._ranked_ids = ()
 
-    def decide(self, plans: Sequence[MarketPlan], *, now: datetime) -> Decision:
+    def decide(self, plans: Sequence[MarketPlan], *, now: datetime, allow_open: bool = True) -> Decision:
         if len({p.market.condition_id for p in plans}) != len(plans):
             raise ValueError("duplicate market plans")
         if self._ranked_at is None or now - self._ranked_at >= timedelta(seconds=600):
@@ -40,9 +40,10 @@ class Engine:
             for order in state.orders:
                 if (order.request.quote.condition_id != cid or order.order_id in cancel_ids
                         or (order.authoritative and order.status != OrderStatus.LIVE)
-                        or now - order.request.created_at < timedelta(seconds=60)):
+                        or (now - order.request.created_at < timedelta(seconds=60)
+                            and not (not allow_open and order.request.purpose == 'opening'))):
                     continue
-                if self._needs_cancel(order, plan, state, now):
+                if (not allow_open and order.request.purpose == 'opening') or self._needs_cancel(order, plan, state, now):
                     cancel = CancelRequest(order.order_id, order.request.request_id, state.owner, cid, now)
                     if self.ledger.register_cancel(cancel):
                         cancels.append(cancel)
@@ -50,7 +51,7 @@ class Engine:
             if all(token in positions and positions[token].quantity > 0 for token in reservation.token_ids):
                 quantity = self.ledger.mergeable_quantity(cid)
                 count = sum(f.condition_id == cid for f in state.fills)
-                identity = f"{state.owner}:merge:{cid}:{count}"
+                identity = f"{state.owner}:{cid[:8]}:merge:{cid}:{count}"
                 if quantity > 0 and all(r.merge_id != identity for r in reservation.merge_requests):
                     terms = self.ledger.reservation_terms(cid)
                     merge = MergeRequest(identity, state.owner, cid, *terms.token_ids, quantity, now, terms.generation)
@@ -73,7 +74,7 @@ class Engine:
                         state = self.ledger.snapshot()
         current = {p.market.condition_id: p for p in plans}
         ranked = (current[cid] for cid in self._ranked_ids if cid in current and eligible_market(current[cid].market))
-        for plan in ranked:
+        for plan in ranked if allow_open else ():
             cid = plan.market.condition_id
             previous = next((r for r in state.reservations if r.condition_id == cid), None)
             if previous is not None and previous.planned_quantity > 0:
@@ -120,9 +121,9 @@ class Engine:
 
     def _place(self, quote: Quote, now: datetime, identities: set[str], *, purpose="opening") -> OrderRequest:
         number = len(identities)
-        while f"{self.ledger.owner}:order:{number}" in identities:
+        while f"{self.ledger.owner}:{quote.condition_id[:8]}:order:{number}" in identities:
             number += 1
-        request = OrderRequest(f"{self.ledger.owner}:order:{number}", self.ledger.owner, quote, now, now + timedelta(hours=1),
+        request = OrderRequest(f"{self.ledger.owner}:{quote.condition_id[:8]}:order:{number}", self.ledger.owner, quote, now, now + timedelta(hours=1),
                                self.ledger.reservation_terms(quote.condition_id), purpose)
         if self.ledger.register_order(request):
             identities.add(request.request_id)
