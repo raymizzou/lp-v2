@@ -8,7 +8,7 @@ import json
 import httpx
 
 from lp_v2.cli import RunConfig
-from lp_v2.readonly_runtime import ReadOnlyRunner
+from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
 from lp_v2.readonly_sdk import L2Credentials, ReadOnlySDK
 from lp_v2.status_server import make_handler
 from tests.test_readonly_sdk import AT, external_sdk, market_wire

@@ -25,6 +25,11 @@ def step_at(runner, at):
     runner.clock=lambda:at
     for sdk in (getattr(runner,'sdk',None),getattr(runner,'observations',None)):
         if hasattr(sdk,'test_clock'):sdk.test_clock[0]=at
+    if hasattr(runner,'scanner') and not hasattr(runner,'current'):
+        scan=runner.scanner.latest()
+        previous=scan.scan.get('started_at') if scan else None
+        if previous is None or (at-runner.config.started_at).total_seconds()//10 > (previous-runner.config.started_at).total_seconds()//10:
+            runner.scanner.scan_once(at)
     return runner.step(at)
 
 
@@ -410,3 +415,10 @@ def test_market_reads_validate_books_at_completion(monkeypatch,method,case):
                 assert [b.observed_at for b in rows[0]['plan'].books]==[AT+timedelta(seconds=1 if case=='normal' else 0)]*2
         assert all(method=='GET' for method,_ in seen)
     finally:sdk.close();public.close()
+
+
+def scanned_runner(config,sdk,**kwargs):
+    from lp_v2.readonly_runtime import ReadOnlyRunner
+    from lp_v2.rotation_scan import ScanWorker
+    clock=kwargs.get('clock',lambda:getattr(sdk,'test_clock',[config.started_at])[0])
+    return ReadOnlyRunner(config,sdk,scanner=ScanWorker(sdk,clock=clock),**kwargs)

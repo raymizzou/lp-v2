@@ -15,6 +15,8 @@ from math import isfinite
 
 from lp_v2.models import Market
 
+SCORE_VERSION = "lp-v2-score-1"
+
 
 @dataclass(frozen=True, slots=True)
 class MarketScore:

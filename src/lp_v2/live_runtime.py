@@ -14,6 +14,7 @@ class LiveRunner:
     def __init__(self, config, sdk, observations, *, clock=lambda: datetime.now(UTC), stop=None):
         self.config, self.sdk, self.observations, self.clock = config, sdk, observations, clock
         self._condition_id = sdk.condition_id
+        self._reconciled_late_fills = 0
         self.ledger = Ledger(sdk.owner, config.capital_usdc)
         self.engine = Engine(self.ledger)
         self.stop = stop if stop is not None else Event()
@@ -25,6 +26,7 @@ class LiveRunner:
         self._accounting_status = UNKNOWN
         self._income_at = None
         self._safety_cancels = {}
+        self._opening_cancels = {}
         self._region = UNKNOWN
         self._m4 = {key: UNKNOWN for key in (*M4_FIELDS,"net_profit")}
         self._freshness = {}
@@ -55,7 +57,7 @@ class LiveRunner:
         with self._lock:
             return deepcopy(self._snapshot)
 
-    def step(self, now=None):
+    def step(self, now=None, *, allow_open=True, opening_policy=None):
         now = self.clock() if now is None else now
         if self._next is not None and (now-self._next).total_seconds() < 10:
             return self.snapshot()
@@ -65,7 +67,7 @@ class LiveRunner:
             self._region = UNKNOWN
             plans = ()
             try:
-                self.ledger.reconcile(self.sdk)
+                self._reconcile()
                 reconciled = self.sdk.orders_verified()
                 if not reconciled:
                     raise ValueError('owned order readback remains uncertain')
@@ -97,10 +99,23 @@ class LiveRunner:
                     self.sdk.journal.append('region_denied', dict(at=now,region_check=self._region))
                     for row in self._rows:
                         row.update(eligible=False,skip_reason='地区检查未通过或未知')
-                decision = self.engine.decide(plans, now=now) if allowed and not self.stop.is_set() else None
+                if opening_policy is not None:
+                    from lp_v2.scoring import eligible_market
+                    valid = allowed and bool(plans) and all(eligible_market(p.market) for p in plans)
+                    allow_open = opening_policy(valid, now)
+                decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
                 if decision is not None:
                     for c in decision.cancel:
+                        self._opening_cancels[c.order_id] = now.timestamp()
                         self.ledger.apply_order(self.sdk.cancel_order(c.order_id, at=now))
+                    if not allow_open:
+                        from lp_v2.models import OrderStatus
+                        for order in self.ledger.snapshot().orders:
+                            if (order.request.purpose == 'opening'
+                                    and (not order.authoritative or order.status == OrderStatus.LIVE)
+                                    and now.timestamp()-self._opening_cancels.get(order.order_id,float('-inf')) >= 5):
+                                self._opening_cancels[order.order_id] = now.timestamp()
+                                self.ledger.apply_order(self.sdk.cancel_order(order.order_id,at=now))
                     for request in decision.place:
                         self.ledger.apply_order(self.sdk.place_order(request, at=now))
                     for request in decision.merge:
@@ -109,6 +124,8 @@ class LiveRunner:
                 self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
             except Exception:
+                if opening_policy is not None:
+                    opening_policy(False, now)
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
                 self._valuation_at = self._income_at = None
                 self._cancel_owned(now.timestamp(),self._safety_cancels,at=now)
@@ -120,6 +137,25 @@ class LiveRunner:
             with self._lock:
                 self._snapshot = self._build(now)
             return self.snapshot()
+
+    def _reconcile(self):
+        """Rebuild only from a newly authenticated, complete late-fill revision.
+
+        Ledger's direct contradictory-terminal guards remain intact. A fresh
+        ledger must independently reconcile every order, trade, merge and chain
+        balance before replacing the previous owned snapshot.
+        """
+        try:
+            self.ledger.reconcile(self.sdk)
+        except ValueError:
+            revisions = len(self.sdk.journal.events('late_fill_reconciliation'))
+            if revisions <= self._reconciled_late_fills:
+                raise
+            candidate = Ledger(self.sdk.owner,self.config.capital_usdc)
+            candidate.reconcile(self.sdk)
+            self.ledger = candidate
+            self.engine.ledger = candidate
+        self._reconciled_late_fills = len(self.sdk.journal.events('late_fill_reconciliation'))
 
     def _audit(self, now, reconciled, plans=()):
         from lp_v2.models import Outcome,OrderStatus
@@ -267,7 +303,7 @@ class LiveRunner:
                 # Current own presence overrides stale terminal history, even if other reads fail.
                 self._cancel_owned(monotonic(),attempted,active=active)
                 try:
-                    self.ledger.reconcile(self.sdk)
+                    self._reconcile()
                     if not opens_verified:
                         raise ValueError('incomplete open order readback')
                     reconciled = True
@@ -318,7 +354,7 @@ class MarketCheckFailure(ValueError):
         super().__init__(self.reason_code)
 
 
-def create_live_runner(config, *, public=None, http=None):
+def create_live_runner(config, *, public=None, http=None, clock=None):
     import json
     from pathlib import Path
     from polymarket import SecureClient
@@ -344,8 +380,9 @@ def create_live_runner(config, *, public=None, http=None):
             raise ValueError('identity mismatch')
     except Exception:
         raise ValueError('signing and L2/Proxy identity mismatch') from None
-    observations=ReadOnlySDK(public=public,http=http)
-    client=journal=None
+    clock = clock or (lambda: datetime.now(UTC))
+    observations=ReadOnlySDK(public=public,http=http,credentials=c,clock=clock)
+    client=journal=scanner=None
     try:
         try:
             rows=observations.read_fixed_market(config.started_at,config.market)
@@ -354,7 +391,8 @@ def create_live_runner(config, *, public=None, http=None):
         tokens=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
         with owner_file(config.relayer_credentials_file) as source:
             try:
-                relayer_key=parse_relayer_credentials(json.load(source),signer)
+                relayer_payload=json.load(source)
+                relayer_key=parse_relayer_credentials(relayer_payload,signer)
             except (ValueError,TypeError):
                 raise ValueError('invalid relayer credentials') from None
         client=SecureClient.create(private_key=key,wallet=c.wallet_address,
@@ -363,19 +401,28 @@ def create_live_runner(config, *, public=None, http=None):
         if (client.wallet_type != 'POLY_PROXY' or str(client.wallet).lower() != c.wallet_address.lower()
                 or str(client.signer).lower() != c.signer_address.lower()):
             raise ValueError('signing and L2 identities disagree')
-        journal=Journal(Path(config.state_dir)/'journal.sqlite')
+        from lp_v2.rotation_state import carry_legacy_journal,open_market_journal,read_control_window
+        action_id,window_end = read_control_window(config)
         identity=dict(owner='lp-v2:'+c.wallet_address.lower(),condition_id=config.market,token_ids=tokens)
-        known=journal.events('identity')
-        if known and known[0][1] != identity:
-            raise ValueError('state belongs to a different wallet or market')
-        if not known:
-            journal.append('identity',identity)
-        sdk=LiveSDK(client,journal,**identity,wallet=c.wallet_address,signer=c.signer_address)
+        carry_legacy_journal(config.state_dir,identity)
+        journal=open_market_journal(config.state_dir,identity)
+        sdk=LiveSDK(client,journal,**identity,wallet=c.wallet_address,signer=c.signer_address,clock=clock)
         sdk.rpc,sdk.relayer=client._ctx.rpc,client._ctx.relayer
         import httpx
         sdk.http=httpx.Client(timeout=5,trust_env=False,follow_redirects=False)
-        return LiveRunner(config,sdk,observations)
+        from lp_v2.live_control.profiles import read_json
+        control_run_id=read_json(Path(config.state_dir)/'process.json')['run_id'] if action_id is not None else None
+        from lp_v2.rotation_live import RotationRunner
+        from lp_v2.rotation_scan import ScanWorker
+        current = LiveRunner(config,sdk,observations,clock=clock)
+        scanner = ScanWorker(observations.new_scan_sdk(),clock=clock)
+        return RotationRunner(config,current,scanner,action_id=action_id,window_end=window_end,clock=clock,
+            account_identity=dict(signer_address=c.signer_address,wallet_address=c.wallet_address,signature_type=c.signature_type),
+            relayer=relayer_payload,control_run_id=control_run_id)
     except BaseException:
+        if scanner is not None:
+            scanner.stop(0)
+            scanner.sdk.close()
         if journal is not None:
             journal.close()
         if client is not None:

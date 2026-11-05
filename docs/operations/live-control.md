@@ -1,6 +1,6 @@
 # One-command live control
 
-`lp-v2 live` wraps the existing fixed-market executor. Code and offline tests do
+`lp-v2 live` wraps the single-market executor and its serial rotation controller. Code and offline tests do
 not authorize deployment, enabling live mode, trading, or a new run window.
 Installation, effective service permissions and field acceptance remain separate.
 
@@ -96,7 +96,7 @@ or automatic retry. Preflight and opening diagnostics report completion time;
 decisions and valuations use time sampled after market reads. Decision time must
 not precede validated joint completion for the current read; missing or invalid
 completion evidence also refuses. Account facts,
-fills, receipts, frozen startup identity and the 10/30/600-second schedules retain
+fills, receipts, frozen startup identity, 10-second decisions, 30-second wallet reads and completed scanner rounds retain
 their own time meaning.
 On confirmation, only the validated nested opening diagnostic `as_of` is excluded
 from comparing the two fresh reports. Displayed reports retain that timestamp.
@@ -134,7 +134,7 @@ restart policy and boot enablement are preserved. Unit installation, missing
 secrets or a new release require their own authorized preparation/deployment.
 
 Two fresh snapshots must independently prove the same run, full validated account,
-code, capital, unique fixed market, live process, stopped read-only process and
+code, capital, unique startup seed market, live process, stopped read-only process and
 SUCCESS accounting. Accounting, decision and snapshot times must advance. A
 systemctl 0, HTTP 200, mode=live alone or protective pause is insufficient proof
 of successful quoting. Both accepted rounds require `eligible=true` and
@@ -320,3 +320,65 @@ must also compare the current private operator SOP before field acceptance.
 
 No target SSH/account check, deployment, real on/off, trade, merge, inventory sale
 or field acceptance is claimed by this implementation's offline verification.
+
+## Single-market rotation
+
+`trading.market_condition_id` and `LP_V2_MARKET` name the startup seed. Initial
+`verify_start` still requires two fresh eligible rounds for that seed. The host records those two independently verified seed rounds in the bound
+on/run record. The scanner may finish earlier, but automatic rotation stays
+locked until that durable same-action/same-run proof exists. Subsequent score
+changes have no cooldown or debounce. Repeating an already verified on action
+returns that action's result, including after its active market has rotated.
+A new confirmed on can return to the seed only after all retained owned markets
+prove flat; restarting the same on restores its last recorded phase instead.
+That recovery retains the logical on/run identity only when the prior physical
+lease, action, frozen profile and durable rotation state agree. The replacement
+executor takes a fresh exclusive lease and records its current PID/start identity;
+the original verified seed proof remains bound to that same logical on. Stop
+results belong to the current physical lease, so an older process's successful
+drain cannot satisfy a stop after restart. A new explicit on gets a new run.
+
+The politics scanner uses keyset pages of 100 until the terminal cursor and
+issues one request at a time. Its public client and transport audit are independent
+of the account/decision client. Decisions read copies of the last completed
+result, so catalog latency cannot block current-market recovery. Coverage includes
+pages, rows, requests, maximum in-flight requests, prescreen count, start/finish,
+directory/market durations and redacted errors. Ranking books are labelled with
+their observation time; entry rereads books and all named public/account checks.
+A partial round may be displayed but cannot initiate active rotation.
+
+Only a strictly higher executable score from a complete round initiates exit.
+If the current market leads again during exit, opening resumes in that same
+market. Ineligibility starts exit on the next decision round even with an expired
+window. Exit stops opening, cancels owned opening orders immediately, and keeps
+covered BUY hedges and merges. Dust, unaffordable hedges, UNKNOWN requests/cancels,
+unsettled merges or inconsistent balances keep the market in recovery; there is
+no sale, taker chase or forced liquidation.
+
+Before entry, old-market owned orders, pending requests and uncertainty must be
+absent, complete merge history terminal, and both conditional balances zero and
+consistent with the owned ledger. Clearance is checked again after drain: a late
+fill returns to recovery instead of allowing another market. Target inventory
+must independently prove flat, including retained journal history. A rejected
+candidate is skipped before activation; once a candidate owns execution, failures
+remain its recovery responsibility.
+
+The confirmed action id/window are read from the bound host run record. Selection
+checks the window, and the actual first-signature boundary checks it again.
+Valid current execution can continue after expiry, but no new market can enter;
+invalid current execution exits to flat and displays `needs_new_on`. A standalone
+live command without a bound control action invents no automatic-entry window.
+
+State consists of append-only `rotation.sqlite` phase events and one immutable
+identity per `markets/<condition_id>/journal.sqlite`. Historical journals are
+retained on revisits. A verified legacy root journal is copied into its market
+journal without changing or deleting the root; a mismatch fails closed. Invalid
+market paths, symlinks, short-prefix collisions and historical request-id collisions
+are refused. Order and merge ids include the market prefix. Restart restores
+running/exiting/cleared/revalidating phases without resubmitting old intents.
+
+Host checks and stopped inventory handoff resolve the active journal from the
+original seed profile and retain full wallet, token, process/run, sequence and
+path proof. Sequence numbers are scoped to their own market database. `off` stops
+the recorded process and drains every retained owned market, preserving foreign
+manual orders. This remains a single-host guard, not distributed wallet exclusivity.

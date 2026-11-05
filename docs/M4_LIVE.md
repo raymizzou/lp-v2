@@ -23,7 +23,7 @@ lp-v2 preflight --market <完整condition_id> --capital-usdc 100 --code-sha <40�
 不借交易所 Date 头、改写时间或自动重试制造新鲜证据。
 预检 `as_of` 与开仓诊断时间对应完成观察时刻；运行轮次在行情返回后采样决策/估值时间，
 决策采样还须不早于本轮已验证的行情联合完成时刻；缺失或无效的完成证明也拒绝。
-账户核对、成交和回执保留原时间，启动身份和 10/30/600 秒调度口径保持独立。
+账户核对、成交和回执保留原时间，启动身份、10 秒决策、30 秒钱包读取与独立扫描轮次保持各自口径。
 这些离线验证不保证未来市场持续就绪，现场检查仍须使用获授权部署的准确版本。
 已能独立核验的费用、接单状态、奖励、政治分类、in_play、tick/最小量和簿时效分别报告。
 公开 CLOB 市场读取成功且返回 JSON 对象时，`in_play` 为布尔 `false` 或对象没有此键，
@@ -77,7 +77,8 @@ L2 凭据不能替代 Relayer 凭据。模板只留路径，不创建、分发�
 真实凭据的准备与投放另需授权。
 
 持久状态目录 `/opt/lp-v2/state` 由 `lp-v2` 独占、权限 **0700**。
-保留其中的 `journal.sqlite`、WAL 与锁/进程结果文件；不要清空或复制一套状态来并发运行。
+保留其中的 `rotation.sqlite`、`markets/<condition_id>/journal.sqlite`、WAL 与锁/进程结果文件；
+旧版根目录 `journal.sqlite` 也必须保留，不要清空或复制一套状态来并发运行。
 进程锁避免同一状态目录启动两个执行者；运维仍须保证同一钱包没有其他执行者。
 
 下面只展示未来获批后的参数形状；占位值不能直接运行：
@@ -89,8 +90,9 @@ lp-v2 run --live --capital-usdc <已批准上限> --market <已批准condition_i
   --relayer-credentials-file /etc/lp-v2/relayer.json --state-dir /opt/lp-v2/state
 ```
 
-`--market` 只允许一个完整 condition id；启动时固定该市场的两个 token、资金上限和 UTC
-启动时间，不在运行中重读配置。`run.env` 仅放 `LP_V2_MARKET`、`LP_V2_CAPITAL_USDC`、
+`--market` 是首个市场，只允许完整 condition id；每个市场的 journal 固定自己的两个 token，
+资金上限与 UTC 启动时间不变。已确认 on 的窗口内可按评分串行轮换，详见
+[轮换说明](operations/live-control.md#single-market-rotation)。不在运行中重读配置。`run.env` 仅放 `LP_V2_MARKET`、`LP_V2_CAPITAL_USDC`、
 `LP_V2_CODE_SHA` 等非秘密身份。改上限只能改该文件并在另行批准的停止/重启后生效；
 降低上限前必须核对现有占用。HTTP 仍只有 GET，没有修改、stop 或 restart 接口。
 
@@ -172,6 +174,8 @@ stop 同时撤当前完整活动列表里具有持久自有归属的 id，即使
 只有自有活动单为零、无可能仍在途的未决下单才返回 0；读回失败或 90 秒排空超时返回非 0，
 写明订单、UNKNOWN、库存份数/成本及有时间戳的估值（缺新鲜行情则 UNKNOWN）。
 残余未配对库存原样持有，不做清库存交易。stop 命令最多等 110 秒取得同一启动身份的最终结果。
+同一次已授权 on 的崩溃恢复可保留逻辑 run，但必须重新取得独占物理 lease 并核验原 action、
+冻结配置与轮转流水；停止结果还须匹配当前 lease，不能复用前一进程的成功排空结果。
 
 `deploy/lp-v2-live.service` 与 `deploy/run-live` 是独立草稿，含 `ExecStop` 和
 `TimeoutStopSec=150`，不把既有只读部署脚本改成实盘启动器。
