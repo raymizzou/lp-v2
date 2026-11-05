@@ -118,16 +118,14 @@ class RotationRunner:
         now = self.clock() if now is None else now
         scan = self.scanner.latest()
         ranking = self._ranking(scan)
-        for cid,historical in self._runners.items():
-            if historical is self.current or not (historical.sdk.journal.events('intent') or historical.sdk.journal.events('merge_intent')):
-                continue
-            waiting = self._clearance_reason(now,runner=historical)
-            if waiting is not None:
-                self.reason = 'historical_'+waiting
-                with self._lock:
-                    self._snapshot = self._build(now)
-                return self.snapshot()
         def policy(valid, at):
+            # A seed that has never signed is still a new-market entry on restart.
+            # Keep its entry gate without skipping the active runner's step.
+            if valid and not self.current.sdk.journal.events('signed'):
+                waiting = self._historical_clearance_reason(at)
+                if waiting is not None:
+                    self.reason = waiting
+                    return False
             if valid and self.control_run_id is not None:
                 from lp_v2.rotation_state import start_verification_passed
                 if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,at):
@@ -146,7 +144,7 @@ class RotationRunner:
                 self._transition('running', result.reason, self.current.condition_id, self.current.condition_id)
             elif self.phase == 'running':
                 self.reason = result.reason
-            return self.phase == 'running'
+            return self.phase == 'running' and valid is True
         if self.phase in ('running','exiting'):
             self.current.step(now, opening_policy=policy)
         elif self.phase in ('cleared','revalidating'):
@@ -233,6 +231,15 @@ class RotationRunner:
             action_id=self.action_id,window_end=self.window_end,phase=phase,result=result,at=self.clock()))
         self.phase, self.reason = phase, reason
 
+    def _historical_clearance_reason(self, now):
+        for historical in self._runners.values():
+            if historical is self.current or not (historical.sdk.journal.events('intent') or historical.sdk.journal.events('merge_intent')):
+                continue
+            waiting = self._clearance_reason(now,runner=historical)
+            if waiting is not None:
+                return 'historical_'+waiting
+        return None
+
     def _enter(self, now, old, scan):
         if self.control_run_id is not None:
             from lp_v2.rotation_state import start_verification_passed
@@ -241,6 +248,11 @@ class RotationRunner:
                 return
         if self.window_end is None or now >= self.window_end:
             self.reason = 'needs_new_on'
+            return
+        # Historical uncertainty gates entry, never the active market's protection.
+        waiting = self._historical_clearance_reason(now)
+        if waiting is not None:
+            self.reason = waiting
             return
         ranking = self._ranking(scan)
         if not scan or not scan.complete or not ranking.leader:

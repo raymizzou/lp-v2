@@ -29,6 +29,10 @@ class _Excluded(ValueError):
     """Only application-authored, identity-free reasons may reach the summary."""
 
 
+class FixedMarketIneligible(_Excluded):
+    """Confirmed fixed-market state, distinct from unavailable observations."""
+
+
 
 class ReadOnlyPort(Protocol):
     def read_markets(self, now): ...
@@ -226,6 +230,8 @@ class ReadOnlySDK:
         from lp_v2.models import Book, MarketPlan
         from lp_v2.scoring import eligible_market, score_market
         cid, st = m.condition_id, raw.state
+        if recovery and st.accepting_orders is False:
+            raise FixedMarketIneligible('市场停止接单')
         if not (st.active is True and st.closed is False and st.accepting_orders is True
                 and st.enable_order_book is True and m.political is True):
             raise _Excluded('市场状态或政治分类缺失或不合格')
@@ -238,6 +244,8 @@ class ReadOnlySDK:
         response = self.__http.get('https://clob.polymarket.com/markets/' + cid)
         response.raise_for_status()
         state=response.json()
+        if recovery and isinstance(state, dict) and state.get('in_play') is True:
+            raise FixedMarketIneligible('市场正在进行中')
         if not isinstance(state,dict) or ('in_play' in state and state['in_play'] is not False):
             raise _Excluded('进行中状态未验证')
         books = []
@@ -325,6 +333,8 @@ class ReadOnlySDK:
     def read_fixed_market(self, now, condition_id):
         try:
             return self.__fixed_market(now, condition_id)
+        except FixedMarketIneligible:
+            raise FixedMarketIneligible("fixed market validation unavailable") from None
         except Exception:
             raise ValueError("fixed market validation unavailable") from None
 
@@ -335,14 +345,15 @@ class ReadOnlySDK:
             for raw in page.items:
                 if str(raw.condition_id) != condition_id:
                     raise ValueError('fixed market identity mismatch')
-                m=self.__metadata_market(raw,now,recovery=True)
-                from lp_v2.scoring import score_market
-                row=dict(title=raw.question or UNKNOWN,condition_id=condition_id,score=str(score_market(m).score))
-                row.update(self.__map_market(raw,now,m,recovery=True))
-                found.append(row)
+                found.append((raw, self.__audit.fee_wire(condition_id)))
         if len(found) != 1:
             raise ValueError('fixed market unavailable or ambiguous')
-        return found
+        raw, fee_wire = found[0]
+        m=self.__metadata_market(raw,now,recovery=True,fee_wire=fee_wire)
+        from lp_v2.scoring import score_market
+        row=dict(title=raw.question or UNKNOWN,condition_id=condition_id,score=str(score_market(m).score))
+        row.update(self.__map_market(raw,now,m,recovery=True))
+        return [row]
 
     def read_region_policy(self):
         self.__audit.require_ready()

@@ -55,7 +55,7 @@ class RotationDecision:
 
 def evaluate_rotation(ranking, *, current, phase, complete, current_valid, now, window_end):
     leader = ranking.leader
-    if current is not None and not current_valid:
+    if current is not None and current_valid is False:
         return RotationDecision('exit', None, 'current_invalid')
     if window_end is None or now >= window_end:
         return RotationDecision('hold', None, 'window_expired' if current else 'needs_new_on')
@@ -65,10 +65,12 @@ def evaluate_rotation(ranking, *, current, phase, complete, current_valid, now, 
         return RotationDecision('hold', None, 'no_executable_candidate')
     if current is None:
         return RotationDecision('enter', leader.condition_id, 'best_executable_candidate')
-    if phase == 'exiting' and leader.condition_id == current:
+    if phase == 'exiting' and current_valid is True and leader.condition_id == current:
         return RotationDecision('resume', current, 'current_leads_again')
     if current is not None:
         active = next((c for c in ranking.candidates if c.condition_id == current), None)
         if active is not None and leader.score > active.score:
             return RotationDecision('exit', leader.condition_id, 'higher_score')
+    if current is not None and current_valid is None:
+        return RotationDecision('hold', None, 'current_unknown')
     return RotationDecision('hold', None, 'current_leads_or_ties')

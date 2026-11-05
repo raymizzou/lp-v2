@@ -92,8 +92,17 @@ class LiveRunner:
                 blocked = region.get('blocked')
                 country = region.get('country')
                 self._region = 'ok' if blocked is False else 'blocked' if blocked is True else UNKNOWN
-                allowed = (type(blocked) is bool and isinstance(country, str) and len(country) == 2
-                           and (blocked is False or (country == 'JP' and self.sdk.client.get_closed_only_mode() is False)))
+                region_valid = None
+                if type(blocked) is bool and isinstance(country, str) and len(country) == 2:
+                    if blocked is False:
+                        region_valid = True
+                    elif country == 'JP':
+                        closed_only = self.sdk.client.get_closed_only_mode()
+                        if type(closed_only) is bool:
+                            region_valid = not closed_only
+                    else:
+                        region_valid = False
+                allowed = region_valid is True
                 if not allowed:
                     self._cancel_owned(now.timestamp(),self._safety_cancels,at=now)
                     self.sdk.journal.append('region_denied', dict(at=now,region_check=self._region))
@@ -101,7 +110,10 @@ class LiveRunner:
                         row.update(eligible=False,skip_reason='地区检查未通过或未知')
                 if opening_policy is not None:
                     from lp_v2.scoring import eligible_market
-                    valid = allowed and bool(plans) and all(eligible_market(p.market) for p in plans)
+                    # Only affirmative ineligibility can request rotation exit.
+                    # Missing observations still deny opening without ending the run.
+                    valid = (False if region_valid is False or any(not eligible_market(p.market) for p in plans)
+                             else True if allowed and plans else None)
                     allow_open = opening_policy(valid, now)
                 decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
                 if decision is not None:
@@ -123,9 +135,10 @@ class LiveRunner:
                 self._m4 = self._income_fields(now,plans)
                 self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
-            except Exception:
+            except Exception as error:
                 if opening_policy is not None:
-                    opening_policy(False, now)
+                    from lp_v2.readonly_sdk import FixedMarketIneligible
+                    opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
                 self._valuation_at = self._income_at = None
                 self._cancel_owned(now.timestamp(),self._safety_cancels,at=now)

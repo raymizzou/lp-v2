@@ -233,6 +233,108 @@ def test_normal_rotation_records_and_preserves_journals(tmp_path):
         rotation.journal.db.execute("DELETE FROM events")
 
 
+@pytest.mark.parametrize('protection', ['stale_quotes', 'read_failure', 'hedge'])
+def test_historical_readback_failure_keeps_current_protection(tmp_path, protection):
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    rotation.step(AT)
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    report = rotation.step(clock[0])
+    assert report['rotation']['phase'] == 'running'
+    assert report['rotation']['current'] == BID
+    original_orders = {oid for oid, order in ex.orders.items()
+                       if order.market == BID and order.status == 'LIVE'}
+    assert len(original_orders) == 2
+    assert all(ex.orders[oid].status == 'CANCELED'
+               for oid, order in ex.orders.items() if order.market == CID)
+    inventory = obs.read_conditional_inventory
+    def old_rpc_unavailable(now, cid):
+        if cid == CID:
+            raise TimeoutError('old cleared market inventory unavailable')
+        return inventory(now, cid)
+    obs.read_conditional_inventory = old_rpc_unavailable
+    if protection == 'stale_quotes':
+        plan = obs.plans[BID]
+        obs.plans[BID] = replace(plan, books=tuple(replace(book,
+            best_bid=D('.20'), best_ask=D('.30')) for book in plan.books))
+    elif protection == 'read_failure':
+        read = obs.read_fixed_market
+        def failed_current(now, cid):
+            if cid == BID:
+                raise TimeoutError('current market book unavailable')
+            return read(now, cid)
+        obs.read_fixed_market = failed_current
+    else:
+        yes = next(oid for oid in original_orders if ex.orders[oid].token_id == '201')
+        no = next(oid for oid in original_orders if ex.orders[oid].token_id == '202')
+        ex.fill(yes, '10', '.40', at=clock[0] + timedelta(seconds=1))
+        ex.terminal(no)
+        plan = obs.plans[BID]
+        obs.plans[BID] = replace(plan, books=(plan.books[0],
+            replace(plan.books[1], best_bid=D('.60'), best_ask=D('.62'))))
+    signatures = ex.sdk.create_limit_order.call_count
+    clock[0] += timedelta(seconds=60)
+    report = rotation.step(clock[0])
+    if protection in ('stale_quotes', 'read_failure'):
+        assert all(ex.orders[oid].status == 'CANCELED' for oid in original_orders)
+        assert original_orders <= {call.kwargs['order_id'] for call in ex.sdk.cancel_order.call_args_list}
+        assert ex.sdk.create_limit_order.call_count == signatures
+    else:
+        hedges = [request for request in rotation.current.ledger.snapshot().requests
+                  if request.purpose == 'hedge']
+        assert len(hedges) == 1
+        assert hedges[0].quote.token_id == '202'
+        assert hedges[0].quote.quantity == D('10')
+        assert hedges[0].quote.price == D('.58')
+        assert ex.sdk.create_limit_order.call_count == signatures + 1
+        assert ex.posts[-1].token_id == '202'
+        assert D(ex.posts[-1].maker_amount) / ex.posts[-1].taker_amount == D('.58')
+    assert report['rotation']['current'] == BID
+    assert report['rotation']['phase'] == 'running'
+    assert not any(signed.token_id in ('301', '302') for signed in ex.posts)
+
+
+@pytest.mark.parametrize('expired', [False, True])
+def test_historical_unknown_blocks_next_market_entry(tmp_path, expired):
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    rotation.step(AT)
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    assert rotation.step(clock[0])['rotation']['current'] == BID
+    # Begin B's exit while all of A's historical readbacks are still healthy.
+    obs.ranked = (CID, BID, CID_C)
+    ex.cancel_unknown = True
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    report = rotation.step(clock[0])
+    assert report['rotation']['phase'] == 'exiting'
+    assert report['rotation']['current'] == BID
+    inventory = obs.read_conditional_inventory
+    def old_rpc_unavailable(now, cid):
+        if cid == CID:
+            raise TimeoutError('old cleared market inventory unavailable')
+        return inventory(now, cid)
+    obs.read_conditional_inventory = old_rpc_unavailable
+    ex.cancel_unknown = False
+    clock[0] += timedelta(seconds=10)
+    report = rotation.step(clock[0])
+    assert report['rotation']['phase'] in ('exiting', 'cleared')
+    assert report['rotation']['reason'] == 'historical_waiting_readback'
+    assert not any(signed.token_id in ('301', '302') for signed in ex.posts)
+    obs.read_conditional_inventory = inventory
+    clock[0] = rotation.window_end + timedelta(seconds=1) if expired else clock[0] + timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    report = rotation.step(clock[0])
+    if expired:
+        assert report['rotation']['phase'] == 'cleared'
+        assert report['rotation']['reason'] == 'needs_new_on'
+        assert not any(signed.token_id in ('301', '302') for signed in ex.posts)
+    else:
+        assert report['rotation']['phase'] == 'running'
+        assert report['rotation']['current'] == CID_C
+        assert {signed.token_id for signed in ex.posts if signed.token_id in ('301', '302')} == {'301', '302'}
+
+
 @pytest.mark.parametrize('revalidation', ['latest','skip_first','all_public_fail','account_fail'])
 def test_latest_complete_target_and_revalidation(tmp_path,revalidation):
     rotation,ex,obs,clock=rotation_world(tmp_path)
@@ -299,6 +401,61 @@ def test_first_signature_window_guard(tmp_path,offset):
     else:
         assert not new_sdk.journal.events('signed')
         assert ex.sdk.create_limit_order.call_count==2
+
+
+@pytest.mark.parametrize('failure', ['books', 'region_unknown', 'missing_plan'])
+def test_transient_unknown_after_window_keeps_current_running(tmp_path, failure):
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    obs.ranked = (CID,)
+    rotation.step(AT)
+    original_orders = set(ex.orders)
+    assert len(original_orders) == 2
+    assert all(ex.orders[oid].status == 'LIVE' for oid in original_orders)
+    clock[0] = rotation.window_end + timedelta(seconds=1)
+    rotation.scanner.scan_once(clock[0])
+    assert rotation.step(clock[0])['rotation']['phase'] == 'running'
+
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    assert rotation.scanner.latest().complete
+    read = obs.read_fixed_market
+    failed_reads = []
+    def transient(now, cid):
+        if cid == CID and not failed_reads:
+            failed_reads.append((now, cid))
+            if failure == 'books':
+                raise TimeoutError('one execution observation unavailable')
+            return [dict(row, plan=None) for row in read(now, cid)]
+        return read(now, cid)
+    if failure == 'region_unknown':
+        obs.region = dict(blocked=None, country='US')
+    else:
+        obs.read_fixed_market = transient
+    signatures = ex.sdk.create_limit_order.call_count
+    report = rotation.step(clock[0])
+    assert report['rotation']['phase'] == 'running'
+    assert report['rotation']['current'] == CID
+    assert report['rotation']['switch_count'] == 0
+    assert report['rotation']['reason'] != 'needs_new_on'
+    assert ex.sdk.create_limit_order.call_count == signatures
+    if failure in ('books', 'region_unknown'):
+        assert all(ex.orders[oid].status == 'CANCELED' for oid in original_orders)
+        assert original_orders <= {call.kwargs['order_id'] for call in ex.sdk.cancel_order.call_args_list}
+    else:
+        assert len(failed_reads) == 1
+
+    obs.read_fixed_market = read
+    obs.region = dict(blocked=False, country='US')
+    for _ in range(2):
+        clock[0] += timedelta(seconds=10)
+        rotation.scanner.scan_once(clock[0])
+        report = rotation.step(clock[0])
+        assert report['rotation']['phase'] == 'running'
+        assert report['rotation']['current'] == CID
+        assert report['rotation']['switch_count'] == 0
+        assert report['rotation']['reason'] != 'needs_new_on'
+    assert all(event['reason'] != 'current_invalid' for _, event in rotation.journal.events('rotation'))
+    assert {signed.token_id for signed in ex.posts} <= set(TOKENS)
 
 
 def test_expired_window_invalid_current_exits_to_idle(tmp_path):
