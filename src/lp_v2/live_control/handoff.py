@@ -8,7 +8,7 @@ def inventory_handoff(profile,balances):
     from lp_v2.live_control.profiles import read_json,timestamp
     from lp_v2.live_control.workflow import fresh
     from lp_v2.models import Position,Order,OrderStatus
-    from lp_v2.live_control.identity import same_identity
+    from lp_v2.live_control.identity import same_identity,single_market_tokens
     try:
         from lp_v2.rotation_state import control_market_profile,run_journal_sequence
         active_profile=control_market_profile(profile)
@@ -23,8 +23,7 @@ def inventory_handoff(profile,balances):
         rows=journal_rows(profile)
         owner='lp-v2:'+profile['identity']['wallet_address'].lower()
         identities=[value for _,kind,value in rows if kind=='identity']
-        expected=dict(owner=owner,condition_id=market,token_ids=tuple(tokens))
-        if not identities or any(identity!=expected for identity in identities):raise ValueError()
+        if not identities or any(single_market_tokens(identity,owner,market)!=tuple(tokens) for identity in identities):raise ValueError()
         control=read_json(state/'live-control-run.json');process=read_json(state/'process.json');final=read_json(state/'stop-result.json')
         run_id=control['run_id']
         import re

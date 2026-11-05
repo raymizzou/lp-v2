@@ -433,11 +433,13 @@ def filesystem_checks(profile):
     try:
         secure_directory(state)
         if journal_present(profile):
+            from lp_v2.live_control.identity import single_market_tokens
             identities=journal_rows(profile,'identity')
             from lp_v2.rotation_state import control_market_profile
             active_profile=control_market_profile(profile)
-            good=bool(identities) and all(row['owner']=='lp-v2:'+profile['identity']['wallet_address'].lower()
-                and row['condition_id']==active_profile['trading']['market_condition_id'] for _,row in identities)
+            tokens=[single_market_tokens(row,'lp-v2:'+profile['identity']['wallet_address'].lower(),
+                active_profile['trading']['market_condition_id']) for _,row in identities]
+            good=bool(tokens) and all(pair==tokens[0] for pair in tokens)
             checks['state_identity']=fact('PASS' if good else 'FAIL','JOURNAL_FROZEN_IDENTITY')
         else:
             checks['state_identity']=fact('PASS','EXPLICIT_NEW_STATE')

@@ -1,4 +1,4 @@
-"""One fixed-market executor. Exchange readback always precedes decisions."""
+"""One executor for a frozen market list. Exchange readback always precedes decisions."""
 from copy import deepcopy
 from datetime import UTC, datetime
 from dataclasses import asdict
@@ -14,6 +14,7 @@ class LiveRunner:
     def __init__(self, config, sdk, observations, *, clock=lambda: datetime.now(UTC), stop=None):
         self.config, self.sdk, self.observations, self.clock = config, sdk, observations, clock
         self._condition_id = sdk.condition_id
+        self._markets = sdk.markets
         self._reconciled_late_fills = 0
         self.ledger = Ledger(sdk.owner, config.capital_usdc)
         self.engine = Engine(self.ledger)
@@ -31,6 +32,10 @@ class LiveRunner:
         self._m4 = {key: UNKNOWN for key in (*M4_FIELDS,"net_profit")}
         self._freshness = {}
         self._valuation_at = None
+        self._valuations = {}
+        self._m4_by_market = {}
+        self._occupation_day = None
+        self._occupation_start = 0
         self.exit_code = None
         self.stop_timeout_s = 90
         self._snapshot = self._build(None)
@@ -45,7 +50,7 @@ class LiveRunner:
             run=dict(code_sha=self.config.code_sha,wallet_tail=self.sdk.wallet[-4:],region_check=self._region),
             wallet=dict(available_usdc=state.cash), markets=self._rows,freshness=self._freshness)
         for row in summary['markets']:
-            row['m4'] = {k:str(v) for k,v in self._m4.items()}
+            row['m4'] = {k:str(v) for k,v in self._m4_by_market.get(row['condition_id'],self._m4).items()}
         summary['mode'] = 'live'
         summary['accounting'] = dict(status=self._accounting_status,as_of=self._accounting_at.isoformat() if self._accounting_at is not None else UNKNOWN)
         summary['freshness']['income_as_of'] = self._income_at.isoformat() if self._income_at is not None else UNKNOWN
@@ -72,7 +77,25 @@ class LiveRunner:
                 if not reconciled:
                     raise ValueError('owned order readback remains uncertain')
                 self._accounting_at = now
-                self._rows = [r for r in (self.observations.read_fixed_market(now,self.condition_id) if hasattr(self.observations,'read_fixed_market') else self.observations.read_markets(now)) if r['condition_id'] == self.condition_id]
+                unavailable = set()
+                market_ineligible = False
+                if hasattr(self.observations,'read_fixed_market'):
+                    rows = []
+                    for cid in self._markets:
+                        try:
+                            current = self.observations.read_fixed_market(now,cid)
+                        except Exception as error:
+                            from lp_v2.readonly_sdk import FixedMarketIneligible
+                            if isinstance(error, FixedMarketIneligible):
+                                market_ineligible = True
+                            unavailable.add(cid)
+                            current = [dict(condition_id=cid,title=next((r['title'] for r in self._rows if r['condition_id']==cid),UNKNOWN),
+                                eligible=False,skip_reason='市场读回不可用，暂停下单')]
+                            self.sdk.journal.append('diagnostic',dict(at=now,condition_id=cid,reason='market readback unavailable'))
+                        rows.extend(current)
+                    self._rows = [r for r in rows if r['condition_id'] in self._markets]
+                else:
+                    self._rows = [r for r in self.observations.read_markets(now) if r['condition_id'] in self._markets]
                 accounting_at = now
                 completed = self.clock()
                 if (not isinstance(completed,datetime) or completed.tzinfo is None or completed.utcoffset() is None or completed < now):
@@ -83,10 +106,18 @@ class LiveRunner:
                         if (not isinstance(observed,datetime) or observed.tzinfo is None
                                 or observed.utcoffset() is None or not now <= observed <= completed):
                             raise ValueError('market observation completion unavailable or discontinuous')
+                        if any(not 0 <= (completed-b.observed_at).total_seconds() <= 60 for b in row['plan'].books):
+                            unavailable.add(row['condition_id'])
+                            row.update(plan=None,eligible=False,skip_reason='订单簿时效未验证，暂停下单')
+                            self.sdk.journal.append('diagnostic',dict(at=completed,condition_id=row['condition_id'],
+                                reason='market book freshness unavailable at decision'))
                 now = completed
+                for order in self.ledger.snapshot().orders:
+                    if order.request.quote.condition_id in unavailable and (not order.authoritative or order.status.value=='live'):
+                        self.ledger.apply_order(self.sdk.cancel_order(order.order_id,at=now))
                 plans = tuple(r['plan'] for r in self._rows if r.get('plan') is not None)
                 self._last_plans = plans
-                if any(tuple(t.token_id for t in p.market.tokens) != self.sdk.token_ids for p in plans):
+                if any(tuple(t.token_id for t in p.market.tokens) != self._markets.get(p.market.condition_id) for p in plans):
                     raise ValueError('frozen token identity changed')
                 region = self.observations.read_region_policy()
                 blocked = region.get('blocked')
@@ -112,7 +143,7 @@ class LiveRunner:
                     from lp_v2.scoring import eligible_market
                     # Only affirmative ineligibility can request rotation exit.
                     # Missing observations still deny opening without ending the run.
-                    valid = (False if region_valid is False or any(not eligible_market(p.market) for p in plans)
+                    valid = (False if market_ineligible or region_valid is False or any(not eligible_market(p.market) for p in plans)
                              else True if allowed and plans else None)
                     allow_open = opening_policy(valid, now)
                 decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
@@ -132,7 +163,15 @@ class LiveRunner:
                         self.ledger.apply_order(self.sdk.place_order(request, at=now))
                     for request in decision.merge:
                         self.ledger.apply_merge(self.sdk.merge(request, at=now))
-                self._m4 = self._income_fields(now,plans)
+                day = now.astimezone(UTC).date()
+                if self._occupation_day != day:
+                    self._occupation_start = self.sdk.journal.day_lower_bound('occupation',day)
+                    self._occupation_day = day
+                samples = [p for _,p in self.sdk.journal.events('occupation',since_seq=self._occupation_start)
+                           if p['at'].astimezone(UTC).date() == day and p['at'] <= now]
+                samples.sort(key=lambda p:p['at'])
+                self._m4_by_market = {cid:self._income_fields(now,plans,cid,samples) for cid in self._markets}
+                self._m4 = self._m4_by_market[self.condition_id]
                 self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
             except Exception as error:
@@ -141,6 +180,8 @@ class LiveRunner:
                     opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
                 self._valuation_at = self._income_at = None
+                self._valuations.clear()
+                self._m4_by_market = {}
                 self._cancel_owned(now.timestamp(),self._safety_cancels,at=now)
                 self.sdk.journal.append('diagnostic', dict(at=now,reason='round readback or execution unavailable'))
                 for row in self._rows:
@@ -172,40 +213,68 @@ class LiveRunner:
 
     def _audit(self, now, reconciled, plans=()):
         from lp_v2.models import Outcome,OrderStatus
+        from lp_v2.capital import capital_breakdown
         state = self.ledger.snapshot()
         books = {b.token_id:b for p in plans for b in p.books}
-        pair = min((next((p.quantity for p in state.positions if p.token_id == token),D('0')) for token in self.sdk.token_ids),default=D('0'))
-        inventory = []
-        for p in state.positions:
-            if p.quantity == 0:
-                continue
-            unmatched = p.quantity-pair
-            book = books.get(p.token_id)
-            fresh = (reconciled and book is not None and book.condition_id == self.condition_id
-                     and 0 <= (now-book.observed_at).total_seconds() <= 60)
-            mid = (book.best_bid+book.best_ask)/2 if fresh else None
-            inventory.append(dict(token_id=p.token_id,quantity=p.quantity,cost_usdc=p.cost_usdc,
-                unpaired_quantity=unmatched,unpaired_cost_usdc=p.cost_usdc*unmatched/p.quantity,
-                mark_usdc=mid*unmatched if mid is not None else UNKNOWN,
-                mark_at=book.observed_at if fresh else None))
-        return dict(at=now,condition_id=self.condition_id,**asdict(state.capital),
+        ceilings = {p['request'].request_id:p.get('hedge_ceiling') for _,p in self.sdk.journal.events('intent')}
+        markets, inventory = {}, []
+        for cid,tokens in self._markets.items():
+            held = [p for p in state.positions if p.condition_id == cid]
+            pair = min((next((p.quantity for p in held if p.token_id == t),D('0')) for t in tokens))
+            rows = []
+            for p in held:
+                if p.quantity == 0:
+                    continue
+                unmatched = p.quantity-pair
+                book = books.get(p.token_id)
+                fresh = (reconciled and book is not None and book.condition_id == cid
+                         and 0 <= (now-book.observed_at).total_seconds() <= 60)
+                mid = (book.best_bid+book.best_ask)/2 if fresh else None
+                rows.append(dict(condition_id=cid,token_id=p.token_id,quantity=p.quantity,cost_usdc=p.cost_usdc,
+                    unpaired_quantity=unmatched,unpaired_cost_usdc=p.cost_usdc*unmatched/p.quantity,
+                    mark_usdc=mid*unmatched if mid is not None else UNKNOWN,
+                    inventory_pnl=mid*p.quantity-p.cost_usdc if mid is not None else UNKNOWN,
+                    mark_at=book.observed_at if fresh else None))
+            reservations = tuple(r for r in state.reservations if r.condition_id == cid)
+            generation = {r.merge_id for r in reservations for r in r.merge_requests}
+            active = {key for r in reservations for key in r.request_ids}
+            orders = tuple(o for o in state.orders if o.request.request_id in active)
+            pending = tuple(r for r in state.pending if r.request_id in active)
+            capital = capital_breakdown(state.owner,reservations=reservations,positions=tuple(held),
+                orders=orders,pending=pending,merge_results=tuple(r for r in state.merges if r.request.merge_id in generation),
+                request_results=tuple(r for r in state.rejected if r.request.request_id in active))
+            uncertainty = dict(pending=tuple(r.request_id for r in pending),
+                orders=tuple(o.order_id for o in orders if not o.authoritative),
+                merges=tuple(r.request.merge_id for r in state.merges if r.request.condition_id == cid and r.outcome == Outcome.UNKNOWN))
+            hedges = []
+            for r,qty in ([(o.request,o.remaining_quantity) for o in orders if o.status == OrderStatus.LIVE or not o.authoritative]
+                          + [(r,r.quote.quantity) for r in pending]):
+                if r.purpose == 'hedge':
+                    hedges.append(dict(request_id=r.request_id,token_id=r.quote.token_id,quantity=qty,
+                        price=r.quote.price,ceiling=ceilings.get(r.request_id),created_at=r.created_at))
+            current_generation=max((r.reservation_terms.generation for r in state.requests if r.quote.condition_id == cid),default=0)
+            markets[cid] = dict(**asdict(capital),inventory=tuple(rows),uncertainty=uncertainty,
+                planned_quantity=max((r.reservation_terms.planned_quantity for r in state.requests if r.quote.condition_id == cid and r.reservation_terms.generation == current_generation),default=D('0')),
+                hedges=tuple(hedges),title=next((r['title'] for r in self._rows if r['condition_id'] == cid),UNKNOWN))
+            inventory.extend(rows)
+        return dict(at=now,condition_id=self.condition_id,**asdict(state.capital),startup_cap=self.config.capital_usdc,
             reconciliation='SUCCESS' if reconciled else UNKNOWN,accounting_as_of=self._accounting_at,
-            inventory=tuple(inventory),uncertainty=dict(pending=tuple(r.request_id for r in state.pending),
+            markets=markets,inventory=tuple(inventory),uncertainty=dict(pending=tuple(r.request_id for r in state.pending),
                 orders=tuple(o.order_id for o in state.orders if not o.authoritative),
                 merges=tuple(r.request.merge_id for r in state.merges if r.outcome == Outcome.UNKNOWN)))
 
-    def _income_fields(self, now, plans):
+    def _income_fields(self, now, plans, condition_id, samples):
         from lp_v2.models import Fill
         day = now.astimezone(UTC).date()
         metrics = {k:UNKNOWN for k in (*M4_FIELDS,'net_profit')}
-        income = self.sdk.read_income(now)
+        income = self.sdk.read_income(now,condition_id)
         self._income_at = income["at"]
         metrics.update({k:income[k] for k in ('reward_today','rebate_today','reward_share')})
         state = self.ledger.snapshot()
         # Replay gross purchase basis; fees are deducted exactly once in net profit.
         basis, fees, paired = {}, D('0'), D('0')
-        events = [(f.executed_at,0,f.trade_id,f) for f in state.fills]
-        events += [(r.observed_at,1,r.request.merge_id,r) for r in state.merges if r.received_usdc]
+        events = [(f.executed_at,0,f.trade_id,f) for f in state.fills if f.condition_id == condition_id]
+        events += [(r.observed_at,1,r.request.merge_id,r) for r in state.merges if r.received_usdc and r.request.condition_id == condition_id]
         for at,_,_,fact in sorted(events):
             if isinstance(fact,Fill):
                 q,c = basis.get(fact.token_id,(D('0'),D('0')))
@@ -222,14 +291,14 @@ class LiveRunner:
                 if at.astimezone(UTC).date() == day:
                     paired += fact.received_usdc-cost
         metrics['paired_profit'] = paired
-        quantities = [basis.get(t,(D('0'),D('0')))[0] for t in self.sdk.token_ids]
+        quantities = [basis.get(t,(D('0'),D('0')))[0] for t in self._markets[condition_id]]
         metrics['unpaired_inventory'] = abs(quantities[0]-quantities[1])
         books = {b.token_id:b for p in plans for b in p.books}
         inventory_pnl = None
         fresh_books = {t:b for t,b in books.items() if 0 <= (now-b.observed_at).total_seconds() <= 60}
         if all(q == 0 or token in fresh_books for token,(q,c) in basis.items()):
             inventory_pnl = sum(((fresh_books[token].best_bid+fresh_books[token].best_ask)/2*q-c for token,(q,c) in basis.items() if q),D('0'))
-        baselines = [p for _,p in self.sdk.journal.events('day_baseline') if p['day'] == day.isoformat()]
+        baselines = [p for _,p in self.sdk.journal.events('day_baseline') if p['day'] == day.isoformat() and p.get('condition_id',self.sdk.legacy_condition_id) == condition_id]
         if not baselines:
             # Midnight marks for carried inventory cannot be invented after downtime.
             before = [(at,kind,key,f) for at,kind,key,f in events if at.astimezone(UTC).date() < day]
@@ -244,28 +313,30 @@ class LiveRunner:
                         consumed = c if q == leg.quantity else c*leg.quantity/q
                         old_basis[leg.token_id] = q-leg.quantity,c-consumed
             baseline = D('0') if not any(q for q,c in old_basis.values()) else None
-            continuous = (self._valuation_at is not None and 0 < (now-self._valuation_at).total_seconds() <= 60
-                          and (day-self._valuation_at.astimezone(UTC).date()).days == 1)
+            continuous = (self._valuations.get(condition_id) is not None and 0 < (now-self._valuations[condition_id]).total_seconds() <= 60
+                          and (day-self._valuations[condition_id].astimezone(UTC).date()).days == 1)
             observed = continuous and all(q == 0 or t in fresh_books for t,(q,c) in old_basis.items())
             mark_at = None
             if baseline is None and observed:
                 baseline = sum(((fresh_books[t].best_bid+fresh_books[t].best_ask)/2*q-c
                                 for t,(q,c) in old_basis.items() if q),D('0'))
                 mark_at = min(fresh_books[t].observed_at for t,(q,c) in old_basis.items() if q)
-            self.sdk.journal.append('day_baseline',dict(day=day.isoformat(),at=now,inventory_pnl=baseline,
+            self.sdk.journal.append('day_baseline',dict(day=day.isoformat(),condition_id=condition_id,at=now,inventory_pnl=baseline,
                 mark_at=mark_at,source='observed_boundary' if mark_at is not None else 'flat' if baseline is not None else UNKNOWN))
         else:
             baseline = baselines[-1]['inventory_pnl']
-        samples = [p for _,p in self.sdk.journal.events('occupation') if p['at'].astimezone(UTC).date() == day and p['at'] <= now]
         average = None
         if samples:
-            samples.sort(key=lambda p:p['at'])
             duration = D(str((now-samples[0]['at']).total_seconds()))
             integral = D('0')
             for index,p in enumerate(samples):
                 end = samples[index+1]['at'] if index+1 < len(samples) else now
-                integral += p['total']*D(str((end-p['at']).total_seconds()))
-            if duration > 0 and integral > 0:
+                amount = p.get('markets',{}).get(condition_id,{}).get('total',p['total'] if condition_id == p.get('condition_id',self.sdk.legacy_condition_id) and 'markets' not in p else None)
+                if amount is None:
+                    integral = None
+                    break
+                integral += amount*D(str((end-p['at']).total_seconds()))
+            if duration > 0 and integral is not None and integral > 0:
                 average = integral/duration
         reward,rebate = income['reward_today'],income['rebate_today']
         if average is not None and isinstance(reward,D):
@@ -275,7 +346,8 @@ class LiveRunner:
             metrics['net_profit'] = net
             if average is not None:
                 metrics['net_yield_pct_per_day'] = net/average*100
-        self._valuation_at = now if inventory_pnl is not None else None
+        self._valuations[condition_id] = now if inventory_pnl is not None else None
+        self._valuation_at = self._valuations[condition_id]
         return metrics
 
     def _cancel_owned(self, elapsed, attempted, *, at=None, active=()):
@@ -397,11 +469,17 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
     observations=ReadOnlySDK(public=public,http=http,credentials=c,clock=clock)
     client=journal=scanner=None
     try:
-        try:
-            rows=observations.read_fixed_market(config.started_at,config.market)
-        except Exception:
-            raise MarketCheckFailure(config.market) from None
-        tokens=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
+        selected = config.markets or (config.market,)
+        if not 1 <= len(selected) <= 3 or len(set(selected)) != len(selected):
+            raise ValueError('invalid frozen market list')
+        markets = {}
+        for cid in selected:
+            try:
+                rows=observations.read_fixed_market(config.started_at,cid)
+            except Exception:
+                raise MarketCheckFailure(cid) from None
+            markets[cid]=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
+        tokens=markets[selected[0]]
         with owner_file(config.relayer_credentials_file) as source:
             try:
                 relayer_payload=json.load(source)
@@ -414,20 +492,38 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         if (client.wallet_type != 'POLY_PROXY' or str(client.wallet).lower() != c.wallet_address.lower()
                 or str(client.signer).lower() != c.signer_address.lower()):
             raise ValueError('signing and L2 identities disagree')
-        from lp_v2.rotation_state import carry_legacy_journal,open_market_journal,read_control_window
-        action_id,window_end = read_control_window(config)
-        identity=dict(owner='lp-v2:'+c.wallet_address.lower(),condition_id=config.market,token_ids=tokens)
-        carry_legacy_journal(config.state_dir,identity)
-        journal=open_market_journal(config.state_dir,identity)
-        sdk=LiveSDK(client,journal,**identity,wallet=c.wallet_address,signer=c.signer_address,clock=clock)
+        identity=dict(owner='lp-v2:'+c.wallet_address.lower(),condition_id=selected[0],token_ids=tokens)
+        shared_path=Path(config.state_dir)/'journal.sqlite'
+        frozen_markets = len(selected) > 1
+        if not frozen_markets and shared_path.exists():
+            previous=Journal(shared_path,readonly=True)
+            try:
+                frozen_markets = any('markets' in row for _,row in previous.events('identity'))
+            finally:
+                previous.close()
+        if frozen_markets:
+            if any(path.exists() or path.is_symlink() for path in
+                   (Path(config.state_dir)/'rotation.sqlite',Path(config.state_dir)/'markets')):
+                raise ValueError('rotation history cannot be opened as frozen markets')
+            journal=Journal(shared_path)
+            sdk=LiveSDK(client,journal,**identity,markets=markets,wallet=c.wallet_address,signer=c.signer_address,clock=clock)
+            _adopt_identity(sdk,at=config.started_at)
+        else:
+            from lp_v2.rotation_state import carry_legacy_journal,open_market_journal,read_control_window
+            action_id,window_end = read_control_window(config)
+            carry_legacy_journal(config.state_dir,identity)
+            journal=open_market_journal(config.state_dir,identity)
+            sdk=LiveSDK(client,journal,**identity,wallet=c.wallet_address,signer=c.signer_address,clock=clock)
         sdk.rpc,sdk.relayer=client._ctx.rpc,client._ctx.relayer
         import httpx
         sdk.http=httpx.Client(timeout=5,trust_env=False,follow_redirects=False)
+        current = LiveRunner(config,sdk,observations,clock=clock)
+        if frozen_markets:
+            return current
         from lp_v2.live_control.profiles import read_json
         control_run_id=read_json(Path(config.state_dir)/'process.json')['run_id'] if action_id is not None else None
         from lp_v2.rotation_live import RotationRunner
         from lp_v2.rotation_scan import ScanWorker
-        current = LiveRunner(config,sdk,observations,clock=clock)
         scanner = ScanWorker(observations.new_scan_sdk(),clock=clock)
         return RotationRunner(config,current,scanner,action_id=action_id,window_end=window_end,clock=clock,
             account_identity=dict(signer_address=c.signer_address,wallet_address=c.wallet_address,signature_type=c.signature_type),
@@ -442,3 +538,77 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
             client.close()
         observations.close()
         raise
+
+
+def _adopt_identity(sdk, *, at):
+    """Append a selection only after all old durable identities prove safe removal."""
+    from lp_v2.models import OrderStatus, Outcome
+    journal, owner, markets = sdk.journal, sdk.owner, dict(sdk.markets)
+    identities = journal.events('identity')
+    old = {}
+    for _,identity in identities:
+        if identity['owner'] != owner:
+            raise ValueError('state belongs to a different wallet')
+        pairs = identity.get('markets', {identity.get('condition_id'):identity.get('token_ids')})
+        if not 1 <= len(pairs) <= 3:
+            raise ValueError('invalid old market list')
+        for cid,pair in pairs.items():
+            pair=tuple(pair)
+            if cid in old and old[cid] != pair or cid in markets and markets[cid] != pair:
+                raise ValueError('frozen token identity changed')
+            old[cid]=pair
+    all_pairs = {**old, **markets}
+    if len({t for pair in all_pairs.values() for t in pair}) != 2*len(all_pairs):
+        raise ValueError('historical token maps overlap')
+    requests, merge_requests = {}, {}
+    for kind in ('intent','order_result','merge_intent','merge_result'):
+        for _,payload in journal.events(kind):
+            r=payload['request'] if isinstance(payload,dict) else payload.request
+            key=r.request_id if kind in ('intent','order_result') else r.merge_id
+            known=requests if kind in ('intent','order_result') else merge_requests
+            if key in known and known[key] != r:
+                raise ValueError('historical request identity changed')
+            known[key]=r
+    history = sdk._history()
+    for result in history.values():
+        r = result.request
+        if (r.owner != owner or r.quote.condition_id not in all_pairs or r.reservation_terms is None
+                or r.reservation_terms.token_ids != all_pairs[r.quote.condition_id]
+                or r.quote.token_id not in all_pairs[r.quote.condition_id]):
+            raise ValueError('old request identity mismatch')
+        if r.quote.condition_id not in markets:
+            order=result.order
+            fills=[f for _,f in journal.events('fill') if f.request_id == r.request_id]
+            if not (result.outcome == Outcome.FAILED and order is None and not fills
+                    or result.outcome == Outcome.SUCCESS and order is not None and order.authoritative
+                    and order.status != OrderStatus.LIVE and order.remaining_quantity == 0
+                    and sum((f.quantity for f in fills),D('0')) == order.filled_quantity):
+                raise ValueError('cannot omit unsettled order or placement')
+    for _,fill in journal.events('fill'):
+        r = history.get(fill.request_id)
+        if (r is None or fill.owner != owner or fill.condition_id != r.request.quote.condition_id
+                or fill.token_id != r.request.quote.token_id
+                or r.order is not None and fill.order_id != r.order.order_id):
+            raise ValueError('old fill identity mismatch')
+    for _,signed in journal.events('signed'):
+        r=requests.get(signed['request_id'])
+        if (r is None or signed['token_id'] != r.quote.token_id or signed['maker'].lower() != sdk.wallet.lower()
+                or signed['signer'].lower() != sdk.signer.lower()):
+            raise ValueError('signed request has no matching durable identity')
+    for result in sdk._merge_results().values():
+        r = result.request
+        if (r.owner != owner or r.condition_id not in all_pairs
+                or (r.yes_token_id,r.no_token_id) != all_pairs[r.condition_id]):
+            raise ValueError('old merge identity mismatch')
+        if r.condition_id not in markets and not (result.outcome == Outcome.FAILED
+                or result.outcome == Outcome.SUCCESS and result.received_usdc == r.quantity
+                and len(result.consumed_positions) == 2
+                and {p.token_id for p in result.consumed_positions} == set(all_pairs[r.condition_id])
+                and all(p.owner == owner and p.condition_id == r.condition_id and p.quantity == r.quantity
+                        for p in result.consumed_positions)):
+            raise ValueError('cannot omit unresolved merge')
+    if any((p.quantity != 0 or p.cost_usdc != 0) and p.condition_id not in markets for p in sdk._positions().values()):
+        raise ValueError('cannot omit owned inventory')
+    identity = dict(owner=owner,markets=markets)
+    if not identities or {k:v for k,v in identities[-1][1].items() if k != 'at'} != identity:
+        journal.append('identity',dict(identity,at=at))

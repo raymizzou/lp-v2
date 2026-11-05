@@ -90,11 +90,16 @@ lp-v2 run --live --capital-usdc <已批准上限> --market <已批准condition_i
   --relayer-credentials-file /etc/lp-v2/relayer.json --state-dir /opt/lp-v2/state
 ```
 
-`--market` 是首个市场，只允许完整 condition id；每个市场的 journal 固定自己的两个 token，
-资金上限与 UTC 启动时间不变。已确认 on 的窗口内可按评分串行轮换，详见
-[轮换说明](operations/live-control.md#single-market-rotation)。不在运行中重读配置。`run.env` 仅放 `LP_V2_MARKET`、`LP_V2_CAPITAL_USDC`、
+`--market` 可重复 1–3 个完整 condition id，重复值去重；启动时冻结每个市场的两个 token、
+统一资金上限和 UTC 启动时间。两个或三个市场走冻结列表的 M5 路径；单市场作为轮换 seed，
+使用各市场独立 journal，在已确认 on 的窗口内可按评分串行轮换，详见
+[轮换说明](operations/live-control.md#single-market-rotation)。不在运行中重读配置。
+已有 M5 root journal 保留冻结路径，缩减至单市场也必须通过原有历史身份与风险检查。
+已有轮换流水或市场目录不能切入冻结多市场路径，防止遗漏历史自有风险。
+`run.env` 仅放逗号分隔的 `LP_V2_MARKETS`、`LP_V2_CAPITAL_USDC`、
 `LP_V2_CODE_SHA` 等非秘密身份。改上限只能改该文件并在另行批准的停止/重启后生效；
-降低上限前必须核对现有占用。HTTP 仍只有 GET，没有修改、stop 或 restart 接口。
+降低上限前必须核对现有占用。launcher 在未设置新变量时兼容旧 `LP_V2_MARKET`，
+显式空值或空列表项会拒绝；不会自动补市场。HTTP 仍只有 GET，没有修改、stop 或 restart 接口。
 
 ## 循环、恢复与停止
 
@@ -213,10 +218,26 @@ lp_yield_pct_per_day = 当日实际奖励 / 同一平均占用 × 100
 重启沿用已有当天基准；停机跨日、持仓但缺开盘观察基准时，净收益 UNKNOWN，不能事后回填。
 无隔夜库存时可由完整成交/回执历史证明基准为零。读回失败也会打断连续观察证明。
 
-每轮 journal 的 `occupation` 保存资金分项、最后核验时间、未配对份数/成本/行情估值及
+每轮 journal 的 `occupation` 保留原全局字段，另存各市场资金分项、计划份数、
+补腿价格上限及在场/在途数量、最后核验时间、未配对份数/成本/行情估值及
 UNKNOWN 清单，失败轮次也记录。导出证据应脱敏，不把私有状态或凭据提交到公开仓。
 本地离线测试、CI、评审、合入、部署、48–72 小时现场验收是不同结果，不能互相替代。
 
+
+## M5 多市场兼容
+
+同一钱包仍只有一个执行者、一个锁、一个 stop、一个地区门禁和一个资金上限。
+所有下单、挂单读回、成交与 merge 均核对名单内 condition/token 映射；补腿成本仅取同市场对侧。
+`/summary` 各行使用本市场的实际收入、毛配对利润、日初基准和时间加权占用，接口 schema 不变。
+
+继续使用原状态目录。新身份名单只追加，不改写 M4 单市场身份或旧流水；启动遍历旧身份及完整
+自有历史，拒绝换钱包、换 token，或遗漏仍有库存、在场/非权威订单、在途/UNKNOWN 下单或 merge 的市场。
+只有原市场已平且订单/merge 已有完整落定证明时才可移除；M4 残余市场必须占用一个名额。
+启动名单变更仍需既有运行授权，不能从支持参数推导获批市场。
+
+`occupation` 用种类索引和当天序号下界读取；重启重新确定下界，UTC 换日清除旧下界。
+不跨轮缓存订单、持仓或 UNKNOWN 事实。按天的 CSV/JSON、只读边界与缺证据说明见
+[M5 日报](M5_REPORT.md)。合成七天负载验证不替代 M4/M5 真实运行验收。
 
 ## 统一运维入口
 

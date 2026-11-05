@@ -54,6 +54,31 @@ def matched_pair():
     return ledger, fake
 
 
+def test_reconcile_repeated_complete_history_is_stable():
+    original,requests=prepared_ledger()
+    fake=FakeSDK(balance=Balance(Decimal('100'),AT))
+    yes,no=place_pair(fake,requests)
+    for result in (yes,no):original.apply_order(result)
+    fill=fake.execute_fill(yes.order.order_id,trade_id='partial',quantity=Decimal('4'),price=Decimal('.40'),fee_usdc=Decimal('.04'),at=T1)
+    original.apply_fill(fill)
+    fake.script_cancel(no.order.order_id,Outcome.SUCCESS,cancelled=True)
+    original.apply_order(fake.cancel_order(no.order.order_id,at=T2))
+    expected=original.snapshot()
+    assert expected.positions==(Position(OWNER,'market-1','yes',Decimal('4'),Decimal('1.64'),T1),)
+    assert len(expected.requests)==len(expected.orders)==2 and expected.cash==Decimal('98.36')
+    recovered=Ledger(OWNER,Decimal('100'))
+    for _ in range(3):
+        recovered.reconcile(fake)
+        assert recovered.snapshot()==expected
+    # Complete cold recovery must reject a new conflicting fact atomically too.
+    before=recovered.snapshot()
+    fake_facts=fake.read_orders()
+    fake.read_orders=lambda:fake_facts+(replace(fake_facts[0],request=replace(requests[0],quote=replace(requests[0].quote,price=Decimal('.41')))),)
+    with pytest.raises(ValueError,match='identity'):
+        recovered.reconcile(fake)
+    assert recovered.snapshot()==before
+
+
 def test_fill_replay_and_ordering():
     first, requests = prepared_ledger()
     second, same_requests = prepared_ledger()

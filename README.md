@@ -66,7 +66,11 @@ explicit operator actions; see the [M4 guide](docs/M4_LIVE.md). Verified taker-o
 fee schedules preserve `feesEnabled=true` while maker plans carry explicit zero costs.
 Actual nonzero maker fill fees remain unsupported.
 
-The separate `run --live --market <condition_id>` path uses that market as its startup seed and connects the existing engine
+The separate `run --live --market <condition_id>` path accepts one to three approved markets.
+A single market is the startup seed for serial rotation; repeating `--market` for two or three
+markets selects the frozen M5 multi-market runner. Existing M5 journal histories stay on
+the frozen runner even when reduced to one market. Existing rotation state cannot be
+opened by the frozen multi-market path. Both paths connect the existing engine
 and ledger to the pinned SDK through an append-only SQLite journal. It includes
 owned-order drain/stop, restart reconciliation, receipt-gated Proxy merge, and
 actual UTC income in the existing dashboard. Read the [M4 operator guide](docs/M4_LIVE.md)
@@ -74,6 +78,9 @@ for the explicit signing/L2/relayer file boundaries, Linux process requirements,
 accounting definitions, UNKNOWN behavior and remaining operational verification.
 The [live unit](deploy/lp-v2-live.service) and [launcher](deploy/run-live) are drafts;
 they provision nothing and do not replace the read-only deployment path.
+The M5 extension freezes one to three markets in one executor, preserves M4 state and global limits,
+and records per-market occupation and income. The read-only `lp-v2 report --state-dir … --day YYYY-MM-DD --out …`
+command writes daily CSV/JSON with explicit UNKNOWN reasons and safety evidence; see the [M5 report guide](docs/M5_REPORT.md).
 No deployment, live operation, key provisioning or field acceptance is claimed.
 
 ## Live-control wrapper

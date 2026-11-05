@@ -20,6 +20,15 @@ class RunConfig:
     private_key_file: str | None = field(default=None,repr=False)
     state_dir: str | None = None
     relayer_credentials_file: str | None = field(default=None,repr=False)
+    markets: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True,slots=True)
+class ReportConfig:
+    state_dir: str
+    day: str
+    out: str
+    credentials: object = field(default=None,repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +54,7 @@ def _positive_capital(value: str) -> Decimal:
     return capital
 
 
-def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | PreflightConfig:
+def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | ReportConfig | PreflightConfig:
     parser = argparse.ArgumentParser(prog="lp-v2")
     commands = parser.add_subparsers(dest="command", required=True)
     preflight = commands.add_parser("preflight")
@@ -54,10 +63,15 @@ def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | PreflightC
     preflight.add_argument("--code-sha", required=True)
     stop = commands.add_parser("stop")
     stop.add_argument("--state-dir",required=True)
+    report = commands.add_parser('report',description='Read-only UTC daily CSV + JSON outside state; missing facts and unset safety thresholds remain UNKNOWN. See docs/M5_REPORT.md for provenance.')
+    report.add_argument('--state-dir',required=True)
+    report.add_argument('--day',required=True,help='UTC YYYY-MM-DD')
+    report.add_argument('--out',required=True,help='Output prefix outside state; writes .csv and .json')
+    report.add_argument('--credentials-file',help='Explicit owner-only existing L2 credentials; GET only; never a signing key')
     run = commands.add_parser("run")
     run.add_argument("--capital-usdc", required=True, type=_positive_capital)
     run.add_argument('--live',action='store_true')
-    run.add_argument('--market')
+    run.add_argument('--market', action='append')
     run.add_argument('--private-key-file')
     run.add_argument('--state-dir')
     run.add_argument('--relayer-credentials-file')
@@ -66,6 +80,22 @@ def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | PreflightC
     args = parser.parse_args(argv)
     if args.command == "stop":
         return StopConfig(args.state_dir)
+    if args.command == 'report':
+        from datetime import date
+        from lp_v2.report import output_paths
+        try:
+            if date.fromisoformat(args.day).isoformat() != args.day:
+                raise ValueError('date')
+            output_paths(args.state_dir,args.out)
+            credentials=None
+            if args.credentials_file:
+                import json
+                from lp_v2.readonly_sdk import L2Credentials
+                with owner_file(args.credentials_file) as source:
+                    credentials=L2Credentials(**json.load(source))
+        except Exception:
+            parser.error('report requires an exact UTC date, safe output outside state, and valid explicit L2 credentials')
+        return ReportConfig(args.state_dir,args.day,args.out,credentials)
     import re
     if args.code_sha != 'UNKNOWN' and not re.fullmatch('[0-9a-f]{40}', args.code_sha):
         parser.error('--code-sha must be an exact 40-character SHA')
@@ -76,8 +106,9 @@ def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | PreflightC
             parser.error('preflight requires an exact code SHA')
         return PreflightConfig(args.capital_usdc,datetime.now(UTC),args.market,args.code_sha)
     if args.live:
-        if not args.market or not re.fullmatch('0x[0-9a-fA-F]{64}',args.market):
-            parser.error('live requires an exact --market condition id')
+        markets = tuple(dict.fromkeys(args.market or ()))
+        if not 1 <= len(markets) <= 3 or any(not re.fullmatch('0x[0-9a-fA-F]{64}', cid) for cid in markets):
+            parser.error('live requires 1–3 exact --market condition ids')
         if not args.private_key_file or not args.state_dir or not args.credentials_file:
             parser.error('live requires explicit signing, L2 credential and state paths')
         try:
@@ -106,7 +137,7 @@ def parse_run(argv: Sequence[str] | None) -> RunConfig | StopConfig | PreflightC
     if args.live and (credentials.signature_type != 1 or not all(re.fullmatch('0x[0-9a-fA-F]{40}',v) for v in (credentials.signer_address,credentials.wallet_address))):
         parser.error('live requires explicit POLY_PROXY identity')
     return RunConfig(capital_usdc=args.capital_usdc, started_at=datetime.now(UTC), code_sha=args.code_sha, credentials=credentials,
-        live=args.live,market=args.market,private_key_file=args.private_key_file,state_dir=args.state_dir,
+        live=args.live,market=markets[0] if args.live else None,markets=markets if args.live else (),private_key_file=args.private_key_file,state_dir=args.state_dir,
         relayer_credentials_file=args.relayer_credentials_file)
 
 
@@ -131,6 +162,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         from lp_v2.live_control import main as live_main
         return live_main(argv[1:])
     config = parse_run(argv)
+    if isinstance(config,ReportConfig):
+        from lp_v2.report import write_report
+        try:
+            write_report(config)
+        except Exception:
+            print('Report failed; state was opened read-only. Check input facts and output access.')
+            return 1
+        print('Report CSV and JSON written; consult notes and safety UNKNOWN reasons.')
+        return 0
     if isinstance(config,PreflightConfig):
         import json
         from lp_v2.preflight import run_preflight

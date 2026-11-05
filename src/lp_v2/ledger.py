@@ -23,6 +23,16 @@ def _order_priority(order: Order):
     return terminal, order.authoritative, order.observed_at, order.filled_quantity
 
 
+def _canonical_order(order, fills):
+    quantity = max(order.filled_quantity, sum((f.quantity for f in fills), Decimal("0")))
+    terminal = order.authoritative and order.status in (OrderStatus.CANCELLED, OrderStatus.FILLED)
+    remaining = Decimal("0") if terminal else min(order.remaining_quantity, order.request.quote.quantity - quantity)
+    status = order.status if terminal else OrderStatus.FILLED if quantity == order.request.quote.quantity else OrderStatus.LIVE
+    observed = max([order.observed_at, *(f.executed_at for f in fills)])
+    return Order(order.order_id, order.request, quantity, remaining, status, observed,
+                 order.authoritative, order.cancel_requested_at)
+
+
 def _terms_valid(terms: ReservationTerms) -> None:
     _money(terms.planned_quantity, *terms.fee_per_share)
     if (len(terms.token_ids) != 2 or len(set(terms.token_ids)) != 2 or not all(terms.token_ids)
@@ -190,6 +200,8 @@ class Ledger:
         _money(balance.usdc)
         if balance.merge_results is None:
             raise ValueError("complete merge history proof is unavailable")
+        provenance = {(r.quote.condition_id, r.reservation_terms.generation): r.reservation_terms
+                      for r in candidate._requests.values()}
         for order in orders:
             request = order.request
             if request.owner != self.owner:
@@ -200,19 +212,18 @@ class Ledger:
                 raise ValueError("request identity has changed payload")
             terms = request.reservation_terms
             cid = request.quote.condition_id
-            for known in candidate._requests.values():
-                old = known.reservation_terms
-                if (known.quote.condition_id == cid and old.generation == terms.generation
-                        and (old.token_ids != terms.token_ids or old.fee_per_share != terms.fee_per_share)):
-                    raise ValueError("conflicting reservation provenance")
+            old = provenance.setdefault((cid, terms.generation), terms)
+            if old.token_ids != terms.token_ids or old.fee_per_share != terms.fee_per_share:
+                raise ValueError("conflicting reservation provenance")
             current = candidate._terms.get(cid)
             if (current is None or terms.generation > current.generation
                     or (terms.generation == current.generation and terms.planned_quantity < current.planned_quantity)):
                 candidate._terms[cid] = terms
             candidate._requests[request.request_id] = request
-        for order in orders:
-            result = order if isinstance(order, OrderResult) else OrderResult(order.request, Outcome.SUCCESS, order, order.observed_at)
-            candidate.apply_order(result)
+        # Validate every fact, then refresh the complete batch once on the atomic candidate.
+        candidate._apply_orders(order if isinstance(order, OrderResult)
+                                else OrderResult(order.request, Outcome.SUCCESS, order, order.observed_at)
+                                for order in orders)
         for fill in sorted(trades, key=lambda f: (f.executed_at, f.trade_id)):
             candidate.apply_fill(fill)
         for result in balance.merge_results:
@@ -265,54 +276,70 @@ class Ledger:
         return True
 
     def apply_order(self, result: OrderResult) -> None:
-        if result.request.owner != self.owner:
+        self._apply_orders((result,))
+
+    def _apply_orders(self, results) -> None:
+        results = tuple(r for r in results if r.request.owner == self.owner)
+        if not results:
             return
-        if self._requests.get(result.request.request_id) != result.request:
-            raise ValueError("request identity has changed payload or is unregistered")
-        order = result.order
-        if order is None:
-            if result.outcome == Outcome.FAILED:
-                if any(o.request.request_id == result.request.request_id for o in self._canonical_orders()):
-                    raise ValueError("placement rejection contradicts an existing order")
-                previous = self._rejected.get(result.request.request_id)
-                if previous is None or result.observed_at > previous.observed_at:
-                    self._rejected[result.request.request_id] = result
-                self._refresh()
-            return
-        if result.request.request_id in self._rejected:
-            raise ValueError("order contradicts confirmed placement rejection")
-        if order.request != result.request or not order.order_id:
-            raise ValueError("order identity does not match request")
-        if order.cancel_requested_at is not None and order.cancel_requested_at < order.request.created_at:
-            raise ValueError("cancellation attempt precedes order intent")
-        _money(order.filled_quantity, order.remaining_quantity)
-        terminal = order.authoritative and order.status in (OrderStatus.CANCELLED, OrderStatus.FILLED)
-        if (order.status not in (OrderStatus.LIVE, OrderStatus.CANCELLED, OrderStatus.FILLED)
-                or (terminal and order.remaining_quantity != 0)
-                or (order.authoritative and order.status == OrderStatus.FILLED
-                    and order.filled_quantity != order.request.quote.quantity)):
-            raise ValueError("invalid terminal order quantities/status")
-        if order.filled_quantity + order.remaining_quantity > order.request.quote.quantity:
-            raise ValueError("order quantities exceed intent")
-        previous = self._order_facts.get(order.order_id)
-        if previous is not None and previous.request != order.request:
-            raise ValueError("order identity has changed payload")
-        for current in self._canonical_orders():
-            if current.request.request_id == order.request.request_id and current.order_id != order.order_id:
+        orders = {o.order_id: o for o in self._canonical_orders()}
+        request_orders = {o.request.request_id: o.order_id for o in orders.values()}
+        fills = {}
+        for fill in self._fills.values():
+            fills.setdefault(fill.order_id, []).append(fill)
+        changed = False
+        for result in results:
+            if self._requests.get(result.request.request_id) != result.request:
+                raise ValueError("request identity has changed payload or is unregistered")
+            order = result.order
+            if order is None:
+                if result.outcome == Outcome.FAILED:
+                    if result.request.request_id in request_orders:
+                        raise ValueError("placement rejection contradicts an existing order")
+                    previous = self._rejected.get(result.request.request_id)
+                    if previous is None or result.observed_at > previous.observed_at:
+                        self._rejected[result.request.request_id] = result
+                    changed = True
+                continue
+            if result.request.request_id in self._rejected:
+                raise ValueError("order contradicts confirmed placement rejection")
+            if order.request != result.request or not order.order_id:
+                raise ValueError("order identity does not match request")
+            if order.cancel_requested_at is not None and order.cancel_requested_at < order.request.created_at:
+                raise ValueError("cancellation attempt precedes order intent")
+            _money(order.filled_quantity, order.remaining_quantity)
+            terminal = order.authoritative and order.status in (OrderStatus.CANCELLED, OrderStatus.FILLED)
+            if (order.status not in (OrderStatus.LIVE, OrderStatus.CANCELLED, OrderStatus.FILLED)
+                    or (terminal and order.remaining_quantity != 0)
+                    or (order.authoritative and order.status == OrderStatus.FILLED
+                        and order.filled_quantity != order.request.quote.quantity)):
+                raise ValueError("invalid terminal order quantities/status")
+            if order.filled_quantity + order.remaining_quantity > order.request.quote.quantity:
+                raise ValueError("order quantities exceed intent")
+            previous = self._order_facts.get(order.order_id)
+            if previous is not None and previous.request != order.request:
+                raise ValueError("order identity has changed payload")
+            if (order.request.request_id in request_orders
+                    and request_orders[order.request.request_id] != order.order_id):
                 raise ValueError("request identity bound to another order")
-            if current.order_id == order.order_id:
+            current = orders.get(order.order_id)
+            if current is not None:
                 if ((terminal and order.filled_quantity < current.filled_quantity)
                         or (current.authoritative and current.status != OrderStatus.LIVE
                             and order.filled_quantity > current.filled_quantity)):
                     raise ValueError("terminal cumulative quantity contradicts recorded fills")
-        chosen = order if previous is None or _order_priority(order) > _order_priority(previous) else previous
-        quantity = max(order.filled_quantity, previous.filled_quantity if previous else Decimal("0"))
-        remaining = Decimal("0") if chosen.authoritative and chosen.status != OrderStatus.LIVE else chosen.request.quote.quantity - quantity
-        self._order_facts[order.order_id] = replace(chosen, filled_quantity=quantity, remaining_quantity=remaining)
-        if order.cancel_requested_at is not None:
-            self._cancels.setdefault(order.order_id, CancelRequest(order.order_id, order.request.request_id, self.owner,
-                                                                  order.request.quote.condition_id, order.cancel_requested_at))
-        self._refresh()
+            chosen = order if previous is None or _order_priority(order) > _order_priority(previous) else previous
+            quantity = max(order.filled_quantity, previous.filled_quantity if previous else Decimal("0"))
+            remaining = Decimal("0") if chosen.authoritative and chosen.status != OrderStatus.LIVE else chosen.request.quote.quantity - quantity
+            self._order_facts[order.order_id] = replace(chosen, filled_quantity=quantity, remaining_quantity=remaining)
+            if order.cancel_requested_at is not None:
+                self._cancels.setdefault(order.order_id, CancelRequest(order.order_id, order.request.request_id, self.owner,
+                                                                      order.request.quote.condition_id, order.cancel_requested_at))
+            orders[order.order_id] = _canonical_order(self._order_facts[order.order_id], fills.get(order.order_id, ()))
+            request_orders[order.request.request_id] = order.order_id
+            changed = True
+        if changed:
+            self._refresh()
 
     def apply_fill(self, fill: Fill) -> None:
         if fill.owner != self.owner:
@@ -354,17 +381,8 @@ class Ledger:
                 request = self._requests[fill.request_id]
                 orders[fill.order_id] = Order(fill.order_id, request, Decimal("0"), request.quote.quantity,
                                               OrderStatus.LIVE, request.created_at, False)
-        result = []
-        for order_id, order in sorted(orders.items()):
-            fills = fills_by_order.get(order_id, ())
-            quantity = max(order.filled_quantity, sum((f.quantity for f in fills), Decimal("0")))
-            terminal = order.authoritative and order.status in (OrderStatus.CANCELLED, OrderStatus.FILLED)
-            remaining = Decimal("0") if terminal else min(order.remaining_quantity, order.request.quote.quantity - quantity)
-            status = order.status if terminal else OrderStatus.FILLED if quantity == order.request.quote.quantity else OrderStatus.LIVE
-            observed = max([order.observed_at, *(f.executed_at for f in fills)])
-            result.append(Order(order.order_id, order.request, quantity, remaining, status, observed,
-                                order.authoritative, order.cancel_requested_at))
-        return tuple(result)
+        return tuple(_canonical_order(order, fills_by_order.get(order_id, ()))
+                     for order_id, order in sorted(orders.items()))
 
     def _positions(self) -> tuple[Position, ...]:
         positions = {}

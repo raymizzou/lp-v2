@@ -77,7 +77,8 @@ def test_reconcile_cancel_place_ordering(tmp_path):
     original = tuple(ex.orders)
     ex.cancel_unknown = True
     p = inputs(yes='.46',no='.46')
-    obs.plans = (replace(p,market=replace(p.market,rewards_max_spread=2.0)),)
+    obs.plans = (replace(p,market=replace(p.market,rewards_max_spread=2.0),
+                         books=tuple(replace(b,observed_at=AT+timedelta(seconds=60)) for b in p.books)),)
     step_at(runner, AT+timedelta(seconds=60))
     assert ex.sdk.list_account_trades.call_count >= 2
     assert set(c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list) == set(original)
@@ -109,8 +110,8 @@ def test_live_scenarios(tmp_path, scenario):
         ex.fill('order-1','10','.40')
         ex.reject_tokens.clear()
         p = inputs(no='.60',reward=0 if scenario == 'expired-holding' else 100)
-        obs.plans = (p,)
         when = AT+timedelta(hours=25) if scenario == 'expired-holding' else AT+timedelta(seconds=10)
+        obs.plans = (replace(p,books=tuple(replace(b,observed_at=when) for b in p.books)),)
         if scenario == 'pending-hedge':
             ex.sdk.post_order.side_effect = TimeoutError('unknown submission')
         step_at(runner, when)
@@ -134,6 +135,7 @@ def test_live_scenarios(tmp_path, scenario):
                 ex.fill('order-2','2','.55',at=AT+timedelta(seconds=61))
                 ex.terminal('order-1')
                 ex.terminal('order-2')
+        obs.plans = tuple(replace(p,books=tuple(replace(b,observed_at=AT+timedelta(seconds=70)) for b in p.books)) for p in obs.plans)
         step_at(runner, AT+timedelta(seconds=70))
         state = runner.ledger.snapshot()
         assert sum(p.quantity for p in state.positions if p.token_id == '101') == D('6')
@@ -167,6 +169,7 @@ def test_live_random_capital(tmp_path):
                     if not ex.cancel_unknown:
                         ex.terminal(order.id)
                     history.append(('cancel',order.id,ex.cancel_unknown))
+            obs.plans = tuple(replace(p,books=tuple(replace(b,observed_at=ex.now) for b in p.books)) for p in obs.plans)
             step_at(runner, ex.now)
             state = runner.ledger.snapshot()
             assert 0 <= state.capital.total <= D('100'), (seed,history)
@@ -445,6 +448,7 @@ def test_unknown_submission_expiry_restores_rounds_without_replay(tmp_path):
     assert len(original) == 2 and len(runner.ledger.snapshot().pending) == 1
     for seconds in (10,3719):
         ex.now = AT+timedelta(seconds=seconds)
+        obs.plans = tuple(replace(p,books=tuple(replace(b,observed_at=ex.now) for b in p.books)) for p in obs.plans)
         step_at(runner, ex.now)
         assert len(ex.posts) == 2 and runner.ledger.snapshot().capital.total == D('10')
         assert runner.ledger.snapshot().pending == (original[1],)
@@ -471,6 +475,7 @@ def test_unknown_submission_expiry_survives_restart(tmp_path):
     live,journal = adapter(tmp_path,ex.sdk)
     runner = LiveRunner(RunConfig(D('100'),AT),live,obs,clock=lambda:ex.now)
     ex.now = AT+timedelta(seconds=3719)
+    obs.plans = tuple(replace(p,books=tuple(replace(b,observed_at=ex.now) for b in p.books)) for p in obs.plans)
     get = ex.sdk.get_order.side_effect
     ex.sdk.get_order.side_effect = TimeoutError('synthetic secret')
     step_at(runner, ex.now)

@@ -150,7 +150,7 @@ def combined_world(target, config_home, monkeypatch):
     import datetime as datetime_module
     root=Path(target['release']['root']);release=(root/'current').resolve()
     source_path='src/lp_v2/cli.py'
-    source=subprocess.check_output(['git','show','HEAD:'+source_path],text=True)
+    source=Path(source_path).read_text()
     (release/'src/lp_v2').mkdir(parents=True)
     (release/source_path).write_text(source)
     launcher=subprocess.check_output(['git','show','HEAD:deploy/run-live'],text=True)
@@ -494,7 +494,7 @@ def test_on_binds_installed_launcher_to_checked_files(combined_world,config_home
     alternative=Path(original['release']['root'])/'alternate-l2.json';alternative.write_bytes(Path(original['files']['l2_credentials']).read_bytes());alternative.chmod(0o600)
     monkeypatch.setattr('builtins.input',lambda _:'on')
     env=Path(original['files']['run_env']);original_env=env.read_bytes()
-    for number,scenario in enumerate(('credentials','state','extra_arg','extra_command','stop_arg','stop_ref','env_ref','env_override','env_input','group','launcher_bytes'),1):
+    for number,scenario in enumerate(('credentials','state','extra_arg','extra_command','stop_arg','stop_ref','env_ref','env_override','env_input','env_markets','group','launcher_bytes'),1):
         world.profile.clear();world.profile.update(copy.deepcopy(original));world.unit_overrides.clear();launcher.write_bytes(original_launcher);env.write_bytes(original_env)
         if scenario=='credentials':world.profile['files']['l2_credentials']=str(alternative)
         if scenario=='state':
@@ -507,13 +507,14 @@ def test_on_binds_installed_launcher_to_checked_files(combined_world,config_home
         if scenario=='env_ref':world.unit_overrides['EnvironmentFiles']='/another/run.env'
         if scenario=='env_override':world.unit_overrides['Environment']='BASH_ENV=/another/script'
         if scenario=='env_input':env.write_bytes(original_env+b'BASH_ENV=/another/script\n')
+        if scenario=='env_markets':env.write_bytes(original_env+b'LP_V2_MARKETS='+original['trading']['market_condition_id'].encode()+b'\n')
         if scenario=='group':world.unit_overrides['Group']='other'
         if scenario=='launcher_bytes':launcher.write_bytes(original_launcher+b'\n# unsupported edit\n')
         config.write_text(json.dumps(world.profile));before=env.read_bytes()
         assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
         capsys.readouterr();assert world.mutations==[] and world.readonly is True and env.read_bytes()==before
         # A directly confirmed helper preparation must bind the target too.
-        if scenario=='env_input':continue
+        if scenario in ('env_input','env_markets'):continue
         from lp_v2.live_control.profiles import fingerprint
         request=dict(schema_version=1,action='prepare',profile=world.profile,action_id=f'{number:032x}',
             changes=dict(LP_V2_CAPITAL_USDC='100',LP_V2_MARKET=original['trading']['market_condition_id'],LP_V2_CODE_SHA=original['release']['expected_sha']),
@@ -576,7 +577,8 @@ def test_check_refuses_active_legacy_or_alternate_executor(combined_world,monkey
     assert world.legacy_queries and world.mutations==[]
 
 
-def test_check_requires_conditional_inventory_handoff(combined_world,monkeypatch,capsys):
+@pytest.mark.parametrize('identity_format',['legacy','m5','mixed'])
+def test_check_requires_conditional_inventory_handoff(combined_world,monkeypatch,capsys,identity_format):
     from datetime import timedelta
     from decimal import Decimal as D
     from dataclasses import replace
@@ -613,7 +615,10 @@ def test_check_requires_conditional_inventory_handoff(combined_world,monkeypatch
     def history(rows,*,merges=(),tokens=('101','102'),reconciliation='SUCCESS'):
         journal=Journal(state/'journal.sqlite')
         if not journal.events():
-            journal.append('identity',dict(owner=owner,condition_id=market,token_ids=tokens))
+            if identity_format in ('legacy','mixed'):
+                journal.append('identity',dict(owner=owner,condition_id=market,token_ids=tokens))
+            if identity_format in ('m5','mixed'):
+                journal.append('identity',dict(owner=owner,markets={market:tokens},at=started))
             journal.append('occupation',dict(at=started))
         journal.append('stop_result',dict(at=at,exit_code=0,orders=[],pending=[],positions=rows,merges=merges,inventory=[],reconciliation=reconciliation,accounting_as_of=at))
         journal.close();(state/'journal.sqlite').chmod(0o600)
@@ -638,6 +643,44 @@ def test_check_requires_conditional_inventory_handoff(combined_world,monkeypatch
     assert {r.url.params['token_id'] for r in reads}=={'101','102'}
     assert all(r.method=='GET' and r.url.params['signature_type']=='1' for r in reads)
     assert world.mutations==[]
+    assert all(r.method=='GET' for r in world.http_requests)
+
+
+@pytest.mark.parametrize('invalid',['owner','market','tokens','multi-market','missing-at','naive-at','history'])
+def test_check_rejects_incompatible_m5_identity(combined_world,capsys,invalid):
+    from datetime import timedelta
+    from decimal import Decimal as D
+    from lp_v2.cli import main
+    from lp_v2.journal import Journal
+    from lp_v2.models import Position
+    world=combined_world;profile=world.profile;state=Path(profile['files']['state_dir'])
+    started=world.clock-timedelta(seconds=30);at=world.clock-timedelta(seconds=10)
+    owner='lp-v2:'+profile['identity']['wallet_address'].lower();market=profile['trading']['market_condition_id']
+    identity=dict(owner=owner,markets={market:('101','102')},at=started)
+    if invalid=='owner':identity['owner']='foreign'
+    if invalid=='market':identity['markets']={'0x'+'f'*64:('101','102')}
+    if invalid=='tokens':identity['markets']={market:('101','999')}
+    if invalid=='multi-market':identity['markets']['0x'+'f'*64]=('201','202')
+    if invalid=='missing-at':del identity['at']
+    if invalid=='naive-at':identity['at']=started.replace(tzinfo=None)
+    record=dict(profile=copy.deepcopy(profile),run_id='f'*32,started_at=started.isoformat(),journal_seq=1)
+    for name,payload in [('live-control-run.json',record),('process.json',dict(run_id='f'*32,pid=45678,identity='synthetic-boot:123')),('stop-result.json',dict(run_id='f'*32,exit_code=0))]:
+        path=state/name;path.write_text(json.dumps(payload));path.chmod(0o600)
+    journal=Journal(state/'journal.sqlite')
+    if invalid=='history':journal.append('identity',dict(owner=owner,condition_id=market,token_ids=('101','999')))
+    journal.append('identity',identity)
+    journal.append('occupation',dict(at=started))
+    positions=[Position(owner,market,'101',D('1.25'),D('.5'),at),Position(owner,market,'102',D('2'),D('1.1'),at)]
+    journal.append('stop_result',dict(at=at,exit_code=0,orders=[],pending=[],positions=positions,merges=[],inventory=[],reconciliation='SUCCESS',accounting_as_of=at))
+    journal.close();(state/'journal.sqlite').chmod(0o600)
+    world.conditional={'101':'1250000','102':'2000000'}
+    frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    assert main(['live','check'])==2
+    checks=json.loads(capsys.readouterr().out)['checks']
+    assert checks['state_identity']['status']!='PASS' or checks['inventory_handoff']['status']!='PASS'
+    assert {p:p.read_bytes() for p in state.rglob('*') if p.is_file()}==frozen
+    assert world.mutations==[] and world.readonly is True
+    assert all(r.method=='GET' for r in world.http_requests)
 
 
 def test_new_state_rejects_orphaned_journal_history(combined_world,monkeypatch,capsys):

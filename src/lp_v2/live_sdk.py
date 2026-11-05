@@ -13,12 +13,23 @@ _UNAVAILABLE = object()
 
 
 class LiveSDK:
-    def __init__(self, client, journal, *, owner, condition_id, token_ids, wallet, signer, clock=lambda: datetime.now(UTC)):
+    def __init__(self, client, journal, *, owner, condition_id, token_ids, wallet, signer, markets=None, clock=lambda: datetime.now(UTC)):
         self.client, self.journal = client, journal
         self.owner, self.condition_id, self.token_ids = owner, condition_id, tuple(token_ids)
+        from types import MappingProxyType
+        pairs = {cid:tuple(pair) for cid,pair in (markets or {condition_id:token_ids}).items()}
+        if (not 1 <= len(pairs) <= 3 or pairs.get(condition_id) != tuple(token_ids)
+                or any(len(pair) != 2 or not all(pair) or pair[0] == pair[1] for pair in pairs.values())
+                or len({t for pair in pairs.values() for t in pair}) != 2*len(pairs)):
+            raise ValueError('invalid frozen market identities')
+        self.markets = MappingProxyType(pairs)
+        identities=journal.events('identity')
+        first=identities[0][1] if identities else {}
+        self.legacy_condition_id=first.get('condition_id',next(iter(first.get('markets',pairs))))
         self.wallet, self.signer = wallet, signer
         self.rpc = self.relayer = self.http = None
         self._order_reads = None
+        self._history_cache = None
         self.clock = clock
         self._cycle_at = None
 
@@ -34,6 +45,7 @@ class LiveSDK:
             yield
         finally:
             self._order_reads = None
+            self._history_cache = None
             self._cycle_at = None
 
     def _now(self):
@@ -52,8 +64,8 @@ class LiveSDK:
 
     def _validate(self, request, at):
         q, terms = request.quote, request.reservation_terms
-        if (request.owner != self.owner or q.condition_id != self.condition_id or q.token_id not in self.token_ids
-                or terms is None or terms.token_ids != self.token_ids or not request.request_id
+        if (request.owner != self.owner or q.condition_id not in self.markets or q.token_id not in self.markets[q.condition_id]
+                or terms is None or terms.token_ids != self.markets[q.condition_id] or not request.request_id
                 or not q.price.is_finite() or not 0 < q.price < 1
                 or not q.quantity.is_finite() or q.quantity <= 0
                 or request.expires_at != request.created_at + timedelta(hours=1)
@@ -70,10 +82,10 @@ class LiveSDK:
             return result if isinstance(result, OrderResult) else OrderResult(request, Outcome.SUCCESS, result, at)
         ceiling = D('.98') - request.quote.price - sum(request.reservation_terms.fee_per_share)
         if request.purpose == 'hedge':
-            opposite = next((p for p in self.read_positions() if p.token_id != request.quote.token_id and p.quantity > 0), None)
+            opposite = next((p for p in self.read_positions() if p.condition_id == request.quote.condition_id and p.token_id != request.quote.token_id and p.quantity > 0), None)
             if opposite is None:
                 raise ValueError('hedge ceiling requires opposite cost proof')
-            index = self.token_ids.index(request.quote.token_id)
+            index = self.markets[request.quote.condition_id].index(request.quote.token_id)
             ceiling = D('.98') - opposite.cost_usdc/opposite.quantity - request.reservation_terms.fee_per_share[index]
             if request.quote.price > ceiling:
                 raise ValueError('hedge exceeds cost ceiling')
@@ -135,16 +147,22 @@ class LiveSDK:
         return dict(authorization, entry_signature=not activated)
 
     def _history(self):
+        if self._order_reads is not None:
+            revision = (self.journal.last_sequence('intent'),self.journal.last_sequence('order_result'))
+            if self._history_cache is not None and self._history_cache[0] == revision:
+                return self._history_cache[1].copy()
         requests = {p['request'].request_id: p['request'] for _, p in self.journal.events('intent')}
         results = {key: OrderResult(r, Outcome.UNKNOWN, None, r.created_at) for key, r in requests.items()}
         for _, result in self.journal.events('order_result'):
             results[result.request.request_id] = result
+        if self._order_reads is not None:
+            self._history_cache = revision,results.copy()
         return results
 
     def _observed_order(self, raw, oid, previous, cancels):
         r, q = previous.request, previous.request.quote
         if (raw.id != oid or raw.maker_address.lower() != self.wallet.lower()
-                or raw.condition_id != self.condition_id or raw.token_id != q.token_id
+                or raw.condition_id != q.condition_id or q.condition_id not in self.markets or raw.token_id != q.token_id
                 or raw.side != 'BUY' or raw.price != q.price or raw.original_size != q.quantity
                 or raw.order_type != 'GTD' or raw.expires_at != datetime.fromtimestamp(int(r.expires_at.timestamp()), UTC)):
             raise ValueError('owned order readback identity mismatch')
@@ -158,13 +176,14 @@ class LiveSDK:
         if status != OrderStatus.LIVE and raw.size_matched < prior:
             raise ValueError('terminal cumulative quantity regressed')
         filled = max(raw.size_matched,prior) if status == OrderStatus.LIVE else raw.size_matched
+        observed_at = self._now()
         order = Order(oid,r,filled,q.quantity-filled if status == OrderStatus.LIVE else D('0'),
-                      status,self._now(),not uncertain,cancels.get(oid))
-        return OrderResult(r,Outcome.UNKNOWN if uncertain else Outcome.SUCCESS,order,self._now())
+                      status,observed_at,not uncertain,cancels.get(oid))
+        return OrderResult(r,Outcome.UNKNOWN if uncertain else Outcome.SUCCESS,order,observed_at)
 
     def _missing_order(self, previous, candidates, cancels):
         # Iterator exhaustion is required: a later-page failure cannot prove absence.
-        opens = tuple(o for page in self.client.list_open_orders(market=self.condition_id) for o in page.items)
+        opens = tuple(o for page in self.client.list_open_orders(market=previous.request.quote.condition_id) for o in page.items)
         if any(not isinstance(o.id,str) or not o.id for o in opens):
             raise ValueError('incomplete open order readback')
         trades = self._trade_facts()
@@ -243,7 +262,11 @@ class LiveSDK:
                     result = previous
             if result is previous and previous.order is not None:
                 result = OrderResult(previous.request,Outcome.UNKNOWN,replace(previous.order,authoritative=False),previous.observed_at)
-            if result != previous:
+            # Observation freshness is returned, while the journal records fact transitions.
+            comparable = replace(result,observed_at=previous.observed_at,
+                order=replace(result.order,observed_at=previous.order.observed_at)
+                if result.order is not None and previous.order is not None else result.order)
+            if comparable != previous:
                 self.journal.append('order_result',result)
                 if result.outcome == Outcome.FAILED and result.order is None:
                     reason = '到期未见'
@@ -253,7 +276,7 @@ class LiveSDK:
                     reason = None
                 if reason:
                     self.journal.append('diagnostic',dict(request_id=key,reason=reason,at=self._now()))
-                results[key] = result
+            results[key] = result
         return tuple(r.order if r.order else r for r in results.values())
 
     def orders_verified(self):
@@ -270,7 +293,7 @@ class LiveSDK:
 
     def cancel_order(self, order_id, *, at):
         known = next((r for r in self._history().values() if r.order and r.order.order_id == order_id), None)
-        if known is None:
+        if known is None or known.request.quote.condition_id not in self.markets or known.request.quote.token_id not in self.markets[known.request.quote.condition_id]:
             raise ValueError('cannot cancel foreign or unknown order')
         self.journal.append('cancel_intent', dict(order_id=order_id, at=at))
         outcome = Outcome.UNKNOWN
@@ -305,32 +328,33 @@ class LiveSDK:
         known = {f.trade_id:f for _,f in self.journal.events('fill')}
         identities = {f.request_id:f.order_id for _,f in self.journal.events('fill')}
         identities.update({key:r.order.order_id for key,r in results.items() if r.order})
-        for page in self.client.list_account_trades(market=self.condition_id, maker_address=self.wallet):
-            for raw in page.items:
-                for maker in raw.maker_orders:
-                    if maker.order_id not in orders:
-                        continue
-                    r = orders[maker.order_id]
-                    if (raw.condition_id != self.condition_id or maker.token_id != r.quote.token_id
-                            or maker.maker_address.lower() != self.wallet.lower() or maker.side != 'BUY'
-                            or maker.fee_rate_bps != 0):
-                        raise ValueError('fill provenance or fee unavailable')
-                    if raw.status == 'FAILED':
-                        continue
-                    if raw.status != 'CONFIRMED':
-                        raise ValueError('owned fill is not settled')
-                    if (not maker.matched_amount.is_finite() or not 0 < maker.matched_amount <= r.quote.quantity
-                            or not maker.price.is_finite() or not 0 < maker.price <= r.quote.price):
-                        raise ValueError('invalid owned fill quantity or price')
-                    if r.request_id in identities and identities[r.request_id] != maker.order_id:
-                        raise ValueError('conflicting signed order identities')
-                    identities[r.request_id] = maker.order_id
-                    fill = Fill(raw.id+':'+maker.order_id, maker.order_id, r.request_id, self.owner,
-                        self.condition_id, maker.token_id, maker.matched_amount, maker.price, D('0'), raw.matched_at)
-                    if ((fill.trade_id in facts and facts[fill.trade_id] != fill)
-                            or (fill.trade_id in known and known[fill.trade_id] != fill)):
-                        raise ValueError('fill identity changed')
-                    facts[fill.trade_id] = fill
+        for cid in self.markets:
+            for page in self.client.list_account_trades(market=cid, maker_address=self.wallet):
+                for raw in page.items:
+                    for maker in raw.maker_orders:
+                        if maker.order_id not in orders:
+                            continue
+                        r = orders[maker.order_id]
+                        if (raw.condition_id != cid or raw.condition_id != r.quote.condition_id or maker.token_id != r.quote.token_id
+                                or maker.maker_address.lower() != self.wallet.lower() or maker.side != 'BUY'
+                                or maker.fee_rate_bps != 0):
+                            raise ValueError('fill provenance or fee unavailable')
+                        if raw.status == 'FAILED':
+                            continue
+                        if raw.status != 'CONFIRMED':
+                            raise ValueError('owned fill is not settled')
+                        if (not maker.matched_amount.is_finite() or not 0 < maker.matched_amount <= r.quote.quantity
+                                or not maker.price.is_finite() or not 0 < maker.price <= r.quote.price):
+                            raise ValueError('invalid owned fill quantity or price')
+                        if r.request_id in identities and identities[r.request_id] != maker.order_id:
+                            raise ValueError('conflicting signed order identities')
+                        identities[r.request_id] = maker.order_id
+                        fill = Fill(raw.id+':'+maker.order_id, maker.order_id, r.request_id, self.owner,
+                            cid, maker.token_id, maker.matched_amount, maker.price, D('0'), raw.matched_at)
+                        if ((fill.trade_id in facts and facts[fill.trade_id] != fill)
+                                or (fill.trade_id in known and known[fill.trade_id] != fill)):
+                            raise ValueError('fill identity changed')
+                        facts[fill.trade_id] = fill
         for oid,r in orders.items():
             if sum((f.quantity for f in facts.values() if f.order_id == oid),D('0')) > r.quote.quantity:
                 raise ValueError('owned fills exceed intent')
@@ -354,7 +378,7 @@ class LiveSDK:
         events += [(r.observed_at,1,r.request.merge_id,r) for r in self._merge_results().values() if r.received_usdc]
         for _,_,_,fact in sorted(events):
             if isinstance(fact, Fill):
-                previous = positions.get(fact.token_id, Position(self.owner,self.condition_id,fact.token_id,D('0'),D('0'),fact.executed_at))
+                previous = positions.get(fact.token_id, Position(self.owner,fact.condition_id,fact.token_id,D('0'),D('0'),fact.executed_at))
                 positions[fact.token_id] = replace(previous, quantity=previous.quantity+fact.quantity,
                     cost_usdc=previous.cost_usdc+fact.quantity*fact.price+fact.fee_usdc, updated_at=max(previous.updated_at,fact.executed_at))
             else:
@@ -368,7 +392,7 @@ class LiveSDK:
         self.read_trades()
         self._refresh_merges()
         positions = self._positions()
-        for token in self.token_ids:
+        for token in (t for pair in self.markets.values() for t in pair):
             raw = self.client.get_balance_allowance(asset_type='CONDITIONAL', token_id=token)
             actual = D(raw.balance)/1000000
             expected = positions[token].quantity if token in positions else D('0')
@@ -396,17 +420,17 @@ class LiveSDK:
             if existing.request != request:
                 raise ValueError('merge identity reused')
             return existing
-        if (request.owner != self.owner or request.condition_id != self.condition_id
-                or (request.yes_token_id,request.no_token_id) != self.token_ids
+        if (request.owner != self.owner or request.condition_id not in self.markets
+                or (request.yes_token_id,request.no_token_id) != self.markets[request.condition_id]
                 or not request.quantity.is_finite() or request.quantity <= 0
                 or request.quantity*1000000 != int(request.quantity*1000000)):
             raise ValueError('invalid fixed-market merge')
         positions = {p.token_id:p for p in self.read_positions()}
-        if any(token not in positions or positions[token].quantity < request.quantity for token in self.token_ids):
+        if any(token not in positions or positions[token].quantity < request.quantity for token in self.markets[request.condition_id]):
             raise ValueError('merge lacks paired owned inventory')
         self.journal.append('merge_intent',dict(request=request,cash=self._cash(),positions=tuple(positions.values())))
         try:
-            handle = self.client.merge_positions(condition_id=self.condition_id,amount=int(request.quantity*1000000),metadata=request.merge_id)
+            handle = self.client.merge_positions(condition_id=request.condition_id,amount=int(request.quantity*1000000),metadata=request.merge_id)
             from polymarket.transactions import SyncGaslessTransactionHandle
             if not isinstance(handle,SyncGaslessTransactionHandle):
                 raise ValueError('only Proxy gasless merge is supported')
@@ -448,22 +472,24 @@ class LiveSDK:
                 before = {p.token_id:p for p in baseline['positions']}
                 consumed = tuple(replace(before[t],quantity=r.quantity,
                     cost_usdc=before[t].cost_usdc if r.quantity == before[t].quantity else before[t].cost_usdc*r.quantity/before[t].quantity,
-                    updated_at=at) for t in self.token_ids)
+                    updated_at=at) for t in self.markets[r.condition_id])
                 self.journal.append('merge_receipt',dict(merge_id=r.merge_id,receipt=receipt,at=at))
                 self.journal.append('merge_result',MergeResult(r,Outcome.SUCCESS,r.quantity,at,consumed))
             except Exception:
                 # Read failures leave the original attempt and full reservation intact.
                 continue
 
-    def read_income(self, now):
+    def read_income(self, now, condition_id=None):
+        condition_id = condition_id or self.condition_id
+        if condition_id not in self.markets:
+            raise ValueError('income market not selected')
         from polymarket.environments import PRODUCTION
         day = now.astimezone(UTC).date()
-        history = self.journal.events('income')
-        if history:
-            previous = history[-1][1]
+        previous = self.journal.latest_market_event('income',condition_id,self.legacy_condition_id)
+        if previous is not None:
             if previous['at'].astimezone(UTC).date() == day and 0 <= (now-previous['at']).total_seconds() < 60:
                 return previous
-        result = dict(at=now,reward_today='UNKNOWN',rebate_today='UNKNOWN',reward_share='UNKNOWN',scoring='UNKNOWN')
+        result = dict(at=now,condition_id=condition_id,reward_today='UNKNOWN',rebate_today='UNKNOWN',reward_share='UNKNOWN',scoring='UNKNOWN')
         assets = {PRODUCTION.collateral_token.lower(),'0x2791bca1f2de4661ed88a30c99a7a9449aa84174'}
         def amount(value):
             if isinstance(value,bool):
@@ -475,7 +501,7 @@ class LiveSDK:
         try:
             scoring = {}
             for r in self._history().values():
-                if r.order is not None and r.order.authoritative and r.order.status == OrderStatus.LIVE:
+                if r.request.quote.condition_id == condition_id and r.order is not None and r.order.authoritative and r.order.status == OrderStatus.LIVE:
                     flag = self.client.get_order_scoring(order_id=r.order.order_id)
                     if type(flag) is not bool:
                         raise ValueError('invalid scoring fact')
@@ -487,7 +513,7 @@ class LiveSDK:
             total = D('0')
             for page in self.client.list_user_earnings_for_day(date=day.isoformat()):
                 for row in page.items:
-                    if row.condition_id != self.condition_id:
+                    if row.condition_id != condition_id:
                         continue
                     if (row.date.astimezone(UTC).date() != day or row.maker_address.lower() != self.wallet.lower()
                             or row.asset_address.lower() not in assets):
@@ -497,7 +523,7 @@ class LiveSDK:
         except Exception:
             pass
         try:
-            share = amount(self.client.get_reward_percentages()[self.condition_id])
+            share = amount(self.client.get_reward_percentages()[condition_id])
             if share > 100:
                 raise ValueError('invalid reward share')
             result['reward_share'] = share
@@ -511,7 +537,7 @@ class LiveSDK:
                 raise ValueError('incomplete rebate readback')
             total = D('0')
             for row in rows:
-                if row['condition_id'] != self.condition_id:
+                if row['condition_id'] != condition_id:
                     continue
                 if (row['date'] != day.isoformat() or row['maker_address'].lower() != self.wallet.lower()
                         or row['asset_address'].lower() not in assets):

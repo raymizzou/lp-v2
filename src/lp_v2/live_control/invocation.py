@@ -4,7 +4,7 @@ import hashlib
 import re
 import shlex
 
-LAUNCHER_SHA256='3b34120b492c53122b4de0b241355b73e998fda2bebdac3257177c3c0d6a61f9'
+LAUNCHER_SHA256='070daa85818ecfe7dfce9996f198fae95b4b844cd79b8a823bb9fbc5b6bbc5c7'
 REFS={'signing_key':'/etc/lp-v2/signing-key','l2_credentials':'/etc/lp-v2/credentials.json',
       'relayer_credentials':'/etc/lp-v2/relayer.json','state_dir':'/opt/lp-v2/state'}
 

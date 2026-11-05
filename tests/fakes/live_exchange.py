@@ -11,8 +11,9 @@ from tests.test_live_sdk import AT, CID, WALLET, SIGNER, boundary
 
 
 class Exchange:
-    def __init__(self, *, condition_id=CID):
+    def __init__(self, *, condition_id=CID, markets=None):
         self.condition_id=condition_id
+        self.markets=markets or {condition_id:('101','102')}
         self.sdk = create_autospec(SecureClient, instance=True, spec_set=True)
         self.orders, self.trades, self.posts = {}, [], []
         self.cash, self.quantities = D('100'), {}
@@ -22,8 +23,8 @@ class Exchange:
         self.sdk.create_limit_order.side_effect = self.sign
         self.sdk.post_order.side_effect = self.post
         self.sdk.get_order.side_effect = self.get_order
-        self.sdk.list_open_orders.side_effect = lambda **kw: (SimpleNamespace(items=tuple(o for o in self.orders.values() if o.status == 'LIVE')),)
-        self.sdk.list_account_trades.side_effect = lambda **kw: (SimpleNamespace(items=tuple(self.trades)),)
+        self.sdk.list_open_orders.side_effect = lambda **kw: (SimpleNamespace(items=tuple(o for o in self.orders.values() if o.status == 'LIVE' and (not kw.get('market') or o.condition_id == kw['market']))),)
+        self.sdk.list_account_trades.side_effect = lambda **kw: (SimpleNamespace(items=tuple(t for t in self.trades if markets is None or not kw.get('market') or t.condition_id == kw['market'])),)
         self.sdk.get_balance_allowance.side_effect = self.balance
         self.sdk.cancel_order.side_effect = self.cancel
         self.sdk.get_closed_only_mode.return_value = False
@@ -45,7 +46,7 @@ class Exchange:
         if signed.token_id in self.reject_tokens:
             return RejectedOrder(code='post_only_would_cross',message='rejected')
         oid = f'order-{len(self.posts)}'
-        self.orders[oid] = OpenOrder(id=oid, market=self.condition_id, asset_id=signed.token_id, owner='api-owner', maker_address=WALLET,
+        self.orders[oid] = OpenOrder(id=oid, market=next(cid for cid,pair in self.markets.items() if signed.token_id in pair), asset_id=signed.token_id, owner='api-owner', maker_address=WALLET,
             side='BUY', price=str(D(signed.maker_amount)/signed.taker_amount), original_size=str(D(signed.taker_amount)/1000000),
             size_matched='0', outcome='Yes',order_type='GTD',status='LIVE',created_at=self.now,expiration=signed.expiration)
         return AcceptedOrder(order_id=oid,status='live',making_amount=D('0'),taking_amount=D('0'),trade_ids=(),transactions_hashes=())
@@ -72,7 +73,7 @@ class Exchange:
         self.orders[oid] = o.model_copy(update={'size_matched':matched,'status':'MATCHED' if matched == o.original_size else o.status})
         self.quantities[o.token_id] = self.quantities.get(o.token_id,D('0'))+quantity
         self.cash -= quantity*price
-        self.trades.append(ClobTrade(id=f'trade-{len(self.trades)}',market=self.condition_id,asset_id=o.token_id,owner='api-owner',
+        self.trades.append(ClobTrade(id=f'trade-{len(self.trades)}',market=o.condition_id,asset_id=o.token_id,owner='api-owner',
             maker_address=WALLET,taker_order_id='foreign-taker',side='BUY',trader_side='MAKER',price=str(price),size=str(quantity),
             outcome='Yes',status='CONFIRMED',fee_rate_bps='0',bucket_index=0,transaction_hash='0x'+'b'*64,
             maker_orders=[dict(order_id=oid,asset_id=o.token_id,maker_address=WALLET,owner='api-owner',side='BUY',

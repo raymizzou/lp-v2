@@ -105,7 +105,7 @@ def rotation_world(tmp_path, *, now=None, identity=None, code_sha="UNKNOWN"):
     from lp_v2.cli import RunConfig
     from tests.fakes.live_exchange import Exchange
     clock=[now or AT]
-    ex=Exchange()
+    ex=Exchange(markets={CID:TOKENS,BID:('201','202'),CID_C:('301','302')})
     ex.token_markets={'101':CID,'102':CID,'201':BID,'202':BID,'301':CID_C,'302':CID_C}
     post=ex.post
     def multi_post(signed):
@@ -383,7 +383,7 @@ def test_first_signature_window_guard(tmp_path,offset):
             count[0]+=1
             if count[0]==2:
                 clock[0]=rotation.window_end+timedelta(seconds=offset)
-        return original_read(now,cid)
+        return original_read(clock[0],cid)
     obs.read_fixed_market=read
     rotation.step(clock[0])
     new=ex.posts[2:]
@@ -474,6 +474,26 @@ def test_expired_window_invalid_current_exits_to_idle(tmp_path):
     assert report['rotation']['reason']=='needs_new_on'
     assert len(ex.posts)==2 and ex.sdk.create_limit_order.call_count==2
     assert {c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list}=={'order-1','order-2'}
+
+
+def test_explicit_ineligible_read_exits_rotation(tmp_path):
+    from lp_v2.readonly_sdk import FixedMarketIneligible
+    rotation,ex,obs,clock=rotation_world(tmp_path)
+    rotation.step(AT)
+    clock[0]=rotation.window_end+timedelta(seconds=1)
+    def excluded(now,cid):
+        raise FixedMarketIneligible('confirmed closed market')
+    obs.read_fixed_market=excluded
+    try:
+        report=rotation.step(clock[0])
+        assert report['rotation']['phase']=='cleared'
+        assert report['rotation']['reason']=='needs_new_on'
+        assert report['rotation']['current'] is None
+        assert len(ex.posts)==2
+        assert {c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list}=={'order-1','order-2'}
+        assert all(o.status=='CANCELED' for o in ex.orders.values())
+    finally:
+        rotation.close()
 
 
 def restart_rotation(rotation,ex,obs,clock):
@@ -651,7 +671,7 @@ def factory_boundary(tmp_path,monkeypatch):
     args+=['--relayer-credentials-file',str(relay),'--code-sha','a'*40]
     config=replace(parse_run(args),started_at=AT)
     state=Path(config.state_dir);state.mkdir(mode=0o700)
-    ex=Exchange();current=[AT]
+    ex=Exchange(markets={CID:TOKENS,BID:('201','202')});current=[AT]
     token_cids={'101':CID,'102':CID,'201':BID,'202':BID}
     ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=credentials['wallet_address'];ex.sdk.signer=credentials['signer_address']
     object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
@@ -800,6 +820,24 @@ def test_production_factory_control_window_and_market_paths(tmp_path,monkeypatch
             assert tuple(s.token_id for s in ex.posts[-2:])==TOKENS
             next_on.close()
     assert all(r.method=='GET' for r in seen)
+
+
+@pytest.mark.parametrize('history',['rotation','markets_only'])
+def test_multimarket_factory_refuses_rotation_history(tmp_path,monkeypatch,history):
+    from pathlib import Path
+    from lp_v2.live_runtime import create_live_runner
+    config,ex,current,record,seen=factory_boundary(tmp_path,monkeypatch)
+    runner=create_live_runner(config,clock=lambda:current[0])
+    runner.close()
+    state=Path(config.state_dir)
+    if history=='markets_only':
+        (state/'rotation.sqlite').unlink()
+    before={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError,match='rotation history'):
+        runner=create_live_runner(replace(config,markets=(CID,BID)),clock=lambda:current[0])
+        runner.sdk.close();runner.observations.close()
+    assert {p:p.read_bytes() for p in state.rglob('*') if p.is_file()}==before
+    assert not ex.posts and ex.sdk.cancel_order.call_count==0
 
 
 def test_estimate_never_changes_ranking_rotation_or_orders(tmp_path):

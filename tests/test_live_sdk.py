@@ -42,6 +42,43 @@ def adapter(tmp_path, sdk=None):
                    wallet=WALLET, signer=SIGNER, clock=lambda: AT), j
 
 
+def test_read_cycle_history_tracks_appended_facts(tmp_path):
+    from lp_v2.live_sdk import LiveSDK
+    from lp_v2.models import OrderResult
+    from tests.fakes.live_exchange import Exchange
+    ex=Exchange()
+    live,journal=adapter(tmp_path,ex.sdk)
+    other=replace(request(),request_id='second',quote=Quote(CID,'102',D('.50'),D('10')))
+    pending=replace(request(),request_id='pending')
+    with live.read_cycle(now=AT):
+        first=live.place_order(request(),at=AT)
+        assert live.known_order_ids()==(first.order.order_id,)
+        assert live.place_order(request(),at=AT)==first and len(ex.posts)==1
+        live.read_orders()
+        live.cancel_order(first.order.order_id,at=AT)
+        terminal=live.read_orders()[0]
+        assert terminal.authoritative and terminal.status=='cancelled'
+        assert live.known_open_order_ids()==()
+        second=live.place_order(other,at=AT)
+        assert set(live.known_order_ids())=={first.order.order_id,second.order.order_id}
+        journal.append('intent',dict(request=pending,hedge_ceiling=D('.58')))
+        facts=live.read_orders()
+        assert len(facts)==3 and facts[-1].request==pending and facts[-1].outcome==Outcome.UNKNOWN
+        assert not live.orders_verified()
+        journal.append('order_result',OrderResult(pending,Outcome.FAILED,None,AT))
+        with live.read_cycle(now=AT):
+            assert live.read_orders()[-1].outcome==Outcome.FAILED and live.orders_verified()
+    ex.now=AT+timedelta(seconds=10)
+    restarted=LiveSDK(ex.sdk,journal,owner=OWNER,condition_id=CID,token_ids=TOKENS,wallet=WALLET,signer=SIGNER,clock=lambda:ex.now)
+    with restarted.read_cycle(now=ex.now):
+        facts=restarted.read_orders()
+        assert len(facts)==3 and facts[0]==terminal
+        assert facts[1].observed_at==ex.now and facts[1].authoritative
+        assert facts[2].outcome==Outcome.FAILED
+    assert len(ex.posts)==2
+    journal.close()
+
+
 def test_intent_is_durable_before_submission(tmp_path):
     sdk = boundary()
     live, journal = adapter(tmp_path, sdk)
