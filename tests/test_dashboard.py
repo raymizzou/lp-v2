@@ -96,7 +96,11 @@ context.payload={...base,rotation:{current:'market-A',candidate:'<market-B>',pha
 vm.runInContext("render('normal',payload)",context);
 for(const expected of ['已扫范围内第一','market-A','&lt;market-B&gt;','waiting_inventory','115','11411','130','100','15','切换 3','撤单 6'])assert.ok(target.innerHTML.includes(expected),expected);
 assert.ok(!target.innerHTML.includes('政治类完整扫描第一'));
-context.payload.rotation.scan.reached_end=true;context.payload.rotation.scan.errors=[];
+context.payload.rotation.scan.reached_end=true;
+vm.runInContext("render('normal',payload)",context);
+assert.ok(target.innerHTML.includes('已扫范围内第一'));
+assert.ok(!target.innerHTML.includes('政治类完整扫描第一'));
+context.payload.rotation.scan.errors=[];
 vm.runInContext("render('normal',payload)",context);
 assert.ok(target.innerHTML.includes('政治类完整扫描第一'));
 '''

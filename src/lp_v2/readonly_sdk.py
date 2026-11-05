@@ -133,11 +133,12 @@ class ReadOnlySDK:
             scan['pages'] += 1
             scan['rows'] += len(page['markets'])
             cursor = page.get('next_cursor')
-            if 'next_cursor' in page and cursor is None:
+            if cursor is None:
                 scan['reached_end'] = True
                 break
             if not isinstance(cursor, str) or not cursor or cursor in seen:
-                scan['errors'].append(dict(page=scan['pages'], reason='cursor_invalid'))
+                kind = 'not_string' if not isinstance(cursor, str) else 'empty' if not cursor else 'repeat'
+                scan['errors'].append(dict(page=scan['pages'], reason='cursor_invalid', kind=kind))
                 break
             seen.add(cursor)
         try:
