@@ -157,6 +157,83 @@ def test_fixed_market_failure_is_isolated(tmp_path):
     sdk.http.close();journal.close()
 
 
+@pytest.mark.parametrize('stale_tokens', [TOKENS, TOKENS[:1], TOKENS[1:]],
+                         ids=['both-books', 'yes-book', 'no-book'])
+def test_multimarket_book_age_at_completed_is_isolated(tmp_path, stale_tokens):
+    import httpx
+    from polymarket import PublicClient
+    from polymarket.clients._transport import SyncTransport
+    from lp_v2.journal import Journal
+    from lp_v2.live_runtime import LiveRunner
+    from lp_v2.live_sdk import LiveSDK
+    from lp_v2.readonly_sdk import ReadOnlySDK
+    from tests.fakes.live_exchange import Exchange
+    from tests.test_readonly_sdk import market_wire
+
+    markets = dict(zip(CIDS[:2], PAIRS[:2]))
+    ex = Exchange(markets=markets)
+    start, delay = AT, 3
+    seen = []
+
+    def http(req):
+        seen.append(req.method)
+        assert req.method == 'GET'
+        if req.url.path == '/markets/keyset':
+            cid = req.url.params['condition_ids']
+            return httpx.Response(200, json={'markets': [market_wire(cid, clobTokenIds=list(markets[cid]))], 'next_cursor': None})
+        if req.url.path == '/book':
+            token = req.url.params['token_id']
+            cid = next(cid for cid, pair in markets.items() if token in pair)
+            ex.now = start + timedelta(seconds=0 if cid == CID else delay)
+            stamp = start - timedelta(seconds=58) if token in stale_tokens else ex.now
+            bid, ask = ('0.46', '0.48') if token == markets[cid][0] else ('0.51', '0.53')
+            return httpx.Response(200, json=dict(market=cid, asset_id=token, timestamp=str(int(stamp.timestamp()*1000)),
+                bids=[dict(price=bid, size='100')], asks=[dict(price=ask, size='100')],
+                min_order_size='1', tick_size='0.01', neg_risk=False, hash='fixture'))
+        if req.url.path.startswith('/markets/'):
+            return httpx.Response(200, json={'in_play': False})
+        if req.url.path == '/api/geoblock':
+            return httpx.Response(200, json=dict(blocked=False, country='US'))
+        raise AssertionError(str(req.url))
+
+    public = PublicClient()
+    for name in ('gamma', 'clob'):
+        getattr(public._ctx, name).close()
+        url = 'https://' + name + '.polymarket.com'
+        public._ctx = replace(public._ctx, **{name: SyncTransport(base_url=url,
+            client=httpx.Client(base_url=url, transport=httpx.MockTransport(http)))})
+    observations = ReadOnlySDK(public=public, http=httpx.Client(transport=httpx.MockTransport(http)), clock=lambda: ex.now)
+    journal = Journal(tmp_path/'journal.sqlite')
+    sdk = LiveSDK(ex.sdk, journal, owner=OWNER, condition_id=CID, token_ids=TOKENS,
+        markets=markets, wallet=WALLET, signer=SIGNER, clock=lambda: ex.now)
+    runner = LiveRunner(RunConfig(D('100'), AT, market=CID, markets=CIDS[:2]), sdk, observations, clock=lambda: ex.now)
+    try:
+        # A first becomes eligible on the existing ten-minute ranking refresh.
+        for tick, delay, active_a, total_signed in ((0, 3, 0, 2), (610, 2, 2, 4), (620, 3, 0, 4), (630, 2, 2, 6)):
+            start = ex.now = AT + timedelta(seconds=tick)
+            report = runner.step(start)
+            requests = runner.ledger.snapshot().requests
+            assert sum(r.quote.condition_id == CID for r in requests) == total_signed - 2
+            assert sum(r.quote.condition_id == CIDS[1] for r in requests) == 2
+            assert len(journal.events('signed')) == len(ex.posts) == total_signed
+            assert [sum(o.condition_id == cid and o.status == 'LIVE' for o in ex.orders.values())
+                    for cid in markets] == [active_a, 2]
+            rows = {r['condition_id']: r for r in report['markets']}
+            assert rows[CID]['eligible'] is (delay == 2) and rows[CIDS[1]]['eligible'] is True
+            assert report['freshness']['decision_as_of'] == ex.now.isoformat()
+            if delay == 3:
+                assert rows[CID]['skip_reason']
+                assert any(p.get('condition_id') == CID and p['at'] == ex.now for _, p in journal.events('diagnostic'))
+            canceled = {p['order_id'] for _, p in journal.events('cancel_intent')}
+            expected = {oid for oid, o in ex.orders.items() if o.condition_id == CID and o.status == 'CANCELED'}
+            assert canceled == expected and len(canceled) == (2 if tick >= 620 else 0)
+        assert seen and set(seen) == {'GET'}
+        assert not journal.events('merge_intent')
+    finally:
+        sdk.close()
+        observations.close()
+
+
 def test_multimarket_execution_safety(tmp_path):
     from lp_v2.models import Quote, MergeRequest, ReservationTerms
     from tests.test_live_sdk import request

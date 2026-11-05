@@ -75,8 +75,9 @@ class LiveRunner:
                 if not reconciled:
                     raise ValueError('owned order readback remains uncertain')
                 self._accounting_at = now
+                unavailable = set()
                 if hasattr(self.observations,'read_fixed_market'):
-                    rows, unavailable = [], set()
+                    rows = []
                     for cid in self._markets:
                         try:
                             current = self.observations.read_fixed_market(now,cid)
@@ -87,9 +88,6 @@ class LiveRunner:
                             self.sdk.journal.append('diagnostic',dict(at=now,condition_id=cid,reason='market readback unavailable'))
                         rows.extend(current)
                     self._rows = [r for r in rows if r['condition_id'] in self._markets]
-                    for order in self.ledger.snapshot().orders:
-                        if order.request.quote.condition_id in unavailable and (not order.authoritative or order.status.value=='live'):
-                            self.ledger.apply_order(self.sdk.cancel_order(order.order_id,at=now))
                 else:
                     self._rows = [r for r in self.observations.read_markets(now) if r['condition_id'] in self._markets]
                 accounting_at = now
@@ -102,7 +100,15 @@ class LiveRunner:
                         if (not isinstance(observed,datetime) or observed.tzinfo is None
                                 or observed.utcoffset() is None or not now <= observed <= completed):
                             raise ValueError('market observation completion unavailable or discontinuous')
+                        if any(not 0 <= (completed-b.observed_at).total_seconds() <= 60 for b in row['plan'].books):
+                            unavailable.add(row['condition_id'])
+                            row.update(plan=None,eligible=False,skip_reason='订单簿时效未验证，暂停下单')
+                            self.sdk.journal.append('diagnostic',dict(at=completed,condition_id=row['condition_id'],
+                                reason='market book freshness unavailable at decision'))
                 now = completed
+                for order in self.ledger.snapshot().orders:
+                    if order.request.quote.condition_id in unavailable and (not order.authoritative or order.status.value=='live'):
+                        self.ledger.apply_order(self.sdk.cancel_order(order.order_id,at=now))
                 plans = tuple(r['plan'] for r in self._rows if r.get('plan') is not None)
                 self._last_plans = plans
                 if any(tuple(t.token_id for t in p.market.tokens) != self._markets.get(p.market.condition_id) for p in plans):
