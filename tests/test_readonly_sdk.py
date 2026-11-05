@@ -208,7 +208,8 @@ def test_fixed_market_recovery_keeps_opening_ineligible_plan(tmp_path,dropped):
 
 
 @pytest.mark.parametrize('case', ['accepting_orders_false', 'in_play_true', 'rewards_disabled',
-                                 'book_timeout', 'in_play_unknown'])
+                                 'book_timeout', 'in_play_unknown', 'active_false',
+                                 'closed_true', 'order_book_disabled'])
 def test_fixed_market_rotation_distinguishes_confirmed_invalid_and_unknown(tmp_path, case):
     from datetime import timedelta
     from lp_v2.cli import RunConfig
@@ -256,6 +257,12 @@ def test_fixed_market_rotation_distinguishes_confirmed_invalid_and_unknown(tmp_p
             wire['acceptingOrders'] = False
         elif case == 'rewards_disabled':
             wire['clobRewards'] = []
+        elif case == 'active_false':
+            wire['active'] = False
+        elif case == 'closed_true':
+            wire['closed'] = True
+        elif case == 'order_book_disabled':
+            wire['enableOrderBook'] = False
         clock[0] = AT + timedelta(seconds=10)
         if case != 'rewards_disabled':
             with pytest.raises(ValueError) as error:
@@ -264,7 +271,8 @@ def test_fixed_market_rotation_distinguishes_confirmed_invalid_and_unknown(tmp_p
             assert 'SECRET_SENTINEL' not in str(error.value)
         signatures = ex.sdk.create_limit_order.call_count
         report = rotation.step(clock[0])
-        confirmed = case in ('accepting_orders_false', 'in_play_true', 'rewards_disabled')
+        confirmed = case in ('accepting_orders_false', 'in_play_true', 'rewards_disabled',
+                             'active_false', 'closed_true', 'order_book_disabled')
         assert report['rotation']['switch_count'] == (1 if confirmed else 0)
         assert report['rotation']['phase'] == ('exiting' if confirmed else 'running')
         invalid_exits = [event for _, event in rotation.journal.events('rotation')
