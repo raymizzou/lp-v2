@@ -71,7 +71,7 @@ class ReadOnlyRunner:
             return self.snapshot()
         try:
             self.__run['region_check'] = self.sdk.read_region()
-            if self.__run['region_check'] != 'ok':
+            if self.__run['region_check'] not in ('ok', 'blocked'):
                 for entry in self.__proposals.values():
                     entry['quotes'] = None
                 for row in self.__rows:
@@ -136,7 +136,7 @@ class ReadOnlyRunner:
         # forward as reality. This ledger is never exposed as actual occupation.
         ledger = Ledger('lp-v2:simulation', self.config.capital_usdc,
                         balance=Balance(self.config.capital_usdc, now))
-        plans = [r['plan'] for r in rows if r.get('plan') is not None and r.get('eligible') is True and r['score'] != UNKNOWN and self.__run['region_check'] == 'ok']
+        plans = [r['plan'] for r in rows if r.get('plan') is not None and r.get('eligible') is True and r['score'] != UNKNOWN and self.__run['region_check'] in ('ok', 'blocked')]
         self.__engine.ledger = ledger
         decision = self.__engine.decide(plans, now=now)
         occupied = risk = Decimal('0')
@@ -154,10 +154,11 @@ class ReadOnlyRunner:
                     previous['quotes'] = None
                 continue
             fresh = tuple(r.quote for r in decision.place if r.quote.condition_id == cid)
-            waiting = previous is not None and (now-previous['at']).total_seconds() < 60
+            waiting = (previous is not None and previous['quotes'] is not None
+                       and (now-previous['at']).total_seconds() < 60)
             pair = previous['quotes'] if waiting else fresh
             allowed = (row.get('eligible') is True and row['score'] != UNKNOWN
-                       and self.__run['region_check'] == 'ok' and self.__safe_pair(pair, p))
+                       and self.__run['region_check'] in ('ok', 'blocked') and self.__safe_pair(pair, p))
             if allowed:
                 quantity = pair[0].quantity
                 pair_risk = max((q.price + fee) * quantity for q, fee in zip(pair, p.fee_per_share))
