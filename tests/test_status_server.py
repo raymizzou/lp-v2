@@ -245,7 +245,7 @@ def test_health_identity_available_during_catalog_read():
     from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
     from lp_v2.status_server import make_handler
     from tests.test_readonly_runtime import ScriptedReads
-    entered,release=Event(),Event()
+    entered,release,published=Event(),Event(),Event()
     errors=[]
     class BlockingReads(ScriptedReads):
         def read_markets(self,now):
@@ -259,11 +259,14 @@ def test_health_identity_available_during_catalog_read():
         try:
             runner.scanner.start(AT)
             runner.step(AT)
+            published.set()
         except BaseException as error: errors.append(error)
     thread=Thread(target=stepping);thread.start()
     watchdog=Timer(2,release.set);watchdog.start()
     try:
         assert entered.wait(1),'read_markets not reached'
+        # Scanner entry can precede the independent wallet/region publication.
+        assert published.wait(1),'identity snapshot not published during blocked catalog'
         start=monotonic();health=request(handler,path='/healthz')[2]
         assert monotonic()-start<0.5,'health waited for blocked catalog'
         assert health==dict(version='0.1.0',status='ok',code_sha='abc1234',capital_usdc='100',wallet_tail='a3F9',region_check='ok')

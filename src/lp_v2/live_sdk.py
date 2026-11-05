@@ -5,11 +5,17 @@ from contextlib import contextmanager
 from decimal import Decimal as D
 from polymarket.models.clob.order_response import AcceptedOrder, RejectedOrder
 from polymarket.errors import RequestRejectedError
+from polymarket.clients._transport import _read_json
+from polymarket._internal.actions.account import build_get_order_request, parse_open_order
 
 from lp_v2.models import Balance, Fill, Position, MergeResult, Order, OrderResult, OrderStatus, Outcome
 
 
 _UNAVAILABLE = object()
+
+
+class _ReadbackError(ValueError):
+    """Fixed application reason code; never carries exchange exception text."""
 
 
 class LiveSDK:
@@ -32,6 +38,7 @@ class LiveSDK:
         self._history_cache = None
         self.clock = clock
         self._cycle_at = None
+        self.readback_blocker = None
 
     @contextmanager
     def read_cycle(self, *, now=None):
@@ -55,7 +62,10 @@ class LiveSDK:
         cache = self._order_reads if self._order_reads is not None else {}
         if order_id not in cache:
             try:
-                cache[order_id] = self.client.get_order(order_id=order_id)
+                path, params = build_get_order_request(order_id=order_id)
+                response = self.client._ctx.secure_clob._request('GET', path, params=params)
+                raw = _read_json(response)
+                cache[order_id] = None if response.status_code == 200 and raw is None else parse_open_order(raw)
             except RequestRejectedError as error:
                 cache[order_id] = None if error.status == 404 else _UNAVAILABLE
             except Exception:
@@ -183,10 +193,16 @@ class LiveSDK:
 
     def _missing_order(self, previous, candidates, cancels):
         # Iterator exhaustion is required: a later-page failure cannot prove absence.
-        opens = tuple(o for page in self.client.list_open_orders(market=previous.request.quote.condition_id) for o in page.items)
-        if any(not isinstance(o.id,str) or not o.id for o in opens):
-            raise ValueError('incomplete open order readback')
-        trades = self._trade_facts()
+        try:
+            opens = tuple(o for page in self.client.list_open_orders(market=previous.request.quote.condition_id) for o in page.items)
+            if any(not isinstance(o.id,str) or not o.id for o in opens):
+                raise ValueError('incomplete open order readback')
+        except Exception:
+            raise _ReadbackError('open_orders_unavailable') from None
+        try:
+            trades = self._trade_facts()
+        except Exception:
+            raise _ReadbackError('trade_history_unavailable') from None
         recorded = tuple(f for _,f in self.journal.events('fill') if f.request_id == previous.request.request_id)
         owned = {f.order_id for f in (*trades.values(),*recorded)
                  if f.request_id == previous.request.request_id}
@@ -202,7 +218,7 @@ class LiveSDK:
             proven = max(previous.order.filled_quantity if previous.order else D('0'),
                          sum((f.quantity for _,f in self.journal.events('fill') if f.order_id == oid),D('0')))
             if filled < proven or any(f.trade_id not in trades for f in recorded):
-                raise ValueError('complete trade history has not caught up')
+                raise _ReadbackError('trade_history_mismatch')
             quantity = previous.request.quote.quantity
             cancel_at = cancels.get(oid) or (previous.order.cancel_requested_at if previous.order else None)
             terminal = (cancel_at is not None or self._now() >= previous.request.expires_at+timedelta(seconds=120)
@@ -216,6 +232,7 @@ class LiveSDK:
         return previous
 
     def read_orders(self):
+        self.readback_blocker = None
         results = self._history()
         signed = {p['request_id']:p for _,p in self.journal.events('signed')}
         cancels = {p['order_id']:p['at'] for _,p in self.journal.events('cancel_intent')}
@@ -250,7 +267,10 @@ class LiveSDK:
                 raw = self._order_readback(oid)
                 if raw is None:
                     missing.append(oid)
-                elif raw is not _UNAVAILABLE:
+                elif raw is _UNAVAILABLE:
+                    if self.readback_blocker is None:
+                        self.readback_blocker = dict(code='order_readback_unavailable', order_tail=oid[-8:])
+                else:
                     found.append(self._observed_order(raw,oid,previous,cancels))
             if len(found) > 1:
                 raise ValueError('conflicting signed order identities')
@@ -258,7 +278,10 @@ class LiveSDK:
             if not found and candidates and len(missing) == len(candidates):
                 try:
                     result = self._missing_order(previous,candidates,cancels)
-                except Exception:
+                except Exception as error:
+                    if self.readback_blocker is None:
+                        code = str(error) if isinstance(error, _ReadbackError) else 'order_readback_unavailable'
+                        self.readback_blocker = dict(code=code, order_tail=candidates[0][-8:])
                     result = previous
             if result is previous and previous.order is not None:
                 result = OrderResult(previous.request,Outcome.UNKNOWN,replace(previous.order,authoritative=False),previous.observed_at)
@@ -295,6 +318,16 @@ class LiveSDK:
         known = next((r for r in self._history().values() if r.order and r.order.order_id == order_id), None)
         if known is None or known.request.quote.condition_id not in self.markets or known.request.quote.token_id not in self.markets[known.request.quote.condition_id]:
             raise ValueError('cannot cancel foreign or unknown order')
+        cancelled = known.order.cancel_requested_at is not None or any(
+            p['order_id'] == order_id for _, p in self.journal.events('cancel_intent'))
+        if cancelled and at >= known.request.expires_at + timedelta(seconds=120):
+            try:
+                opens = tuple(o for page in self.client.list_open_orders(market=known.request.quote.condition_id)
+                              for o in page.items)
+                if all(isinstance(o.id, str) and o.id for o in opens) and all(o.id != order_id for o in opens):
+                    return known
+            except Exception:
+                pass
         self.journal.append('cancel_intent', dict(order_id=order_id, at=at))
         outcome = Outcome.UNKNOWN
         try:

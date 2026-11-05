@@ -25,6 +25,7 @@ def request():
 
 def boundary():
     sdk = create_autospec(SecureClient, instance=True, spec_set=True)
+    raw_order_context(sdk)
     sdk.create_limit_order.return_value = SignedOrder(builder='0x'+'0'*64, expiration=int((AT+timedelta(hours=1)).timestamp()),
         maker=WALLET, maker_amount=4000000, metadata='0x'+'0'*64, order_type='GTD', salt=123,
         side='BUY', signature='0x'+'0'*130, signature_type=2, signer=SIGNER, taker_amount=10000000,
@@ -901,3 +902,91 @@ def test_missing_history_terminal_requires_reason(tmp_path,reason,quantity):
     assert len(state.fills) == 1 and len(ex.posts) == 2
     assert not any(r.outcome == Outcome.FAILED for _,r in journal.events('order_result') if r.request == request())
     assert 'synthetic-secret-never-log' not in str(journal.events())
+
+
+def raw_order_context(sdk):
+    """Wire bridge for the existing external SDK fake and its read assertions."""
+    from types import SimpleNamespace
+    def get_json(path, *, params):
+        raw = sdk.get_order(order_id=path.removeprefix('/data/order/'))
+        if raw is None:
+            return None
+        wire = raw.model_dump(mode='json')
+        wire['asset_id'] = wire.pop('token_id')
+        wire['market'] = wire.pop('condition_id')
+        wire.pop('expires_at')
+        wire['expiration'] = int(raw.expires_at.timestamp()) if raw.expires_at is not None else 0
+        return wire
+    import httpx
+    import json
+    transport = SimpleNamespace(get_json=get_json)
+    transport._request = lambda method, path, **kw: httpx.Response(200, content=json.dumps(transport.get_json(path, **kw)).encode())
+    object.__setattr__(sdk, '_ctx', SimpleNamespace(secure_clob=transport))
+
+
+@pytest.mark.parametrize('proof', ['cancel', 'expired', 'neither'])
+def test_null_readback_closes_only_with_existing_missing_order_proof(tmp_path, proof):
+    from tests.fakes.live_exchange import Exchange
+    from lp_v2.models import OrderStatus
+    ex = Exchange()
+    live, journal = adapter(tmp_path, ex.sdk)
+    accepted = live.place_order(request(), at=AT)
+    oid = accepted.order.order_id
+    if proof == 'cancel':
+        live.cancel_order(oid, at=AT)
+    ex.orders.clear()
+    raw_order_context(ex.sdk)
+    ex.sdk._ctx.secure_clob.get_json = lambda *a, **kw: None
+    ex.sdk.get_order.side_effect = ValueError('typed parser rejects null')
+    now = request().expires_at + timedelta(seconds=120) if proof == 'expired' else AT
+    with live.read_cycle(now=now):
+        order = live.read_orders()[0]
+        assert order.authoritative is (proof != 'neither')
+        assert live.orders_verified() is (proof != 'neither')
+        assert order.status == (OrderStatus.CANCELLED if proof != 'neither' else OrderStatus.LIVE)
+    assert len(ex.posts) == 1
+    journal.close()
+
+
+def test_null_readback_open_order_is_still_cancelled(tmp_path):
+    from tests.fakes.live_exchange import Exchange
+    ex = Exchange()
+    live, journal = adapter(tmp_path, ex.sdk)
+    oid = live.place_order(request(), at=AT).order.order_id
+    ex.sdk._ctx.secure_clob.get_json = lambda *a, **kw: None
+    order = live.read_orders()[0]
+    assert order.status.value == 'live'
+    live.cancel_order(oid, at=AT)
+    assert ex.sdk.cancel_order.call_count == 1
+    assert ex.orders[oid].status == 'CANCELED'
+    journal.close()
+
+
+@pytest.mark.parametrize('status, body, closed', [
+    (200, b'null\n', True), (404, b'{}', True), (500, b'null', False),
+    (201, b'null', False), (202, b'null', False), (204, b'', False),
+    (200, b'{}', False), (200, b'false', False), (200, b'[]', False),
+])
+def test_order_readback_real_http_transport(tmp_path, status, body, closed):
+    import httpx
+    from polymarket.clients._transport import SyncTransport
+    from tests.fakes.live_exchange import Exchange
+    ex = Exchange()
+    live, journal = adapter(tmp_path, ex.sdk)
+    oid = live.place_order(request(), at=AT).order.order_id
+    live.cancel_order(oid, at=AT)
+    ex.orders.clear()
+    seen = []
+    def respond(req):
+        seen.append((req.method, req.url.path))
+        return httpx.Response(status, content=body)
+    with httpx.Client(base_url='https://clob.example', transport=httpx.MockTransport(respond)) as http:
+        ex.sdk._ctx.secure_clob = SyncTransport(base_url='https://clob.example', client=http)
+        ex.sdk.get_order.side_effect = lambda **kw: SecureClient.get_order(ex.sdk, **kw)
+        with live.read_cycle(now=AT):
+            fact = live.read_orders()[0]
+            assert fact.authoritative is closed
+            assert live.orders_verified() is closed
+    assert seen == [('GET', '/data/order/' + oid)]
+    assert len(ex.posts) == 1
+    journal.close()

@@ -36,6 +36,7 @@ class LiveRunner:
         self._m4_by_market = {}
         self._occupation_day = None
         self._occupation_start = 0
+        self.blocker = None
         self.exit_code = None
         self.stop_timeout_s = 90
         self._snapshot = self._build(None)
@@ -69,6 +70,7 @@ class LiveRunner:
         self._next = now
         with self.sdk.read_cycle(now=now):
             reconciled = False
+            self.blocker = None
             self._region = UNKNOWN
             plans = ()
             try:
@@ -175,6 +177,7 @@ class LiveRunner:
                 self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
             except Exception as error:
+                self.blocker = self.sdk.readback_blocker or dict(code='round_readback_unavailable', order_tail=None)
                 if opening_policy is not None:
                     from lp_v2.readonly_sdk import FixedMarketIneligible
                     opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)

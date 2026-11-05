@@ -318,7 +318,7 @@ def factory_inputs(tmp_path, monkeypatch):
     Path(config.state_dir).mkdir()
     ex=Exchange(markets=dict(zip(CIDS,PAIRS)))
     ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=config.credentials.wallet_address;ex.sdk.signer=config.credentials.signer_address
-    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None,secure_clob=ex.sdk._ctx.secure_clob))
     monkeypatch.setattr(SecureClient,'create',lambda **kw:ex.sdk)
     def sources(pairs=None):
         pairs=pairs or dict(zip(CIDS,PAIRS))

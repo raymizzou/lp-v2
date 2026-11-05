@@ -674,7 +674,7 @@ def factory_boundary(tmp_path,monkeypatch):
     ex=Exchange(markets={CID:TOKENS,BID:('201','202')});current=[AT]
     token_cids={'101':CID,'102':CID,'201':BID,'202':BID}
     ex.sdk.wallet_type='POLY_PROXY';ex.sdk.wallet=credentials['wallet_address'];ex.sdk.signer=credentials['signer_address']
-    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None))
+    object.__setattr__(ex.sdk,'_ctx',SimpleNamespace(rpc=None,relayer=None,secure_clob=ex.sdk._ctx.secure_clob))
     sign,post=ex.sign,ex.post
     ex.sdk.create_limit_order.side_effect=lambda **kw:replace(sign(**kw),maker=ex.sdk.wallet,signer=ex.sdk.signer)
     def owned_post(signed):
@@ -1228,3 +1228,198 @@ def test_real_terminal_page_allows_rotation(tmp_path):
     finally:
         rotation.close()
         sdk.close()
+
+
+def test_null_readback_rotation_enters_and_counts(tmp_path):
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    rotation.step(AT)
+    old = rotation.sdk
+    for oid in old.known_order_ids():
+        old.cancel_order(oid, at=AT + timedelta(seconds=1))
+        del ex.orders[oid]
+    original_get = ex.sdk._ctx.secure_clob.get_json
+    ex.sdk._ctx.secure_clob.get_json = lambda path, **kw: (
+        None if path.rsplit('/', 1)[-1] in ('order-1', 'order-2') else original_get(path, **kw))
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    report = rotation.step(clock[0])['rotation']
+    assert old.orders_verified()
+    assert report['phase'] == 'running' and report['current'] == BID
+    assert report['entered_count'] == 1 and report['switch_count'] == 1
+    assert [r['phase'] for _, r in rotation.journal.events('rotation')][-3:] == ['cleared', 'revalidating', 'running']
+    assert len(ex.posts) == 4
+
+
+def test_entered_count_restores_without_counting_initial_seed(tmp_path):
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    assert rotation.snapshot()['rotation']['entered_count'] == 0
+    rotation.step(AT)
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    report = rotation.step(clock[0])['rotation']
+    assert report['entered_count'] == 1
+    for runner in rotation._runners.values():
+        runner.sdk.journal.close()
+    rotation.journal.close()
+    restarted, _, _, _ = rotation_world(tmp_path)
+    report = restarted.snapshot()['rotation']
+    assert report['entered_count'] == 1 and report['switch_count'] == 1
+
+
+def exiting_world(tmp_path):
+    rotation, ex, obs, clock = rotation_world(tmp_path)
+    rotation.step(AT)
+    ex.cancel_unknown = True
+    clock[0] += timedelta(seconds=10)
+    rotation.scanner.scan_once(clock[0])
+    assert rotation.step(clock[0])['rotation']['phase'] == 'exiting'
+    return rotation, ex, obs, clock
+
+
+@pytest.mark.parametrize('failure', ['timeout', '500', 'dict', 'list', 'false', 'string'])
+def test_non_null_order_failure_remains_blocked(tmp_path, failure):
+    from polymarket.errors import RequestRejectedError
+    rotation, ex, obs, clock = exiting_world(tmp_path)
+    def raw(*a, **kw):
+        if failure == 'timeout':
+            raise TimeoutError('synthetic secret')
+        if failure == '500':
+            raise RequestRejectedError('synthetic secret', status=500)
+        return {'dict': {}, 'list': [], 'false': False, 'string': ''}[failure]
+    ex.sdk._ctx.secure_clob.get_json = raw
+    ex.orders.clear()
+    clock[0] += timedelta(seconds=10)
+    report = rotation.step(clock[0])['rotation']
+    assert report['phase'] == 'exiting' and report['current'] == CID
+    assert not rotation.sdk.orders_verified()
+    assert report['blocker']['code'] == 'order_readback_unavailable'
+    assert len(report['blocker']['order_tail']) <= 8
+    assert 'synthetic secret' not in str(report)
+    assert len(ex.posts) == 2
+
+
+@pytest.mark.parametrize('bad_page', ['failure', 'blank_id'])
+def test_null_readback_incomplete_open_list_blocks(tmp_path, bad_page):
+    from types import SimpleNamespace
+    rotation, ex, obs, clock = exiting_world(tmp_path)
+    ex.sdk._ctx.secure_clob.get_json = lambda *a, **kw: None
+    def pages(**kw):
+        yield SimpleNamespace(items=())
+        if bad_page == 'failure':
+            raise TimeoutError('synthetic secret')
+        yield SimpleNamespace(items=(SimpleNamespace(id=''),))
+    ex.sdk.list_open_orders.side_effect = pages
+    clock[0] += timedelta(seconds=10)
+    report = rotation.step(clock[0])['rotation']
+    assert report['current'] == CID and report['phase'] == 'exiting'
+    assert not rotation.sdk.orders_verified()
+    assert report['blocker']['code'] == 'open_orders_unavailable'
+    assert len(ex.posts) == 2
+
+
+def test_null_readback_missing_trade_proof_blocks(tmp_path):
+    rotation, ex, obs, clock = exiting_world(tmp_path)
+    ex.fill('order-1', '1', '.40', at=clock[0])
+    rotation.sdk.read_trades()
+    ex.trades.clear()
+    ex.sdk._ctx.secure_clob.get_json = lambda *a, **kw: None
+    ex.orders.clear()
+    clock[0] += timedelta(seconds=10)
+    report = rotation.step(clock[0])['rotation']
+    assert report['current'] == CID and report['phase'] == 'exiting'
+    assert not rotation.sdk.orders_verified()
+    assert report['blocker']['code'] == 'trade_history_mismatch'
+    assert len(ex.posts) == 2
+
+
+@pytest.mark.parametrize('failure, expected', [
+    ('invalid_inventory', 'inventory_readback_invalid'),
+    ('inventory_mismatch', 'inventory_mismatch'),
+    ('reconciliation', 'reconciliation_unavailable'),
+    ('blank_order', 'open_orders_invalid'),
+    ('open_page', 'open_orders_unavailable'),
+    ('round', 'round_readback_unavailable'),
+])
+def test_clearance_blocker_codes_are_distinct(tmp_path, failure, expected):
+    from types import SimpleNamespace
+    if failure == 'round':
+        rotation, ex, obs, clock = rotation_world(tmp_path)
+        rotation.step(AT)
+        def region():
+            raise TimeoutError('synthetic secret')
+        obs.read_region_policy = region
+    else:
+        rotation, ex, obs, clock = exiting_world(tmp_path)
+        ex.cancel_unknown = False
+        for oid in rotation.sdk.known_order_ids():
+            rotation.sdk.cancel_order(oid, at=clock[0])
+        clock[0] += timedelta(seconds=10)
+        rotation.current.step(clock[0], allow_open=False)
+        inventory = obs.read_conditional_inventory
+        if failure in ('invalid_inventory', 'inventory_mismatch'):
+            def read(now, cid):
+                result = inventory(now, cid)
+                if failure == 'invalid_inventory':
+                    result['as_of'] = 'stale'
+                else:
+                    result['quantities']['101'] = D('1')
+                return result
+            obs.read_conditional_inventory = read
+        elif failure == 'reconciliation':
+            balance = ex.balance
+            def read(**kw):
+                if kw['asset_type'] == 'COLLATERAL':
+                    raise TimeoutError('synthetic secret')
+                return balance(**kw)
+            ex.sdk.get_balance_allowance.side_effect = read
+        elif failure == 'blank_order':
+            ex.sdk.list_open_orders.side_effect = lambda **kw: (SimpleNamespace(items=(SimpleNamespace(id=''),)),)
+        else:
+            ex.sdk.list_open_orders.side_effect = TimeoutError('synthetic secret')
+    clock[0] += timedelta(seconds=10)
+    report = rotation.step(clock[0])['rotation']
+    assert report['blocker']['code'] == expected
+    assert report['blocker']['since'] == clock[0].isoformat()
+    assert len(ex.posts) == 2
+    assert 'synthetic secret' not in str(report)
+
+
+@pytest.mark.parametrize('cause', ['order', 'position'])
+def test_stuck_blocker_threshold_and_reset(tmp_path, cause):
+    rotation, ex, obs, clock = exiting_world(tmp_path)
+    inventory = obs.read_conditional_inventory
+    if cause == 'order':
+        ex.sdk.get_order.side_effect = TimeoutError('synthetic secret')
+        expected = 'order_readback_unavailable'
+    else:
+        def mismatch(now, cid):
+            result = inventory(now, cid)
+            result['quantities']['101'] = D('1')
+            return result
+        obs.read_conditional_inventory = mismatch
+        expected = 'inventory_mismatch'
+    clock[0] += timedelta(seconds=10)
+    began = clock[0]
+    report = rotation.step(clock[0])['rotation']
+    assert report['blocker']['code'] == expected
+    for seconds, alarm in ((899, 'UNKNOWN'), (900, 15)):
+        clock[0] = began + timedelta(seconds=seconds)
+        report = rotation.step(clock[0])['rotation']
+        assert report['blocker']['since'] == began.isoformat()
+        assert report['stuck_minutes'] == alarm
+        assert report['phase'] == 'exiting' and report['current'] == CID
+        assert report['entered_count'] == 0
+    obs.inventory_unknown = True
+    obs.read_conditional_inventory = inventory
+    clock[0] += timedelta(seconds=1)
+    report = rotation.step(clock[0])['rotation']
+    assert report['blocker']['code'] == 'inventory_readback_unavailable'
+    assert report['blocker']['since'] == clock[0].isoformat()
+    assert report['stuck_minutes'] == 'UNKNOWN'
+    obs.inventory_unknown = False
+    ex.sdk.get_order.side_effect = ex.get_order
+    ex.cancel_unknown = False
+    clock[0] += timedelta(seconds=10)
+    report = rotation.step(clock[0])['rotation']
+    assert report['phase'] == 'cleared'
+    assert report['blocker'] == 'UNKNOWN' and report['stuck_minutes'] == 'UNKNOWN'

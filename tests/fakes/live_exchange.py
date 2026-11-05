@@ -7,7 +7,7 @@ from unittest.mock import create_autospec
 from polymarket import SecureClient
 from polymarket.models.clob.account import OpenOrder, ClobTrade, BalanceAllowance
 from polymarket.models.clob.order_response import AcceptedOrder
-from tests.test_live_sdk import AT, CID, WALLET, SIGNER, boundary
+from tests.test_live_sdk import AT, CID, WALLET, SIGNER, boundary, raw_order_context
 
 
 class Exchange:
@@ -15,6 +15,7 @@ class Exchange:
         self.condition_id=condition_id
         self.markets=markets or {condition_id:('101','102')}
         self.sdk = create_autospec(SecureClient, instance=True, spec_set=True)
+        raw_order_context(self.sdk)
         self.orders, self.trades, self.posts = {}, [], []
         self.cash, self.quantities = D('100'), {}
         self.cancel_unknown = False
