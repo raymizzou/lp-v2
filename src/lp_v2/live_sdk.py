@@ -39,6 +39,7 @@ class LiveSDK:
         self.clock = clock
         self._cycle_at = None
         self.readback_blocker = None
+        self.unexpected_error = None
 
     @contextmanager
     def read_cycle(self, *, now=None):
@@ -46,6 +47,7 @@ class LiveSDK:
         if self._order_reads is not None:
             yield
             return
+        self.unexpected_error = None
         self._order_reads = {}
         self._cycle_at = now
         try:
@@ -54,6 +56,30 @@ class LiveSDK:
             self._order_reads = None
             self._history_cache = None
             self._cycle_at = None
+
+    def _read(self, source, operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except Exception as error:
+            from lp_v2.wait_policy import unexpected_error
+            if self.unexpected_error is None:
+                self.unexpected_error = unexpected_error(error, source)
+            raise
+
+    def _pages(self, source, operation, **kwargs):
+        pages = self._read(source, operation, **kwargs)
+        iterator = iter(pages)
+        while True:
+            try:
+                page = next(iterator)
+            except StopIteration:
+                return
+            except Exception as error:
+                from lp_v2.wait_policy import unexpected_error
+                if self.unexpected_error is None:
+                    self.unexpected_error = unexpected_error(error, source)
+                raise
+            yield page
 
     def _now(self):
         return self._cycle_at if self._cycle_at is not None else self.clock()
@@ -67,8 +93,14 @@ class LiveSDK:
                 raw = _read_json(response)
                 cache[order_id] = None if response.status_code == 200 and raw is None else parse_open_order(raw)
             except RequestRejectedError as error:
+                if error.status != 404 and self.unexpected_error is None:
+                    from lp_v2.wait_policy import unexpected_error
+                    self.unexpected_error = unexpected_error(error, 'order_query')
                 cache[order_id] = None if error.status == 404 else _UNAVAILABLE
-            except Exception:
+            except Exception as error:
+                from lp_v2.wait_policy import unexpected_error
+                if self.unexpected_error is None:
+                    self.unexpected_error = unexpected_error(error, 'order_query')
                 cache[order_id] = _UNAVAILABLE
         return cache[order_id]
 
@@ -194,7 +226,7 @@ class LiveSDK:
     def _missing_order(self, previous, candidates, cancels):
         # Iterator exhaustion is required: a later-page failure cannot prove absence.
         try:
-            opens = tuple(o for page in self.client.list_open_orders(market=previous.request.quote.condition_id) for o in page.items)
+            opens = tuple(o for page in self._pages('open_orders', self.client.list_open_orders, market=previous.request.quote.condition_id) for o in page.items)
             if any(not isinstance(o.id,str) or not o.id for o in opens):
                 raise ValueError('incomplete open order readback')
         except Exception:
@@ -362,7 +394,7 @@ class LiveSDK:
         identities = {f.request_id:f.order_id for _,f in self.journal.events('fill')}
         identities.update({key:r.order.order_id for key,r in results.items() if r.order})
         for cid in self.markets:
-            for page in self.client.list_account_trades(market=cid, maker_address=self.wallet):
+            for page in self._pages('trade_history', self.client.list_account_trades, market=cid, maker_address=self.wallet):
                 for raw in page.items:
                     for maker in raw.maker_orders:
                         if maker.order_id not in orders:
@@ -426,7 +458,7 @@ class LiveSDK:
         self._refresh_merges()
         positions = self._positions()
         for token in (t for pair in self.markets.values() for t in pair):
-            raw = self.client.get_balance_allowance(asset_type='CONDITIONAL', token_id=token)
+            raw = self._read('balance', self.client.get_balance_allowance, asset_type='CONDITIONAL', token_id=token)
             actual = D(raw.balance)/1000000
             expected = positions[token].quantity if token in positions else D('0')
             if actual != expected:
@@ -434,7 +466,7 @@ class LiveSDK:
         return tuple(positions.values())
 
     def _cash(self):
-        return D(self.client.get_balance_allowance(asset_type='COLLATERAL').balance)/1000000
+        return D(self._read('balance', self.client.get_balance_allowance, asset_type='COLLATERAL').balance)/1000000
 
     def read_balance(self):
         self._refresh_merges()
@@ -484,7 +516,7 @@ class LiveSDK:
                 continue
             try:
                 handle = handles[r.merge_id]
-                tx = fetch_gasless_transaction_sync(self.relayer,transaction_id=handle['transaction_id'])
+                tx = self._read('merge_query', fetch_gasless_transaction_sync, self.relayer,transaction_id=handle['transaction_id'])
                 if tx.transaction_id != handle['transaction_id']:
                     continue
                 if tx.state in ('STATE_FAILED','STATE_INVALID'):
@@ -493,7 +525,7 @@ class LiveSDK:
                 txhash = tx.transaction_hash
                 if tx.state != 'STATE_CONFIRMED' or not txhash or (handle['transaction_hash'] and handle['transaction_hash'] != txhash):
                     continue
-                receipt = self.rpc.eth_get_transaction_receipt(txhash)
+                receipt = self._read('merge_query', self.rpc.eth_get_transaction_receipt, txhash)
                 if not receipt or receipt.get('transactionHash') != txhash:
                     continue
                 at = datetime.now(UTC)

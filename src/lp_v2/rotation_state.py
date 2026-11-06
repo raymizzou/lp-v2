@@ -181,7 +181,7 @@ def carry_legacy_journal(state_dir, identity):
         old.close()
 
 
-def read_control_window(config):
+def read_control_window(config, *, on_error=None):
     """Only a bound persisted on action grants automatic new-market entry."""
     from lp_v2.live_control.profiles import read_json, timestamp
     from lp_v2.live_control.identity import same_identity
@@ -234,7 +234,9 @@ def read_control_window(config):
             if prior!=bound or record['run_id'] is None:
                 atomic_json(state/'live-control-run.json',dict(record,run_id=process['run_id'],process_binding=bound))
         return action,end
-    except Exception:
+    except Exception as error:
+        if on_error is not None:
+            on_error(error)
         raise ValueError('persisted on authorization unavailable or mismatched') from None
 
 
@@ -270,11 +272,11 @@ def run_journal_sequence(record, market):
     return value
 
 
-def start_verification_passed(config, action_id, window_end, run_id, now):
+def start_verification_passed(config, action_id, window_end, run_id, now, *, on_error=None):
     """A durable proof for this exact on/run unlocks rotation, never an elapsed delay."""
     from lp_v2.live_control.profiles import read_json,timestamp
     try:
-        action,end = read_control_window(config)
+        action,end = read_control_window(config, on_error=on_error)
         record = read_json(Path(config.state_dir)/'live-control-run.json')
         process = read_json(Path(config.state_dir)/'process.json')
         proof = record['startup_verified']
@@ -288,7 +290,9 @@ def start_verification_passed(config, action_id, window_end, run_id, now):
             and all(value > timestamp(record['started_at']) and value <= verified
                     for row in moments for value in row)
             and all(new > old for new,old in zip(moments[1],moments[0])) and verified <= now)
-    except Exception:
+    except Exception as error:
+        if on_error is not None:
+            on_error(error)
         return False
 
 

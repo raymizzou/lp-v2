@@ -1292,7 +1292,8 @@ def test_non_null_order_failure_remains_blocked(tmp_path, failure):
     report = rotation.step(clock[0])['rotation']
     assert report['phase'] == 'exiting' and report['current'] == CID
     assert not rotation.sdk.orders_verified()
-    assert report['blocker']['code'] == 'order_readback_unavailable'
+    error_type = 'TimeoutError' if failure == 'timeout' else 'RequestRejectedError' if failure == '500' else 'UnexpectedResponseError'
+    assert report['blocker']['code'] == f'unexpected_error:{error_type}@order_query'
     assert len(report['blocker']['order_tail']) <= 8
     assert 'synthetic secret' not in str(report)
     assert len(ex.posts) == 2
@@ -1313,7 +1314,7 @@ def test_null_readback_incomplete_open_list_blocks(tmp_path, bad_page):
     report = rotation.step(clock[0])['rotation']
     assert report['current'] == CID and report['phase'] == 'exiting'
     assert not rotation.sdk.orders_verified()
-    assert report['blocker']['code'] == 'open_orders_unavailable'
+    assert report['blocker']['code'] == ('unexpected_error:TimeoutError@open_orders' if bad_page == 'failure' else 'open_orders_unavailable')
     assert len(ex.posts) == 2
 
 
@@ -1335,10 +1336,10 @@ def test_null_readback_missing_trade_proof_blocks(tmp_path):
 @pytest.mark.parametrize('failure, expected', [
     ('invalid_inventory', 'inventory_readback_invalid'),
     ('inventory_mismatch', 'inventory_mismatch'),
-    ('reconciliation', 'reconciliation_unavailable'),
+    ('reconciliation', 'unexpected_error:TimeoutError@balance'),
     ('blank_order', 'open_orders_invalid'),
-    ('open_page', 'open_orders_unavailable'),
-    ('round', 'round_readback_unavailable'),
+    ('open_page', 'unexpected_error:TimeoutError@open_orders'),
+    ('round', 'unexpected_error:TimeoutError@region'),
 ])
 def test_clearance_blocker_codes_are_distinct(tmp_path, failure, expected):
     from types import SimpleNamespace
@@ -1390,7 +1391,7 @@ def test_stuck_blocker_threshold_and_reset(tmp_path, cause):
     inventory = obs.read_conditional_inventory
     if cause == 'order':
         ex.sdk.get_order.side_effect = TimeoutError('synthetic secret')
-        expected = 'order_readback_unavailable'
+        expected = 'unexpected_error:TimeoutError@order_query'
     else:
         def mismatch(now, cid):
             result = inventory(now, cid)
@@ -1413,13 +1414,15 @@ def test_stuck_blocker_threshold_and_reset(tmp_path, cause):
     obs.read_conditional_inventory = inventory
     clock[0] += timedelta(seconds=1)
     report = rotation.step(clock[0])['rotation']
-    assert report['blocker']['code'] == 'inventory_readback_unavailable'
-    assert report['blocker']['since'] == clock[0].isoformat()
-    assert report['stuck_minutes'] == 'UNKNOWN'
+    assert report['blocker']['code'] == (expected if cause == 'order' else 'unexpected_error:ValueError@balance')
+    assert report['blocker']['since'] == (began if cause == 'order' else clock[0]).isoformat()
+    assert report['stuck_minutes'] == ((901 / 60) if cause == 'order' else 'UNKNOWN')
     obs.inventory_unknown = False
     ex.sdk.get_order.side_effect = ex.get_order
     ex.cancel_unknown = False
     clock[0] += timedelta(seconds=10)
     report = rotation.step(clock[0])['rotation']
     assert report['phase'] == 'cleared'
-    assert report['blocker'] == 'UNKNOWN' and report['stuck_minutes'] == 'UNKNOWN'
+    assert report['blocker']['code'] == 'needs_new_on'
+    assert report['stuck_minutes'] == 'UNKNOWN'
+    assert len(ex.posts) == 2 and report['entered_count'] == 0
