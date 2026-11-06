@@ -36,6 +36,7 @@ class RotationRunner:
             self.switch_count = 0
             self.entered_count = 0
             self.blocker = None
+            self._blocker_phase = None
             self._clearance_blocker = None
             self._entry_blocker = None
             self._lock = Lock()
@@ -186,15 +187,17 @@ class RotationRunner:
                     if not self.stop.is_set():
                         self.current.stop.clear()
                         self.current.exit_code = None
-        detail = self._entry_blocker or (self._clearance_blocker if self.phase == 'exiting' else self.current.blocker)
+        detail = self._clearance_blocker if self.phase == 'exiting' else self._entry_blocker or self.current.blocker
         if detail is None and (self.reason.startswith(('waiting_', 'historical_'))
                 or self.reason in ('needs_new_on', 'no_revalidated_candidate', 'no_executable_candidate', 'incomplete_scan', 'window_expired')):
             detail = dict(code=self.reason)
         if detail:
             from lp_v2.wait_policy import wait_blocker
-            self.blocker = wait_blocker(detail, self.blocker, now)
+            previous = self.blocker if self._blocker_phase == self.phase else None
+            self.blocker = wait_blocker(detail, previous, now)
         else:
             self.blocker = None
+        self._blocker_phase = self.phase
         with self._lock:
             self._snapshot = self._build(now)
         return self.snapshot()

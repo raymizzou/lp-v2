@@ -38,8 +38,13 @@ def wait_blocker(detail, previous, now):
     seconds, next_step = wait_policy(detail['code'])
     same = previous is not None and previous['code'] == detail['code']
     since = previous['since'] if same else now
-    deadline = since + timedelta(seconds=seconds)
-    return dict(detail, since=since, deadline=deadline, escalated=now >= deadline,
+    episode_since = previous['episode_since'] if previous is not None else now
+    deadline = min(since + timedelta(seconds=seconds),
+                   episode_since + timedelta(seconds=max(s for s, _ in WAIT_POLICIES.values())))
+    if previous is not None and previous['escalated'] is True:
+        deadline = min(deadline, previous['deadline'])
+    return dict(detail, since=since, episode_since=episode_since, deadline=deadline,
+                escalated=now >= deadline or (previous is not None and previous['escalated'] is True),
                 numbers=detail.get('numbers', 'UNKNOWN'), next_step=next_step,
                 safe_to_stop=detail.get('safe_to_stop', 'UNKNOWN'))
 
