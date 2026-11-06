@@ -9,6 +9,10 @@ from lp_v2.scoring import SCORE_VERSION
 from lp_v2.status_server import build_summary
 
 
+class _CandidateCheckFailure(ValueError):
+    """Expected failed admission, with no change to candidate fallback."""
+
+
 class RotationRunner:
     def __init__(self, config, current, scanner, *, action_id, window_end,
                  clock=lambda: datetime.now(UTC), account_identity=None, relayer=None, control_run_id=None):
@@ -33,6 +37,7 @@ class RotationRunner:
             self.entered_count = 0
             self.blocker = None
             self._clearance_blocker = None
+            self._entry_blocker = None
             self._lock = Lock()
             self.exit_code = None
             identity = dict(owner=current.sdk.owner,wallet=current.sdk.wallet,signer=current.sdk.signer,
@@ -129,6 +134,7 @@ class RotationRunner:
         scan = self.scanner.latest()
         ranking = self._ranking(scan)
         def policy(valid, at):
+            self._entry_blocker = None
             # A seed that has never signed is still a new-market entry on restart.
             # Keep its entry gate without skipping the active runner's step.
             if valid and not self.current.sdk.journal.events('signed'):
@@ -138,7 +144,7 @@ class RotationRunner:
                     return False
             if valid and self.control_run_id is not None:
                 from lp_v2.rotation_state import start_verification_passed
-                if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,at):
+                if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,at, on_error=self._startup_error):
                     self.reason = 'waiting_seed_start_verification'
                     return self.phase == 'running'
             result = evaluate_rotation(ranking,current=self.current.condition_id,phase=self.phase,
@@ -180,10 +186,13 @@ class RotationRunner:
                     if not self.stop.is_set():
                         self.current.stop.clear()
                         self.current.exit_code = None
-        detail = self._clearance_blocker if self.phase == 'exiting' else self.current.blocker
+        detail = self._entry_blocker or (self._clearance_blocker if self.phase == 'exiting' else self.current.blocker)
+        if detail is None and (self.reason.startswith(('waiting_', 'historical_'))
+                or self.reason in ('needs_new_on', 'no_revalidated_candidate', 'no_executable_candidate', 'incomplete_scan', 'window_expired')):
+            detail = dict(code=self.reason)
         if detail:
-            since = self.blocker['since'] if self.blocker and self.blocker['code'] == detail['code'] else now
-            self.blocker = dict(detail, since=since)
+            from lp_v2.wait_policy import wait_blocker
+            self.blocker = wait_blocker(detail, self.blocker, now)
         else:
             self.blocker = None
         with self._lock:
@@ -196,9 +205,13 @@ class RotationRunner:
         runner = runner or self.current
         sdk, ledger = runner.sdk, runner.ledger
         readback = False
+        numbers = 'UNKNOWN'
+        safe_to_stop = 'UNKNOWN'
+        diagnostic = None
         self._clearance_blocker = None
         def blocked(reason, code, *, order_id=None, detail=None):
-            self._clearance_blocker = detail or dict(code=code, order_tail=order_id[-8:] if order_id else None)
+            self._clearance_blocker = dict(diagnostic or detail or dict(code=code, order_tail=order_id[-8:] if order_id else None),
+                                           numbers=numbers, safe_to_stop=safe_to_stop)
             return reason
         try:
             with sdk.read_cycle(now=now):
@@ -206,8 +219,13 @@ class RotationRunner:
                 ledger = runner.ledger
                 readback = sdk.orders_verified()
             state = ledger.snapshot()
-        except Exception:
+        except Exception as error:
+            # Plain ValueError is the existing SDK/ledger domain-guard contract.
+            if type(error) is not ValueError:
+                from lp_v2.wait_policy import unexpected_error
+                diagnostic = unexpected_error(error, 'clearance_reconcile')
             state = ledger.snapshot()
+        diagnostic = sdk.unexpected_error or diagnostic
         if state.pending:
             return blocked('waiting_pending', 'pending_order', detail=sdk.readback_blocker)
         profile = dict(identity=dict(wallet_address=sdk.wallet), trading=dict(market_condition_id=sdk.condition_id))
@@ -224,6 +242,10 @@ class RotationRunner:
                     or any(not isinstance(q, Decimal) or not q.is_finite() or q < 0 for q in quantities.values())):
                 return blocked('waiting_readback', 'inventory_readback_invalid')
             recorded = {t:sum((p.quantity for p in state.positions if p.token_id == t),Decimal('0')) for t in sdk.token_ids}
+            numbers = dict(inventory=[dict(token=str(i+1), exchange=quantities[t], ledger=recorded[t],
+                difference=quantities[t]-recorded[t]) for i,t in enumerate(sdk.token_ids)])
+            if any(quantities.values()):
+                safe_to_stop = False
             if recorded != quantities:
                 return blocked('waiting_readback', 'inventory_mismatch')
             if any(quantities.values()):
@@ -241,9 +263,18 @@ class RotationRunner:
                         return blocked('waiting_readback', 'open_orders_invalid')
                     if order.id in owned:
                         return blocked('waiting_orders', 'orders_remaining', order_id=order.id)
-        except Exception:
+        except Exception as error:
+            from lp_v2.wait_policy import unexpected_error
+            diagnostic = diagnostic or unexpected_error(error, 'balance' if failure_code == 'inventory_readback_unavailable' else 'open_orders')
             return blocked('waiting_readback', failure_code)
+        if diagnostic is not None:
+            self._clearance_blocker = dict(diagnostic, numbers=numbers, safe_to_stop=safe_to_stop)
         return None
+
+    def _startup_error(self, error):
+        from lp_v2.wait_policy import unexpected_error
+        if self._entry_blocker is None:
+            self._entry_blocker = unexpected_error(error, 'startup_proof')
 
     def _transition(self, phase, reason, old, new, *, result='PASS', scan=None):
         scan = scan if scan is not None else self.scanner.latest()
@@ -266,9 +297,10 @@ class RotationRunner:
         return None
 
     def _enter(self, now, old, scan):
+        self._entry_blocker = None
         if self.control_run_id is not None:
             from lp_v2.rotation_state import start_verification_passed
-            if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,now):
+            if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,now, on_error=self._startup_error):
                 self.reason = 'waiting_seed_start_verification'
                 return
         if self.window_end is None or now >= self.window_end:
@@ -288,37 +320,44 @@ class RotationRunner:
                 continue
             target = candidate.condition_id
             self._transition('revalidating', 'fresh_checks', old, target,scan=scan)
+            source = 'candidate_market'
             try:
                 plans = self.observations.read_fixed_market(now,target)
                 plan = plans[0]['plan']
                 fresh_ranking = rank_candidates((plan,),startup_cap=self.config.capital_usdc)
                 if fresh_ranking.leader is None or plan.market.condition_id != target:
-                    raise ValueError('fresh candidate no longer executable')
+                    raise _CandidateCheckFailure('fresh candidate no longer executable')
                 if any(not 0 <= (self.clock()-b.observed_at).total_seconds() <= 60 for b in plan.books):
-                    raise ValueError('stale entry books')
+                    raise _CandidateCheckFailure('stale entry books')
                 checks = self.observations.public_preflight(now,target)
                 from lp_v2.live_control.workflow import PUBLIC
                 if not isinstance(checks,dict) or any(checks.get(key,{}).get('status') != 'PASS' for key in PUBLIC):
-                    raise ValueError('public checks')
+                    raise _CandidateCheckFailure('public checks')
+                source = 'account_check'
                 account = self.observations.read_account_readiness(now, capital_usdc=self.config.capital_usdc,
                     identity=self.account_identity,relayer=self.relayer)
                 required = ('balance','allowance','closed_only','legacy_orders','region','relayer_auth','proxy_execution')
                 if not isinstance(account,dict) or any(account.get(key,{}).get('status') != 'PASS' for key in required):
-                    raise ValueError('account checks')
+                    raise _CandidateCheckFailure('account checks')
                 candidate_runner = self._runner_for(plan)
                 if self._clearance_reason(self.clock(),runner=candidate_runner) is not None:
-                    raise ValueError('target inventory or retained history is not cleared')
+                    raise _CandidateCheckFailure('target inventory or retained history is not cleared')
                 if self.clock() >= self.window_end:
                     self._transition('cleared', 'needs_new_on', old, None,scan=scan)
                     return
                 activation = self.action_id+':'+str(len(self.journal.events()))
                 candidate_runner.sdk.bind_entry(action_id=self.action_id,window_end=self.window_end,
                                                 activation_id=activation)
-            except Exception:
-                self.journal.append('revalidation',dict(condition_id=target,status='FAIL',reason='revalidation_failed',at=self.clock()))
+            except Exception as error:
+                from lp_v2.wait_policy import unexpected_error
+                self._entry_blocker = self._entry_blocker or (dict(code='no_revalidated_candidate')
+                    if isinstance(error, _CandidateCheckFailure) else unexpected_error(error, source))
+                self.journal.append('revalidation',dict(condition_id=target,status='FAIL',reason='revalidation_failed',
+                    diagnostic=self._entry_blocker,at=self.clock()))
                 continue
             # Once a target becomes active, an execution failure cannot cause
             # fallback into a second market. Its own recovery owns every intent.
+            self._entry_blocker = None
             self.current = candidate_runner
             self._transition('running', 'entry_verified', old, target,scan=scan)
             self.current.step(self.clock())

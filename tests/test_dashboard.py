@@ -106,3 +106,35 @@ assert.ok(target.innerHTML.includes('政治类完整扫描第一'));
 '''
     result=subprocess.run(['node','-e',program],input=json.dumps(dict(js=js,html=html)),text=True,capture_output=True,timeout=10)
     assert result.returncode==0,result.stdout+result.stderr
+
+
+def test_wait_blocker_visibility():
+    from lp_v2.status_server import make_handler
+    from tests.test_readonly_sdk import scanned_runner as ReadOnlyRunner
+    runner = ReadOnlyRunner(RunConfig(Decimal('100'), AT), ScriptedReads())
+    handler = make_handler(runner.config, runner)
+    payload = dict(html=request(handler, path='/dashboard')[2].decode(),
+                   js=request(handler, path='/dashboard.js')[2].decode())
+    script = r'''
+const vm=require('node:vm'),assert=require('node:assert/strict');
+const input=JSON.parse(require('node:fs').readFileSync(0,'utf8'));
+const base=JSON.parse(input.html.match(/id="summary-data">([\s\S]*?)<\/script>/)[1]);
+const target={innerHTML:''};
+const context=vm.createContext({document:{getElementById:id=>id==='summary-data'?{textContent:JSON.stringify(base)}:target,
+ querySelectorAll:()=>[],documentElement:{dataset:{}}},structuredClone,Intl,Date,Number,URLSearchParams,
+ location:{search:'?demo=1',hash:''},history:{replaceState(){}}});
+vm.runInContext(input.js,context);
+context.payload=structuredClone(base);
+context.payload.rotation={blocker:{code:'unexpected_error:Novel@balance',since:'2026-11-06T00:00:00Z',
+ deadline:'2026-11-06T00:10:00Z',escalated:true,numbers:{difference:'0.125'},next_step:'check <secret>',safe_to_stop:'UNKNOWN'}};
+vm.runInContext("render('normal',payload)",context);
+let html=target.innerHTML;
+for(const text of ['unexpected_error:Novel@balance','2026-11-06T00:10:00Z','0.125','check &lt;secret&gt;','已升级','停机安全 UNKNOWN'])assert.ok(html.includes(text),text);
+assert.ok(!html.includes('<secret>'));
+context.payload.rotation.blocker.safe_to_stop=false;
+vm.runInContext("render('normal',payload)",context);assert.ok(target.innerHTML.includes('停机安全 否'));
+context.payload.blocker=context.payload.rotation.blocker;context.payload.rotation={};
+vm.runInContext("render('normal',payload)",context);assert.ok(target.innerHTML.includes('unexpected_error:Novel@balance'));
+'''
+    result = subprocess.run(['node', '-e', script], input=json.dumps(payload), text=True, capture_output=True)
+    assert result.returncode == 0, result.stdout + result.stderr

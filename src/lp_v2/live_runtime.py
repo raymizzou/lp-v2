@@ -52,6 +52,7 @@ class LiveRunner:
             wallet=dict(available_usdc=state.cash), markets=self._rows,freshness=self._freshness)
         for row in summary['markets']:
             row['m4'] = {k:str(v) for k,v in self._m4_by_market.get(row['condition_id'],self._m4).items()}
+        summary['blocker'] = build_summary(self.config, state.capital, rotation=dict(blocker=self.blocker))['rotation']['blocker']
         summary['mode'] = 'live'
         summary['accounting'] = dict(status=self._accounting_status,as_of=self._accounting_at.isoformat() if self._accounting_at is not None else UNKNOWN)
         summary['freshness']['income_as_of'] = self._income_at.isoformat() if self._income_at is not None else UNKNOWN
@@ -70,9 +71,11 @@ class LiveRunner:
         self._next = now
         with self.sdk.read_cycle(now=now):
             reconciled = False
+            previous_blocker = self.blocker
             self.blocker = None
             self._region = UNKNOWN
             plans = ()
+            source = 'reconcile'
             try:
                 self._reconcile()
                 reconciled = self.sdk.orders_verified()
@@ -121,6 +124,7 @@ class LiveRunner:
                 self._last_plans = plans
                 if any(tuple(t.token_id for t in p.market.tokens) != self._markets.get(p.market.condition_id) for p in plans):
                     raise ValueError('frozen token identity changed')
+                source = 'region'
                 region = self.observations.read_region_policy()
                 blocked = region.get('blocked')
                 country = region.get('country')
@@ -177,7 +181,8 @@ class LiveRunner:
                 self._freshness = dict(decision_as_of=now,scores_as_of=now,wallet_as_of=accounting_at)
 
             except Exception as error:
-                self.blocker = self.sdk.readback_blocker or dict(code='round_readback_unavailable', order_tail=None)
+                from lp_v2.wait_policy import unexpected_error
+                self.blocker = self.sdk.unexpected_error or self.sdk.readback_blocker or unexpected_error(error, source)
                 if opening_policy is not None:
                     from lp_v2.readonly_sdk import FixedMarketIneligible
                     opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)
@@ -189,6 +194,11 @@ class LiveRunner:
                 self.sdk.journal.append('diagnostic', dict(at=now,reason='round readback or execution unavailable'))
                 for row in self._rows:
                     row.update(eligible=False,skip_reason='读回未核实，暂停下单')
+            if self.sdk.unexpected_error is not None:
+                self.blocker = self.sdk.unexpected_error
+            if self.blocker is not None:
+                from lp_v2.wait_policy import wait_blocker
+                self.blocker = wait_blocker(self.blocker, previous_blocker, now)
             self._accounting_status = 'SUCCESS' if reconciled else UNKNOWN
             self.sdk.journal.append('occupation',self._audit(now,reconciled,plans))
             with self._lock:
