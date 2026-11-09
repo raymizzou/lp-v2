@@ -55,14 +55,20 @@ def check(profile):
 
 
 def owned_order_ids(profile):
+    from lp_v2.rotation_state import validate_histories,market_path
+    state=Path(profile['files']['state_dir'])
+    owner='lp-v2:'+profile['identity']['wallet_address'].lower()
+    histories=validate_histories(state,owner,immutable=True)
+    paths={journal_path(profile),state/'journal.sqlite'}
+    paths.update(market_path(state,identity['condition_id']) for identity in histories)
     ids=set()
-    if not journal_present(profile):
-        return ()
-    for _,kind,value in journal_rows(profile):
-        if kind=='order_result' and value.order is not None:
-            ids.add(value.order.order_id)
-        elif kind=='signed':
-            ids.update(value.get('order_ids',()))
+    for path in paths:
+        if not _journal_present(path):continue
+        for _,kind,value in _journal_rows(path):
+            if kind=='order_result' and value.order is not None:
+                ids.add(value.order.order_id)
+            elif kind=='signed':
+                ids.update(value.get('order_ids',()))
     return tuple(sorted(ids))
 
 
@@ -183,8 +189,11 @@ def journal_path(profile):
 
 def journal_present(profile):
     """Do not mistake interrupted sidecars for new state or recover them on read."""
+    return _journal_present(journal_path(profile))
+
+
+def _journal_present(path):
     import os
-    path=journal_path(profile)
     try:
         path.lstat();present=True
     except FileNotFoundError:
@@ -203,11 +212,14 @@ def journal_present(profile):
 
 
 def journal_rows(profile,kind=None):
+    return _journal_rows(journal_path(profile),kind)
+
+
+def _journal_rows(path,kind=None):
     import sqlite3
     from lp_v2.journal import decode
-    path=journal_path(profile)
     # No Journal constructor, pragmas or database creation on observational reads.
-    if not journal_present(profile):raise ValueError('journal missing')
+    if not _journal_present(path):raise ValueError('journal missing')
     with owner_file(path): pass
     db=sqlite3.connect(path.as_uri()+'?mode=ro&immutable=1',uri=True)
     try:

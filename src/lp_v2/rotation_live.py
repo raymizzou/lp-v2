@@ -145,10 +145,13 @@ class RotationRunner:
         now = self.clock() if now is None else now
         scan = self.scanner.latest()
         ranking = self._ranking(scan)
+        def record_round(valid, at):
+            observed = self.current._accounting_at
+            self._record_self_proof(self.current, observed if valid is True else at,
+                valid is True and observed is not None and self.current.sdk.orders_verified())
         def policy(valid, at):
             self._entry_blocker = None
-            if valid is not True:
-                self._record_self_proof(self.current, at, False)
+            record_round(valid, at)
             # A seed that has never signed is still a new-market entry on restart.
             # Keep its entry gate without skipping the active runner's step.
             if valid and not self.current.sdk.journal.events('signed'):
@@ -157,7 +160,6 @@ class RotationRunner:
                     self.reason = waiting
                     return False
             if valid and self.control_run_id is not None:
-                self._record_self_proof(self.current, at, self.current._accounting_at == at and self.current.sdk.orders_verified())
                 if not self._startup_ready(self.current, at):
                     self.reason = 'waiting_seed_start_verification'
                     return self.phase == 'running' and self._runtime_binding_valid()
@@ -178,6 +180,15 @@ class RotationRunner:
         if self.phase in ('running','exiting'):
             self.current.step(now, opening_policy=policy)
         elif self.phase in ('cleared','revalidating'):
+            if self.control_run_id is not None and not self._startup_ready(self.current, now):
+                # A restarted cleared executor still owns its journal. Collect real
+                # serialized rounds without reopening either old or candidate quotes.
+                self.current.stop.clear()
+                self.current.exit_code = None
+                def recovery_policy(valid, at):
+                    record_round(valid, at)
+                    return False
+                self.current.step(now,opening_policy=recovery_policy)
             waiting = self._clearance_reason(now)
             if waiting:
                 self._transition('exiting',waiting,self.current.condition_id,None)
@@ -268,14 +279,14 @@ class RotationRunner:
             numbers = inventory_numbers(sdk.token_ids, quantities, recorded, inventory)
             if any(quantities.values()):
                 safe_to_stop = False
-            if recorded != quantities and (require_accounting or any(quantities.values())):
+            if recorded != quantities:
                 return blocked('waiting_readback', 'inventory_mismatch')
             if any(quantities.values()):
                 return blocked('waiting_inventory', 'inventory_remaining', detail=sdk.readback_blocker)
             uncertain = next((o for o in state.orders if not o.authoritative or o.status == OrderStatus.LIVE), None)
             if uncertain is not None and not execution:
                 return blocked('waiting_orders', 'orders_unverified', order_id=uncertain.order_id, detail=sdk.readback_blocker)
-            if not readback and (require_accounting or not execution):
+            if not readback:
                 return blocked('waiting_readback', 'reconciliation_unavailable', detail=sdk.readback_blocker)
             owned = set(sdk.owned_candidate_ids())
             failure_code = 'open_orders_unavailable'
@@ -289,10 +300,6 @@ class RotationRunner:
             from lp_v2.wait_policy import unexpected_error
             diagnostic = diagnostic or unexpected_error(error, 'balance' if failure_code == 'inventory_readback_unavailable' else 'open_orders')
             return blocked('waiting_readback', failure_code)
-        if not readback or recorded != quantities:
-            self._verified_exit = dict(condition_id=sdk.condition_id, at=now,
-                accounting='UNRECONCILED', numbers=numbers,
-                explanation='current_zero_inventory_and_no_execution_risk; historical_accounting_retained')
         if diagnostic is not None:
             self._clearance_blocker = dict(diagnostic, numbers=numbers, safe_to_stop=safe_to_stop)
         return None
@@ -416,10 +423,8 @@ class RotationRunner:
                     self._entry_blocker = self._entry_blocker or self._clearance_blocker
                     raise _CandidateCheckFailure('target inventory or retained history is not cleared')
                 if self.control_run_id is not None and not self._startup_ready(self.current, now):
-                    self._record_self_proof(candidate_runner, now, True)
-                    if not self._startup_ready(candidate_runner, now):
-                        self._transition('cleared', 'waiting_seed_start_verification', old, target, scan=scan)
-                        return
+                    self._transition('cleared', 'waiting_seed_start_verification', old, target, scan=scan)
+                    return
                 if self.clock() >= self.window_end:
                     self._transition('cleared', 'needs_new_on', old, None,scan=scan)
                     return

@@ -1025,19 +1025,23 @@ def test_restart_drains_retained_owned_history(tmp_path):
     rotation.close()
 
 
-def test_fast_scan_cannot_rotate_before_seed_start_verification(tmp_path,monkeypatch):
+@pytest.mark.parametrize('clock_mode',['frozen','advancing'],ids=['frozen','advancing'])
+def test_fast_scan_cannot_rotate_before_seed_start_verification(tmp_path,monkeypatch,clock_mode):
     import json
     from pathlib import Path
     from datetime import datetime as RealDateTime
     import datetime as datetime_module
     from lp_v2.live_runtime import create_live_runner
     config,ex,current,record,seen=factory_boundary(tmp_path,monkeypatch)
+    def read_clock():
+        if clock_mode=='advancing':current[0]+=timedelta(microseconds=1)
+        return current[0]
     class Clock(RealDateTime):
         @classmethod
-        def now(cls,tz=None):return current[0]
+        def now(cls,tz=None):return read_clock()
     current[0]=Clock.fromisoformat(current[0].isoformat())
     monkeypatch.setattr(datetime_module,'datetime',Clock)
-    runner=create_live_runner(config,clock=lambda:current[0])
+    runner=create_live_runner(config,clock=read_clock)
     runner.scanner.scan_once(current[0]) # Catalog B wins before the first decision.
     runner.step(current[0])
     assert runner.current.condition_id==CID
@@ -1077,7 +1081,7 @@ def test_fast_scan_cannot_rotate_before_seed_start_verification(tmp_path,monkeyp
     before=tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))
     assert len(before)==2
     runner.close()
-    runner=create_live_runner(config,clock=lambda:current[0])
+    runner=create_live_runner(config,clock=read_clock)
     current[0]+=timedelta(seconds=10);runner.step(current[0])
     assert runner.current.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
     assert tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))==before

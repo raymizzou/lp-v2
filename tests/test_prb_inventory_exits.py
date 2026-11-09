@@ -119,7 +119,7 @@ def test_absence_proof_resets_after_incomplete_or_present_list(tmp_path):
         journal.close()
 
 
-def test_zero_exchange_balance_exits_with_auditable_ledger_warning(tmp_path):
+def test_zero_exchange_balance_keeps_unreconciled_ledger_blocked(tmp_path):
     rotation,ex,obs,clock=rotation_world(tmp_path)
     rotation.step(AT)
     ex.fill('order-1','1','.40',at=AT+timedelta(seconds=1))
@@ -134,15 +134,15 @@ def test_zero_exchange_balance_exits_with_auditable_ledger_warning(tmp_path):
     rotation.scanner.scan_once(clock[0])
     clock[0]+=timedelta(seconds=10)
     report=rotation.step(clock[0])['rotation']
-    assert report['phase']=='cleared' and report['entered_count']==0
+    assert report['phase']=='exiting' and report['current']==CID and report['entered_count']==0
     assert old.ledger.snapshot().positions==before
-    event=old.sdk.journal.events('exit_observation')[-1][1]
-    assert event['accounting']=='UNRECONCILED'
-    assert event['numbers']['inventory'][0]['exchange']==0
-    assert event['numbers']['inventory'][0]['ledger']==1
-    assert event['numbers']['inventory'][0]['difference']==-1
-    assert event['numbers']['inventory'][0]['source']=='UNKNOWN'
-    assert report['exit_observation']['accounting']=='UNRECONCILED'
+    assert not old.sdk.journal.events('exit_observation')
+    assert not old.stop.is_set()
+    row=report['blocker']['numbers']['inventory'][0]
+    assert row['exchange']=='0' and row['ledger']=='1' and row['difference']=='-1'
+    assert row['source']==row['upstream_unit']==row['upstream_precision']=='UNKNOWN'
+    assert report['blocker']['code']=='inventory_mismatch'
+    assert report['exit_observation']=='UNKNOWN'
     assert old.sdk.journal.events('fill')[-1][1].quantity==1
     assert {p.token_id for p in ex.posts}<=set(TOKENS)
     rotation.close()
@@ -151,6 +151,7 @@ def test_zero_exchange_balance_exits_with_auditable_ledger_warning(tmp_path):
 def test_nonzero_inventory_blocker_keeps_complete_evidence(tmp_path):
     rotation,ex,obs,clock=rotation_world(tmp_path)
     rotation.step(AT)
+    # Dust requires manual handling; no tolerance or automatic transfer.
     ex.quantities['101']=D('.008133')
     clock[0]+=timedelta(seconds=10);rotation.scanner.scan_once(clock[0])
     first=clock[0]
@@ -205,16 +206,45 @@ def test_self_proof_recovers_after_old_accounting_failure(tmp_path,monkeypatch):
     runner.step(clock[0]);clock[0]+=timedelta(seconds=10);runner.step(clock[0])
     assert {s.token_id for s in ex.posts}==set(TOKENS)
     ex.fill('order-1','1','.40',at=clock[0]+timedelta(seconds=1))
+    # Match this factory's derived wallet in the external fake trade response.
+    trade=ex.trades[-1];wallet=runner.sdk.wallet
+    ex.trades[-1]=trade.model_copy(update=dict(maker_address=wallet,
+        maker_orders=[m.model_copy(update=dict(maker_address=wallet)) for m in trade.maker_orders]))
     clock[0]+=timedelta(seconds=10);runner.current.step(clock[0],allow_open=False)
     old=runner.current;before=old.ledger.snapshot().positions
     ex.quantities['101']=D(0)
     clock[0]+=timedelta(seconds=10);runner.scanner.scan_once(clock[0]);report=runner.step(clock[0])['rotation']
-    assert report['phase']=='cleared' and report['entered_count']==0
+    assert report['phase']=='exiting' and report['entered_count']==0
+    assert report['blocker']['code'] in ('inventory_mismatch','reconciliation_unavailable')
     assert {s.token_id for s in ex.posts}<=set(TOKENS)
     runner.step(clock[0]);assert runner.entered_count==0
-    clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
-    assert report['current']==BID and report['entered_count']==1
-    assert old.ledger.snapshot().positions==before
+    ex.quantities['101']=D(1)
+    for _ in range(2):
+        clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+        assert report['current']==CID and report['entered_count']==0
+        assert old.ledger.snapshot().positions==before and not old.stop.is_set()
+    assert old.sdk.journal.events('fill')[-1][1].quantity==1
+    assert {s.token_id for s in ex.posts}<=set(TOKENS)
+    runner.close()
+    # Actual read failure can recover when both financial sources really agree.
+    # Clean candidate retry evidence now lives in the legal cleared-restart case.
+    recovery=tmp_path/'read-recovery';recovery.mkdir()
+    config,ex,clock,record,seen=factory_boundary(recovery,monkeypatch)
+    read_clock=shared_runtime_clock(monkeypatch,clock,'advancing')
+    runner=create_live_runner(config,clock=read_clock)
+    runner.scanner.scan_once(clock[0]);runner.step(clock[0])
+    ex.sdk.get_balance_allowance.side_effect=TimeoutError('temporary balance unavailable')
+    clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+    assert runner.entered_count==0 and {p.token_id for p in ex.posts}<=set(TOKENS)
+    ex.sdk.get_balance_allowance.side_effect=ex.balance
+    clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+    assert runner.entered_count==0 and {p.token_id for p in ex.posts}<=set(TOKENS)
+    runner.step(clock[0]);assert runner.entered_count==0
+    clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+    assert runner.condition_id==BID and runner.entered_count==1
+    assert sum(p.token_id in ('201','202') for p in ex.posts)==2
+    signatures=tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))
+    assert len(signatures)==len(set(signatures))==2
     runner.close()
 
 
@@ -421,8 +451,26 @@ def test_official_start_accepts_bound_self_proven_rotation(tmp_path,monkeypatch,
     runner.close()
 
 
-@pytest.mark.parametrize('guard',['action','run','process','window','failed-round','duplicate','restart'])
-def test_self_proof_preserves_current_binding_and_consecutive_rounds(tmp_path,monkeypatch,guard):
+def shared_runtime_clock(monkeypatch,current,mode):
+    import datetime as datetime_module
+    from datetime import datetime as RealDateTime
+    def read_clock():
+        if mode=='advancing':current[0]+=timedelta(microseconds=1)
+        return current[0]
+    class Clock(RealDateTime):
+        @classmethod
+        def now(cls,tz=None):return read_clock()
+    current[0]=Clock.fromisoformat(current[0].isoformat())
+    monkeypatch.setattr(datetime_module,'datetime',Clock)
+    return read_clock
+
+
+@pytest.mark.parametrize('clock_mode,guard',[(mode,guard)
+    for mode in ('frozen','advancing')
+    for guard in ('action','run','process','window','failed-round','duplicate','restart')],
+    ids=[f'{mode}-{guard}' for mode in ('frozen','advancing')
+         for guard in ('action','run','process','window','failed-round','duplicate','restart')])
+def test_self_proof_preserves_current_binding_and_consecutive_rounds(tmp_path,monkeypatch,clock_mode,guard):
     import json
     from pathlib import Path
     from tests.test_rotation_live import factory_boundary
@@ -430,14 +478,15 @@ def test_self_proof_preserves_current_binding_and_consecutive_rounds(tmp_path,mo
     from lp_v2.live_control.profiles import atomic_json
     from lp_v2.readonly_sdk import FixedMarketIneligible
     config,ex,clock,record,seen=factory_boundary(tmp_path,monkeypatch)
+    read_clock=shared_runtime_clock(monkeypatch,clock,clock_mode)
     state=Path(config.state_dir)
     original_process=json.loads((state/'process.json').read_text())
-    runner=create_live_runner(config,clock=lambda:clock[0]);runner.scanner.scan_once(clock[0]);runner.step(clock[0])
+    runner=create_live_runner(config,clock=read_clock);runner.scanner.scan_once(clock[0]);runner.step(clock[0])
     assert runner.condition_id==CID and tuple(p.token_id for p in ex.posts)==TOKENS
     if guard=='duplicate':
         runner.step(clock[0]);runner.step(clock[0])
     elif guard=='restart':
-        runner.close();runner=create_live_runner(config,clock=lambda:clock[0]);runner.scanner.scan_once(clock[0])
+        runner.close();runner=create_live_runner(config,clock=read_clock);runner.scanner.scan_once(clock[0])
         clock[0]+=timedelta(seconds=10);runner.step(clock[0])
     else:
         if guard=='action':atomic_json(state/'live-control-run.json',dict(record,action_id='c'*32))
@@ -467,6 +516,30 @@ def test_self_proof_preserves_current_binding_and_consecutive_rounds(tmp_path,mo
     runner.close()
 
 
+def test_advancing_clock_active_market_collects_new_round_proof(tmp_path,monkeypatch):
+    import json
+    from pathlib import Path
+    from tests.test_rotation_live import factory_boundary
+    from lp_v2.live_runtime import create_live_runner
+    config,ex,clock,record,seen=factory_boundary(tmp_path,monkeypatch)
+    read_clock=shared_runtime_clock(monkeypatch,clock,'advancing')
+    runner=create_live_runner(config,clock=read_clock)
+    runner.scanner.scan_once(clock[0]);runner.step(clock[0])
+    assert runner.condition_id==CID and tuple(p.token_id for p in ex.posts)==TOKENS
+    clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+    assert runner.condition_id==BID and runner.entered_count==1
+    signed=tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))
+    assert len(signed)==len(set(signed))==2
+    for _ in range(2):
+        clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+    assert report['reason']=='current_leads_or_ties'
+    assert report['current']==BID and report['entered_count']==1 and report['switch_count']==1
+    assert tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))==signed
+    assert tuple(p.token_id for p in ex.posts)==('101','102','201','202')
+    assert 'startup_verified' not in json.loads((Path(config.state_dir)/'live-control-run.json').read_text())
+    runner.close()
+
+
 @pytest.mark.parametrize('variant',['clean','unexpired','partial','present','missing-signature','unknown-merge'])
 def test_handoff_retains_unknown_accounting_after_proven_expired_absence(combined_world,monkeypatch,capsys,variant):
     import json
@@ -493,7 +566,8 @@ def test_handoff_retains_unknown_accounting_after_proven_expired_absence(combine
     clock[0]=world.clock;runtime.step(clock[0])
     clock[0]+=timedelta(seconds=10);runtime.step(clock[0]);world.clock=clock[0]
     current=runtime.current
-    if variant=='unexpired':current.drain(timeout_s=0)
+    # Explicitly stop through the public lifecycle before validating handoff.
+    current.drain(timeout_s=0)
     journal=current.sdk.journal;drain=journal.events('stop_result')[-1][1]
     assert len(drain['pending'])==2 and drain['reconciliation']=='UNKNOWN'
     ids=tuple(oid for _,p in journal.events('signed') for oid in p['order_ids'])
@@ -567,3 +641,164 @@ def test_current_owned_presence_blocks_legacy_clean_handoff(combined_world,monke
     assert main(['live','check'])==0
     assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
     assert world.mutations==[] and frozen=={p:p.read_bytes() for p in frozen}
+
+
+def retained_handoff_world(world,history='acknowledged'):
+    from dataclasses import replace
+    from lp_v2.journal import Journal
+    from lp_v2.models import Order,OrderResult,OrderStatus,Outcome
+    from lp_v2.rotation_state import open_market_journal
+    from lp_v2.live_control.profiles import atomic_json
+    from tests.test_live_sdk import request
+    state=stopped_history(world);p=world.profile
+    owner='lp-v2:'+p['identity']['wallet_address'].lower()
+    active=Journal(state/'journal.sqlite');drain=active.events('stop_result')[-1][1]
+    active.append('stop_result',dict(drain,exit_code=0,reconciliation='SUCCESS',positions=[]))
+    active.close();atomic_json(state/'stop-result.json',dict(run_id='f'*32,exit_code=0))
+    retained=CID_C if p['trading']['market_condition_id']!=CID_C else BID
+    identity=dict(owner=owner,condition_id=retained,token_ids=('201','202'))
+    journal=open_market_journal(state,identity)
+    req=request();req=replace(req,owner=owner,request_id='retained-request',
+        quote=replace(req.quote,condition_id=retained,token_id='201'),
+        created_at=drain['at']-timedelta(seconds=1),expires_at=drain['at']+timedelta(hours=1),
+        reservation_terms=replace(req.reservation_terms,token_ids=('201','202')))
+    journal.append('intent',dict(request=req))
+    oid='0x'+'d'*64
+    if history=='signed':
+        journal.append('signed',dict(request_id=req.request_id,order_ids=(oid,'0x'+'e'*64),token_id='201',
+            maker=p['identity']['wallet_address'],signer=p['identity']['signer_address'],
+            expiration=int(req.expires_at.timestamp()),signed_at=drain['at']))
+    else:
+        order=Order(oid,req,D(0),D(0),OrderStatus.CANCELLED,drain['at'],True)
+        journal.append('order_result',OrderResult(req,Outcome.SUCCESS,order,drain['at']))
+    journal.close()
+    return state,state/'markets'/retained/'journal.sqlite',oid,retained
+
+
+@pytest.mark.parametrize('history',['acknowledged','signed'],ids=['acknowledged','signed'])
+def test_retained_owned_order_blocks_host_handoff(combined_world,monkeypatch,capsys,history):
+    import json
+    from lp_v2.cli import main
+    world=combined_world;state,path,oid,retained=retained_handoff_world(world,history)
+    route=httpx.HTTPTransport.handle_request;dirty=[True]
+    def pages(self,r):
+        if r.url.path!='/data/orders':return route(self,r)
+        return httpx.Response(200,json=dict(data=[dict(id=oid,market=retained)] if dirty[0] else [],next_cursor='LTE='),request=r)
+    monkeypatch.setattr(httpx.HTTPTransport,'handle_request',pages)
+    frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    assert main(['live','check'])==2
+    result=json.loads(capsys.readouterr().out)
+    assert result['checks']['legacy_orders']['status']=='PASS'
+    row=result['checks']['inventory_handoff']
+    assert row['status']=='FAIL' and row['owned_open_count']==1
+    dirty[0]=False
+    assert main(['live','check'])==0
+    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
+    assert world.mutations==[] and world.readonly is True
+    assert all(r.method=='GET' for r in world.http_requests)
+    assert frozen=={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+
+
+@pytest.mark.parametrize('problem',['foreign-owner','symlink','unsettled-wal'],ids=['foreign-owner','symlink','unsettled-wal'])
+def test_retained_owned_history_fails_closed(combined_world,capsys,problem):
+    import json
+    from lp_v2.cli import main
+    from lp_v2.journal import Journal
+    world=combined_world;state,path,oid,retained=retained_handoff_world(world)
+    if problem=='foreign-owner':
+        history=Journal(path);identity=history.events('identity')[0][1]
+        history.append('identity',dict(identity,owner='lp-v2:foreign'));history.close()
+    elif problem=='symlink':
+        destination=path.with_name('retained.sqlite');path.rename(destination);path.symlink_to(destination.name)
+    else:
+        sidecar=path.with_name(path.name+'-wal');sidecar.write_bytes(b'unsettled');sidecar.chmod(0o600)
+    frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    assert main(['live','check'])==2
+    report=json.loads(capsys.readouterr().out)
+    assert report['checks']['inventory_handoff']['status']!='PASS'
+    assert world.mutations==[] and world.readonly is True
+    assert all(r.method=='GET' for r in world.http_requests)
+    assert frozen=={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+
+
+def test_settlement_lag_keeps_old_market_owned(tmp_path):
+    rotation,ex,obs,clock=rotation_world(tmp_path)
+    rotation.step(clock[0])
+    ex.fill('order-1','1','.40',at=clock[0]+timedelta(seconds=1))
+    clock[0]+=timedelta(seconds=10);rotation.current.step(clock[0],allow_open=False)
+    old=rotation.current;before=old.ledger.snapshot().positions
+    assert before[0].quantity==D('1') and before[0].cost_usdc==D('.40')
+    ex.quantities['101']=D(0);rotation.scanner.scan_once(clock[0])
+    clock[0]+=timedelta(seconds=10);report=rotation.step(clock[0])['rotation']
+    assert report['current']==CID and report['entered_count']==0
+    assert report['phase']=='exiting'
+    assert report['blocker']['code'] in ('inventory_mismatch','reconciliation_unavailable')
+    assert rotation.current is old and not old.stop.is_set()
+    assert tuple(p.token_id for p in ex.posts)==TOKENS
+    assert old.ledger.snapshot().positions==before and not old.sdk.journal.events('exit_observation')
+    ex.quantities['101']=D(1)
+    for _ in range(3):
+        clock[0]+=timedelta(seconds=10);report=rotation.step(clock[0])['rotation']
+        assert report['current']==CID and report['entered_count']==0 and report['phase']=='exiting'
+        assert not old.stop.is_set() and {p.token_id for p in ex.posts}<=set(TOKENS)
+        assert old.ledger.snapshot().positions==before
+    assert old.sdk.journal.events('fill')[-1][1].quantity==D(1)
+    rotation.close()
+
+
+def cleared_factory_restart(tmp_path,monkeypatch):
+    from tests.test_rotation_live import factory_boundary
+    from lp_v2.live_runtime import create_live_runner
+    config,ex,clock,record,seen=factory_boundary(tmp_path,monkeypatch)
+    read_clock=shared_runtime_clock(monkeypatch,clock,'advancing')
+    route=httpx.HTTPTransport.handle_request;unavailable=[True]
+    def account(self,r):
+        if unavailable[0] and r.url.path=='/transactions':
+            return httpx.Response(503,json={},request=r)
+        return route(self,r)
+    monkeypatch.setattr(httpx.HTTPTransport,'handle_request',account)
+    runner=create_live_runner(config,clock=read_clock)
+    runner.scanner.scan_once(clock[0]);runner.step(clock[0])
+    clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+    assert runner.phase=='cleared' and runner.entered_count==0
+    assert tuple(p.token_id for p in ex.posts)==TOKENS
+    runner.close();unavailable[0]=False
+    runner=create_live_runner(config,clock=read_clock);runner.scanner.scan_once(clock[0])
+    return runner,ex,clock,record,seen,config
+
+
+def test_candidate_clean_reads_do_not_count_as_executor_rounds(tmp_path,monkeypatch):
+    import json
+    from pathlib import Path
+    runner,ex,clock,record,seen,config=cleared_factory_restart(tmp_path,monkeypatch)
+    old=runner.current;occupation_start=len(old.sdk.journal.events('occupation'))
+    ex.sdk.get_balance_allowance.side_effect=TimeoutError('temporary balance unavailable')
+    clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+    assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
+    ex.sdk.get_balance_allowance.side_effect=ex.balance
+    clock[0]+=timedelta(seconds=10);first_at=clock[0];runner.step(first_at)
+    assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
+    def reads(token):
+        return sum(r.url.path=='/balance-allowance' and r.url.params.get('asset_type')=='CONDITIONAL'
+                   and r.url.params.get('token_id')==token for r in seen)
+    before={token:reads(token) for token in ('201','202')}
+    runner.step(first_at) # Exact same supplied observation; real candidate reads still happen.
+    assert all(reads(token)>before[token] for token in before)
+    assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
+    before={token:reads(token) for token in ('201','202')}
+    clock[0]=first_at+timedelta(seconds=1);runner.step(clock[0])
+    assert all(reads(token)>before[token] for token in before)
+    assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
+    clock[0]=first_at+timedelta(seconds=10);runner.step(clock[0])
+    assert runner.condition_id==BID and runner.entered_count==1
+    assert tuple(p.token_id for p in ex.posts)==('101','102','201','202')
+    proof=next(p['admission_proof'] for _,p in reversed(runner.journal.events('rotation')) if p.get('admission_proof'))
+    observations=[p['accounting_as_of'].isoformat() for _,p in old.sdk.journal.events('occupation')[occupation_start:]
+                  if p['reconciliation']=='SUCCESS']
+    assert proof['source_market']==CID and proof['moments']==observations[-2:]
+    assert len(proof['moments'])==2 and proof['moments'][0]<proof['moments'][1]
+    assert 'startup_verified' not in json.loads((Path(config.state_dir)/'live-control-run.json').read_text())
+    signatures=tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))
+    assert len(signatures)==len(set(signatures))==2
+    runner.step(clock[0]);assert runner.entered_count==1 and len(ex.posts)==4
+    runner.close()

@@ -39,11 +39,28 @@ def open_market_journal(state_dir, identity):
         raise
 
 
-def read_market_identity(state_dir, condition_id):
+def _history_connection(path, *, immutable=False):
+    import sqlite3
+    if immutable:
+        import os
+        from lp_v2.cli import owner_file
+        with owner_file(path):
+            pass
+        for suffix in ('-wal','-shm','-journal'):
+            sidecar=path.with_name(path.name+suffix)
+            try:sidecar.lstat()
+            except FileNotFoundError:continue
+            with owner_file(sidecar) as source:
+                if suffix in ('-wal','-journal') and os.fstat(source.fileno()).st_size:
+                    raise ValueError('unsettled journal history')
+    return sqlite3.connect(path.as_uri()+'?mode=ro'+('&immutable=1' if immutable else ''),uri=True)
+
+
+def read_market_identity(state_dir, condition_id, *, immutable=False):
     import sqlite3
     from lp_v2.journal import decode
     path = market_path(state_dir, condition_id)
-    db = sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
+    db = _history_connection(path,immutable=immutable)
     try:
         rows = [decode(row[0]) for row in db.execute("SELECT payload FROM events WHERE kind='identity' ORDER BY seq")]
         if (not rows or any(r != rows[0] for r in rows) or rows[0]['condition_id'] != condition_id
@@ -55,7 +72,7 @@ def read_market_identity(state_dir, condition_id):
         db.close()
 
 
-def validate_histories(state_dir, owner, *, candidate=None):
+def validate_histories(state_dir, owner, *, candidate=None, immutable=False):
     """Fail closed before generating IDs, including short-prefix collisions."""
     import sqlite3
     from lp_v2.journal import decode
@@ -75,11 +92,11 @@ def validate_histories(state_dir, owner, *, candidate=None):
         prefixes[prefix] = cid
         if cid == candidate and not path.exists():
             continue
-        identity = read_market_identity(state_dir,cid)
+        identity = read_market_identity(state_dir,cid,immutable=immutable)
         if identity['owner'] != owner:
             raise ValueError('historical market owner mismatch')
         identities.append(identity)
-        db = sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
+        db = _history_connection(path,immutable=immutable)
         try:
             for kind,payload in db.execute("SELECT kind,payload FROM events WHERE kind IN ('intent','merge_intent') ORDER BY seq"):
                 record = decode(payload)['request']
