@@ -373,6 +373,18 @@ class LiveRunner:
             except Exception:
                 self.sdk.journal.append('diagnostic',dict(at=self.clock(),reason='owned cancel unavailable'))
 
+    def finish_verified_exit(self, observation):
+        """Rotation's fresh zero-risk observation ends execution, retaining accounting."""
+        self.stop.set()
+        state = self.ledger.snapshot()
+        self.sdk.journal.append('exit_observation', observation)
+        self.sdk.journal.append('stop_result', dict(at=self.clock(), exit_code=0,
+            orders=state.orders,pending=state.pending,positions=state.positions,merges=state.merges,
+            reconciliation=UNKNOWN,accounting_as_of=self._accounting_at,exit_observation=observation,
+            inventory=self._audit(self.clock(),False,self._last_plans)['inventory']))
+        self.exit_code = 0
+        return 0
+
     def drain(self, *, timeout_s=90, monotonic=None, wait=None):
         from time import monotonic as real_monotonic, sleep
         from lp_v2.models import OrderStatus

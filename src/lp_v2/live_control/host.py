@@ -54,6 +54,18 @@ def check(profile):
 
 
 
+def owned_order_ids(profile):
+    ids=set()
+    if not journal_present(profile):
+        return ()
+    for _,kind,value in journal_rows(profile):
+        if kind=='order_result' and value.order is not None:
+            ids.add(value.order.order_id)
+        elif kind=='signed':
+            ids.update(value.get('order_ids',()))
+    return tuple(sorted(ids))
+
+
 def account_checks(profile):
     from lp_v2.readonly_sdk import L2Credentials, ReadOnlySDK
     from datetime import datetime, UTC
@@ -77,14 +89,25 @@ def account_checks(profile):
         relayer=read_json(profile['files']['relayer_credentials'])
         sdk=ReadOnlySDK(credentials=credentials)
         try:
-            result.update(sdk.read_account_readiness(datetime.now(UTC),capital_usdc=profile['trading']['capital_usdc'],identity=identity,relayer=relayer))
+            from lp_v2.rotation_state import control_market_profile
+            active_profile=control_market_profile(profile)
+            own=owned_order_ids(profile)
+            result.update(sdk.read_account_readiness(datetime.now(UTC),capital_usdc=profile['trading']['capital_usdc'],
+                identity=identity,relayer=relayer,condition_id=active_profile['trading']['market_condition_id'],known_order_ids=own))
             try:
                 from lp_v2.readonly_sdk import ConditionalIdentityUnavailable
                 from lp_v2.live_control.handoff import inventory_handoff
                 from lp_v2.rotation_state import control_market_profile
                 active_profile=control_market_profile(profile)
                 quantities=sdk.read_conditional_inventory(datetime.now(UTC),active_profile['trading']['market_condition_id'])
-                result['inventory_handoff']=inventory_handoff(profile,quantities)
+                orders=sdk.read_orders(datetime.now(UTC),condition_id=active_profile['trading']['market_condition_id'],known_order_ids=own)
+                absence_orders=()
+                if orders.get('complete') is True and orders.get('owned_open_count')==0 and journal_present(profile):
+                    stopped=journal_rows(profile,'stop_result')
+                    if stopped and stopped[-1][1].get('pending'):
+                        absence_orders=(sdk.read_orders(datetime.now(UTC),
+                            condition_id=active_profile['trading']['market_condition_id'],known_order_ids=own),)
+                result['inventory_handoff']=inventory_handoff(profile,quantities,orders=orders,absence_orders=absence_orders)
             except ConditionalIdentityUnavailable:
                 result['inventory_handoff']=fact('UNKNOWN','CONDITIONAL_IDENTITY_UNAVAILABLE')
             except Exception:
@@ -551,7 +574,7 @@ def observe(request):
 
 
 def record_start_observation(request,snapshot):
-    """Persist the existing two-seed-round proof under the control record lock."""
+    """Persist two corroborated live rounds under the control record lock."""
     import fcntl,os,stat
     from lp_v2.live_control.profiles import atomic_json,timestamp
     from lp_v2.live_control.workflow import valid_round
@@ -568,12 +591,14 @@ def record_start_observation(request,snapshot):
         if (record['profile']!=profile or record['run_id']!=request['run_id'] or process['run_id']!=record['run_id']
                 or request.get('action_id',record['action_id'])!=record['action_id'] or not record['window_end']):
             raise ValueError('startup proof run mismatch')
+        from lp_v2.rotation_state import verified_start_rotation
+        snapshot['rotation_verification']=verified_start_rotation(profile,record,process,snapshot['summary'])
         bound=dict(action_id=record['action_id'],run_id=record['run_id'],window_end=record['window_end'],
                    seed_market=profile['trading']['market_condition_id'])
         prior=record.get('startup_verified',{})
         if all(prior.get(key)==value for key,value in bound.items()) and prior.get('verified_rounds')==2:
             return dict(status='PASS',verified_rounds=2)
-        moment=valid_round(profile,record['run_id'],snapshot,record['started_at'])
+        moment=valid_round(profile,record['run_id'],snapshot,record['started_at'],action_id=record['action_id'])
         samples=record.get('startup_samples',[])
         if moment is None:
             samples=[]

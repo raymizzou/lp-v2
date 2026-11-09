@@ -37,7 +37,7 @@ class FixedMarketIneligible(_Excluded):
 class ReadOnlyPort(Protocol):
     def read_markets(self, now): ...
     def read_wallet(self, now): ...
-    def read_orders(self, now): ...
+    def read_orders(self, now, *, condition_id=None, known_order_ids=()): ...
     def read_region(self): ...
     def safety(self, since): ...
     def transport_safety(self): ...
@@ -297,22 +297,46 @@ class ReadOnlySDK:
         response.raise_for_status()
         return response.json()
 
-    def read_orders(self, now):
-        # Readback is observational: old wallet orders never enter our ledger.
+    def read_orders(self, now, *, condition_id=None, known_order_ids=()):
+        # Default whole-account observational count remains compatible with M3.
         try:
-            count, cursor, seen = 0, None, set()
+            import re
+            if condition_id is not None and not re.fullmatch('0x[0-9a-fA-F]{64}',condition_id):
+                raise ValueError('market identity')
+            owned = set(known_order_ids)
+            if any(not isinstance(oid,str) or not oid for oid in owned):
+                raise ValueError('owned identity')
+            count, other, cursor, seen, ids, tails = 0, 0, None, set(), set(), []
             for _ in range(5):
                 data = self.__account_get('/data/orders', now, {} if cursor is None else dict(next_cursor=cursor))
-                if (not isinstance(data['data'], list) or 'next_cursor' not in data
-                        or any(not isinstance(order, dict) or not isinstance(order.get('id'), str)
-                               or not order['id'] for order in data['data'])):
+                if not isinstance(data['data'],list) or 'next_cursor' not in data:
                     raise ValueError('orders')
-                count += len(data['data'])
+                for order in data['data']:
+                    oid = order.get('id') if isinstance(order,dict) else None
+                    if not isinstance(oid,str) or not oid or (condition_id is not None and oid in ids):
+                        raise ValueError('order identity')
+                    ids.add(oid)
+                    if condition_id is None:
+                        count += 1
+                        continue
+                    market = order.get('market',order.get('condition_id'))
+                    if not isinstance(market,str) or not re.fullmatch('0x[0-9a-fA-F]{64}',market):
+                        raise ValueError('order market unknown')
+                    if market.lower() != condition_id.lower():
+                        other += 1
+                    elif oid not in owned:
+                        count += 1
+                        tails.append(oid[-8:])
                 cursor = data.get('next_cursor')
                 if cursor in (None, 'LTE='):
-                    return dict(legacy_order_count=count, as_of=now)
-                if not isinstance(cursor, str) or not cursor or cursor in seen:
-                    break
+                    result = dict(legacy_order_count=count, as_of=now)
+                    if condition_id is not None:
+                        from lp_v2.inventory_evidence import order_identity_digest
+                        result.update(owned_ids_sha256=order_identity_digest(owned),condition_id=condition_id,non_target_order_count=other,foreign_order_tails=tails,
+                                      owned_open_count=len(ids & owned),complete=True)
+                    return result
+                if not isinstance(cursor,str) or not cursor or cursor in seen:
+                    raise ValueError('cursor')
                 seen.add(cursor)
         except Exception:
             pass
@@ -397,9 +421,11 @@ class ReadOnlySDK:
             data=BalanceAllowance.model_validate(raw)
             if data.balance<0 or any(value<0 for value in data.allowances.values()):raise ValueError('conditional balance invalid')
             quantities[token]=Decimal(data.balance)/Decimal('1000000')
-        return dict(condition_id=condition_id,token_ids=tokens,quantities=quantities,as_of=now.isoformat())
+        return dict(condition_id=condition_id,token_ids=tokens,quantities=quantities,as_of=now.isoformat(),
+            source='authenticated GET /balance-allowance CONDITIONAL', observed_at=self.observation_time(now).isoformat(),
+            exchange_as_of=UNKNOWN,upstream_unit=UNKNOWN,upstream_precision=UNKNOWN,adapter_divisor='1000000')
 
-    def read_account_readiness(self, now, *, capital_usdc, identity, relayer):
+    def read_account_readiness(self, now, *, capital_usdc, identity, relayer, condition_id=None, known_order_ids=()):
         """Authenticated GET facts only. Authentication never proves a merge."""
         from decimal import Decimal
         from polymarket.environments import PRODUCTION
@@ -444,10 +470,11 @@ class ReadOnlySDK:
                 result['closed_only']=fact('PASS' if closed is False else 'FAIL','CLOSED_ONLY')
         except Exception:
             pass
-        orders=self.read_orders(now)
+        orders=self.read_orders(now,condition_id=condition_id,known_order_ids=known_order_ids)
         count=orders['legacy_order_count']
         if type(count) is int:
-            result['legacy_orders']=fact('PASS' if count==0 else 'FAIL','EXTERNAL_ORDERS_REQUIRE_HANDOFF')
+            result['legacy_orders']=dict(fact('PASS' if count==0 else 'FAIL','EXTERNAL_ORDERS_REQUIRE_HANDOFF'),
+                **{k:orders[k] for k in ('non_target_order_count','foreign_order_tails','owned_open_count','complete') if k in orders})
         try:
             region=self.read_region_policy()
             allowed=region['blocked'] is False or (region['blocked'] is True and region['country']=='JP' and closed is False)

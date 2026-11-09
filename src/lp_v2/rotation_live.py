@@ -1,6 +1,6 @@
 """Serial live-market rotation. Old risk remains owned until independently cleared."""
 from copy import deepcopy
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from threading import Event, Lock
 
@@ -20,6 +20,15 @@ class RotationRunner:
         self.clock, self.action_id, self.window_end = clock, action_id, window_end
         self.account_identity, self.relayer = account_identity, relayer
         self.control_run_id = control_run_id
+        self._candidate_failures = []
+        self._failed_sweeps = 0
+        self._next_retry_at = None
+        self._admission_proof = None
+        self._self_proofs = {}
+        self._proof_binding = None
+        if control_run_id is not None:
+            from lp_v2.rotation_state import runtime_proof_binding
+            self._proof_binding = runtime_proof_binding(config,action_id,window_end,control_run_id)
         self.stop = Event()
         from pathlib import Path
         from lp_v2.journal import Journal
@@ -39,6 +48,7 @@ class RotationRunner:
             self._blocker_phase = None
             self._clearance_blocker = None
             self._entry_blocker = None
+            self._exit_observation = None
             self._lock = Lock()
             self.exit_code = None
             identity = dict(owner=current.sdk.owner,wallet=current.sdk.wallet,signer=current.sdk.signer,
@@ -118,7 +128,8 @@ class RotationRunner:
             if seconds >= 900:
                 stuck_minutes = seconds / 60
         rotation = dict(current=self.current.condition_id if self.phase in ('running','exiting') else None, candidate=ranking.leader.condition_id if ranking.leader else None,
-            phase=self.phase, reason=self.reason, blocker=self.blocker, stuck_minutes=stuck_minutes, score_version=SCORE_VERSION,
+            phase=self.phase, reason=self.reason, blocker=self.blocker, exit_observation=self._exit_observation,
+            candidate_failures=self._candidate_failures,next_retry_at=self._next_retry_at, stuck_minutes=stuck_minutes, score_version=SCORE_VERSION,
             candidates=[dict(condition_id=c.condition_id,score=c.score,executable=c.reason is None,reason=c.reason)
                         for c in ranking.candidates],
             score_at=scan.scan['finished_at'] if scan else None, scan=scan.scan if scan else {},
@@ -136,6 +147,8 @@ class RotationRunner:
         ranking = self._ranking(scan)
         def policy(valid, at):
             self._entry_blocker = None
+            if valid is not True:
+                self._record_self_proof(self.current, at, False)
             # A seed that has never signed is still a new-market entry on restart.
             # Keep its entry gate without skipping the active runner's step.
             if valid and not self.current.sdk.journal.events('signed'):
@@ -144,10 +157,10 @@ class RotationRunner:
                     self.reason = waiting
                     return False
             if valid and self.control_run_id is not None:
-                from lp_v2.rotation_state import start_verification_passed
-                if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,at, on_error=self._startup_error):
+                self._record_self_proof(self.current, at, self.current._accounting_at == at and self.current.sdk.orders_verified())
+                if not self._startup_ready(self.current, at):
                     self.reason = 'waiting_seed_start_verification'
-                    return self.phase == 'running'
+                    return self.phase == 'running' and self._runtime_binding_valid()
             result = evaluate_rotation(ranking,current=self.current.condition_id,phase=self.phase,
                 complete=scan.complete if scan else False,current_valid=valid,now=at,window_end=self.window_end)
             if result.action == 'exit':
@@ -177,7 +190,11 @@ class RotationRunner:
                 complete_scan=self.scanner.latest(complete=True)
                 complete_ranking=self._ranking(complete_scan)
                 target = complete_ranking.leader.condition_id if complete_ranking.leader else None
-                code = self.current.drain(timeout_s=0)
+                observation = self._verified_exit
+                code = (self.current.finish_verified_exit(observation) if observation is not None
+                        else self.current.drain(timeout_s=0))
+                if observation is not None:
+                    self._exit_observation = observation
                 waiting = self._clearance_reason(self.clock())
                 if code == 0 and waiting is None:
                     self._transition('cleared', 'old_market_cleared', old, target,scan=complete_scan)
@@ -202,16 +219,18 @@ class RotationRunner:
             self._snapshot = self._build(now)
         return self.snapshot()
 
-    def _clearance_reason(self, now, *, runner=None):
+    def _clearance_reason(self, now, *, runner=None, require_accounting=False):
         from lp_v2.live_control.host import merge_history_report
         from lp_v2.models import OrderStatus
         runner = runner or self.current
         sdk, ledger = runner.sdk, runner.ledger
         readback = False
-        numbers = 'UNKNOWN'
+        from lp_v2.inventory_evidence import inventory_numbers
+        numbers = inventory_numbers(sdk.token_ids)
         safe_to_stop = 'UNKNOWN'
         diagnostic = None
         self._clearance_blocker = None
+        self._verified_exit = None
         def blocked(reason, code, *, order_id=None, detail=None):
             self._clearance_blocker = dict(diagnostic or detail or dict(code=code, order_tail=order_id[-8:] if order_id else None),
                                            numbers=numbers, safe_to_stop=safe_to_stop)
@@ -229,7 +248,8 @@ class RotationRunner:
                 diagnostic = unexpected_error(error, 'clearance_reconcile')
             state = ledger.snapshot()
         diagnostic = sdk.unexpected_error or diagnostic
-        if state.pending:
+        execution = sdk.execution_risk_verified()
+        if state.pending and not execution:
             return blocked('waiting_pending', 'pending_order', detail=sdk.readback_blocker)
         profile = dict(identity=dict(wallet_address=sdk.wallet), trading=dict(market_condition_id=sdk.condition_id))
         expected = {p['request'].merge_id for _, p in sdk.journal.events('merge_intent')}
@@ -245,20 +265,19 @@ class RotationRunner:
                     or any(not isinstance(q, Decimal) or not q.is_finite() or q < 0 for q in quantities.values())):
                 return blocked('waiting_readback', 'inventory_readback_invalid')
             recorded = {t:sum((p.quantity for p in state.positions if p.token_id == t),Decimal('0')) for t in sdk.token_ids}
-            numbers = dict(inventory=[dict(token=str(i+1), exchange=quantities[t], ledger=recorded[t],
-                difference=quantities[t]-recorded[t]) for i,t in enumerate(sdk.token_ids)])
+            numbers = inventory_numbers(sdk.token_ids, quantities, recorded, inventory)
             if any(quantities.values()):
                 safe_to_stop = False
-            if recorded != quantities:
+            if recorded != quantities and (require_accounting or any(quantities.values())):
                 return blocked('waiting_readback', 'inventory_mismatch')
             if any(quantities.values()):
                 return blocked('waiting_inventory', 'inventory_remaining', detail=sdk.readback_blocker)
             uncertain = next((o for o in state.orders if not o.authoritative or o.status == OrderStatus.LIVE), None)
-            if uncertain is not None:
+            if uncertain is not None and not execution:
                 return blocked('waiting_orders', 'orders_unverified', order_id=uncertain.order_id, detail=sdk.readback_blocker)
-            if not readback:
+            if not readback and (require_accounting or not execution):
                 return blocked('waiting_readback', 'reconciliation_unavailable', detail=sdk.readback_blocker)
-            owned = set(sdk.known_order_ids())
+            owned = set(sdk.owned_candidate_ids())
             failure_code = 'open_orders_unavailable'
             for page in sdk.client.list_open_orders():
                 for order in page.items:
@@ -270,9 +289,55 @@ class RotationRunner:
             from lp_v2.wait_policy import unexpected_error
             diagnostic = diagnostic or unexpected_error(error, 'balance' if failure_code == 'inventory_readback_unavailable' else 'open_orders')
             return blocked('waiting_readback', failure_code)
+        if not readback or recorded != quantities:
+            self._verified_exit = dict(condition_id=sdk.condition_id, at=now,
+                accounting='UNRECONCILED', numbers=numbers,
+                explanation='current_zero_inventory_and_no_execution_risk; historical_accounting_retained')
         if diagnostic is not None:
             self._clearance_blocker = dict(diagnostic, numbers=numbers, safe_to_stop=safe_to_stop)
         return None
+
+    def _record_self_proof(self, runner, now, success):
+        if self.control_run_id is None:
+            return
+        from lp_v2.rotation_state import runtime_proof_binding
+        try:
+            if runtime_proof_binding(self.config,self.action_id,self.window_end,self.control_run_id,on_error=self._startup_error) != self._proof_binding:
+                raise ValueError('physical run changed')
+        except Exception as error:
+            self._startup_error(error)
+            self._self_proofs.clear()
+            return
+        cid = runner.condition_id
+        if not success:
+            self._self_proofs.pop(cid, None)
+            return
+        moments = self._self_proofs.setdefault(cid, [])
+        if not moments or now > moments[-1]:
+            moments.append(now)
+            del moments[:-2]
+
+    def _runtime_binding_valid(self):
+        from lp_v2.rotation_state import runtime_proof_binding
+        try:
+            return runtime_proof_binding(self.config,self.action_id,self.window_end,self.control_run_id,
+                on_error=self._startup_error) == self._proof_binding
+        except Exception as error:
+            self._startup_error(error)
+            return False
+
+    def _startup_ready(self, runner, now):
+        if self.control_run_id is None:
+            return True
+        from lp_v2.rotation_state import runtime_proof_binding, start_verification_passed
+        try:
+            if runtime_proof_binding(self.config,self.action_id,self.window_end,self.control_run_id,on_error=self._startup_error) != self._proof_binding:
+                return False
+        except Exception as error:
+            self._startup_error(error)
+            return False
+        return (len(self._self_proofs.get(runner.condition_id, ())) == 2
+                or start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,now))
 
     def _startup_error(self, error):
         from lp_v2.wait_policy import unexpected_error
@@ -281,7 +346,8 @@ class RotationRunner:
 
     def _transition(self, phase, reason, old, new, *, result='PASS', scan=None):
         scan = scan if scan is not None else self.scanner.latest()
-        self.journal.append('rotation', dict(old_market=old,new_market=new,reason=reason,
+        self.journal.append('rotation', dict(admission_proof=self._admission_proof if reason=='entry_verified' else None,
+            old_market=old,new_market=new,reason=reason,
             score_version=SCORE_VERSION,score_at=scan.scan['finished_at'] if scan else None,
             scan_started_at=scan.scan['started_at'] if scan else None,
             scan_finished_at=scan.scan['finished_at'] if scan else None,
@@ -300,15 +366,15 @@ class RotationRunner:
         return None
 
     def _enter(self, now, old, scan):
-        self._entry_blocker = None
-        if self.control_run_id is not None:
-            from lp_v2.rotation_state import start_verification_passed
-            if not start_verification_passed(self.config,self.action_id,self.window_end,self.control_run_id,now, on_error=self._startup_error):
-                self.reason = 'waiting_seed_start_verification'
-                return
         if self.window_end is None or now >= self.window_end:
+            self._entry_blocker = None
             self.reason = 'needs_new_on'
             return
+        if self._next_retry_at is not None and now < self._next_retry_at:
+            self.reason = 'no_revalidated_candidate'
+            return
+        self._entry_blocker = None
+        failures = []
         # Historical uncertainty gates entry, never the active market's protection.
         waiting = self._historical_clearance_reason(now)
         if waiting is not None:
@@ -332,19 +398,28 @@ class RotationRunner:
                     raise _CandidateCheckFailure('fresh candidate no longer executable')
                 if any(not 0 <= (self.clock()-b.observed_at).total_seconds() <= 60 for b in plan.books):
                     raise _CandidateCheckFailure('stale entry books')
+                source = 'public_check'
                 checks = self.observations.public_preflight(now,target)
                 from lp_v2.live_control.workflow import PUBLIC
                 if not isinstance(checks,dict) or any(checks.get(key,{}).get('status') != 'PASS' for key in PUBLIC):
                     raise _CandidateCheckFailure('public checks')
                 source = 'account_check'
                 account = self.observations.read_account_readiness(now, capital_usdc=self.config.capital_usdc,
-                    identity=self.account_identity,relayer=self.relayer)
+                    identity=self.account_identity,relayer=self.relayer,condition_id=target,
+                    known_order_ids=tuple(oid for r in self._runners.values() for oid in r.sdk.owned_candidate_ids()))
                 required = ('balance','allowance','closed_only','legacy_orders','region','relayer_auth','proxy_execution')
                 if not isinstance(account,dict) or any(account.get(key,{}).get('status') != 'PASS' for key in required):
                     raise _CandidateCheckFailure('account checks')
                 candidate_runner = self._runner_for(plan)
-                if self._clearance_reason(self.clock(),runner=candidate_runner) is not None:
+                if self._clearance_reason(self.clock(),runner=candidate_runner,require_accounting=True) is not None:
+                    self._record_self_proof(candidate_runner, now, False)
+                    self._entry_blocker = self._entry_blocker or self._clearance_blocker
                     raise _CandidateCheckFailure('target inventory or retained history is not cleared')
+                if self.control_run_id is not None and not self._startup_ready(self.current, now):
+                    self._record_self_proof(candidate_runner, now, True)
+                    if not self._startup_ready(candidate_runner, now):
+                        self._transition('cleared', 'waiting_seed_start_verification', old, target, scan=scan)
+                        return
                 if self.clock() >= self.window_end:
                     self._transition('cleared', 'needs_new_on', old, None,scan=scan)
                     return
@@ -355,12 +430,23 @@ class RotationRunner:
                 from lp_v2.wait_policy import unexpected_error
                 self._entry_blocker = self._entry_blocker or (dict(code='no_revalidated_candidate')
                     if isinstance(error, _CandidateCheckFailure) else unexpected_error(error, source))
-                self.journal.append('revalidation',dict(condition_id=target,status='FAIL',reason='revalidation_failed',
-                    diagnostic=self._entry_blocker,at=self.clock()))
+                failures.append(dict(condition_id=target,source=source,diagnostic=(dict(code='no_revalidated_candidate',reason=str(error))
+                    if isinstance(error,_CandidateCheckFailure) else unexpected_error(error,source))))
                 continue
             # Once a target becomes active, an execution failure cannot cause
             # fallback into a second market. Its own recovery owns every intent.
             self._entry_blocker = None
+            self._candidate_failures = []
+            self._failed_sweeps = 0
+            self._next_retry_at = None
+            source_runner = candidate_runner if len(self._self_proofs.get(target,()))==2 else self.current
+            moments = self._self_proofs.get(source_runner.condition_id,())
+            self._admission_proof = None
+            if self._proof_binding is not None and len(moments)==2 and self._runtime_binding_valid():
+                from lp_v2.live_control.profiles import fingerprint
+                self._admission_proof = dict(action_id=self.action_id,run_id=self.control_run_id,
+                    window_end=self.window_end.isoformat(),process_sha256=fingerprint(self._proof_binding['process']),
+                    source_market=source_runner.condition_id,moments=[at.isoformat() for at in moments])
             self.current = candidate_runner
             self._transition('running', 'entry_verified', old, target,scan=scan)
             self.current.step(self.clock())
@@ -368,6 +454,13 @@ class RotationRunner:
             if self.clock() >= self.window_end and not any(p.get('activation_id') == activation for _,p in signed):
                 self._transition('cleared','needs_new_on',target,None)
             return
+        self._candidate_failures = failures
+        delay = (30,60,120,300)[min(self._failed_sweeps,3)]
+        self._failed_sweeps += 1
+        self._next_retry_at = now+timedelta(seconds=delay)
+        self._entry_blocker = dict(self._entry_blocker or dict(code='no_revalidated_candidate'),candidates=failures)
+        self.journal.append('revalidation',dict(status='FAIL',reason='revalidation_failed',
+            candidates=failures,next_retry_at=self._next_retry_at,at=now))
         self._transition('cleared', 'no_revalidated_candidate', old, None,scan=scan)
 
     def _runner_for(self, plan):

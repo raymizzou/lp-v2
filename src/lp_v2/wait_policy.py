@@ -8,7 +8,7 @@ WAIT_POLICIES = {
         'reconciliation_unavailable', 'round_readback_unavailable', 'current_unknown',
         'waiting_drain'), (600, 'Check exchange/network readback; provide summary to maintainer if persistent.')),
     **dict.fromkeys(('waiting_pending', 'pending_order', 'waiting_orders', 'orders_unverified',
-        'orders_remaining'), (1800, 'Verify or cancel owned orders at exchange; retain unresolved reservations.')),
+        'orders_remaining','OWNED_OPEN_ORDERS_REMAIN'), (1800, 'Verify or cancel owned orders at exchange; retain unresolved reservations.')),
     **dict.fromkeys(('waiting_merge', 'merge_unverified'),
         (1800, 'Verify merge transaction/receipt with relayer; retain reservation.')),
     **dict.fromkeys(('inventory_mismatch', 'inventory_remaining', 'waiting_inventory',

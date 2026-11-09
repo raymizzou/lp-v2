@@ -38,6 +38,7 @@ class LiveSDK:
         self._history_cache = None
         self.clock = clock
         self._cycle_at = None
+        self._absence = {}
         self.readback_blocker = None
         self.unexpected_error = None
 
@@ -223,14 +224,35 @@ class LiveSDK:
                       status,observed_at,not uncertain,cancels.get(oid))
         return OrderResult(r,Outcome.UNKNOWN if uncertain else Outcome.SUCCESS,order,observed_at)
 
-    def _missing_order(self, previous, candidates, cancels):
+    def order_not_open(self, order_id):
+        """Execution absence only; never releases fills, reserves or cost basis."""
+        return any(order_id in candidates and count >= 2
+                   for candidates, (_, count) in self._absence.items())
+
+    def _observe_absence(self, previous, candidates, opens):
+        key = tuple(candidates)
+        from lp_v2.inventory_evidence import absence_step
+        observation = absence_step(previous.request.expires_at,key,(o.id for o in opens),self._now(),
+                                   self._absence.get(key,(None,0)))
+        if observation[1]:
+            self._absence[key] = observation
+        else:
+            self._absence.pop(key,None)
+
+    def _missing_order(self, previous, candidates, cancels, *, allow_accounting=True, signed_candidates=()):
+        # Every signature identity must be absent, including uncertain acceptance hashes.
+        proof_ids = tuple(sorted(set(candidates) | set(signed_candidates)))
         # Iterator exhaustion is required: a later-page failure cannot prove absence.
         try:
             opens = tuple(o for page in self._pages('open_orders', self.client.list_open_orders, market=previous.request.quote.condition_id) for o in page.items)
             if any(not isinstance(o.id,str) or not o.id for o in opens):
                 raise ValueError('incomplete open order readback')
+            self._observe_absence(previous, proof_ids, opens)
         except Exception:
+            self._absence.pop(proof_ids, None)
             raise _ReadbackError('open_orders_unavailable') from None
+        if not allow_accounting:
+            return previous
         try:
             trades = self._trade_facts()
         except Exception:
@@ -303,13 +325,17 @@ class LiveSDK:
                     if self.readback_blocker is None:
                         self.readback_blocker = dict(code='order_readback_unavailable', order_tail=oid[-8:])
                 else:
+                    for proof_ids in tuple(self._absence):
+                        if oid in proof_ids:
+                            self._absence.pop(proof_ids,None)
                     found.append(self._observed_order(raw,oid,previous,cancels))
             if len(found) > 1:
                 raise ValueError('conflicting signed order identities')
             result = found[0] if found else previous
-            if not found and candidates and len(missing) == len(candidates):
+            if not found and candidates:
                 try:
-                    result = self._missing_order(previous,candidates,cancels)
+                    result = self._missing_order(previous,candidates,cancels,allow_accounting=len(missing)==len(candidates),
+                        signed_candidates=signed.get(key,{}).get('order_ids',()))
                 except Exception as error:
                     if self.readback_blocker is None:
                         code = str(error) if isinstance(error, _ReadbackError) else 'order_readback_unavailable'
@@ -338,13 +364,28 @@ class LiveSDK:
         return all((r.outcome == Outcome.FAILED and r.order is None)
                    or (r.order is not None and r.order.authoritative) for r in self._history().values())
 
+    def execution_risk_verified(self):
+        """Owned signed identities are terminal or separately proven NOT OPEN."""
+        signed = {p['request_id']:p for _,p in self.journal.events('signed')}
+        return all((r.outcome == Outcome.FAILED and r.order is None)
+            or (r.order is not None and ((r.order.authoritative and r.order.status != OrderStatus.LIVE)
+                                       or self.order_not_open(r.order.order_id)))
+            or (r.order is None and signed.get(key, {}).get('order_ids')
+                and self._absence.get(tuple(sorted(signed[key]['order_ids'])), (None, 0))[1] >= 2)
+            for key, r in self._history().items())
+
+    def owned_candidate_ids(self):
+        return tuple(sorted(set(self.known_order_ids()) | {
+            oid for _,p in self.journal.events('signed') for oid in p.get('order_ids',())}))
+
     def known_order_ids(self):
         return tuple(sorted(r.order.order_id for r in self._history().values() if r.order is not None))
 
     def known_open_order_ids(self):
         """Durable ownership only; this read never depends on exchange availability."""
         return tuple(sorted(r.order.order_id for r in self._history().values() if r.order is not None
-                            and (not r.order.authoritative or r.order.status == OrderStatus.LIVE)))
+                            and (not r.order.authoritative or r.order.status == OrderStatus.LIVE)
+                            and not self.order_not_open(r.order.order_id)))
 
     def cancel_order(self, order_id, *, at):
         known = next((r for r in self._history().values() if r.order and r.order.order_id == order_id), None)

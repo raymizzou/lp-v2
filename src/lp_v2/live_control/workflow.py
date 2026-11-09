@@ -16,7 +16,7 @@ STEP_REASONS={
     'state_identity':{'JOURNAL_FROZEN_IDENTITY','EXPLICIT_NEW_STATE','STATE_IDENTITY_UNAVAILABLE'},
     'single_executor':{'EXECUTOR_AND_LOCK','SERVICE_EVIDENCE_MISSING','LOCAL_EXECUTOR_HANDOFF','COMPETING_LOCAL_EXECUTOR','LOCAL_EXECUTOR_SCAN_INCOMPLETE'},
     'legacy_service':{'LEGACY_SERVICE_HANDOFF','LEGACY_SERVICE_UNAVAILABLE'},
-    'inventory_handoff':{'CONDITIONAL_IDENTITY_UNAVAILABLE','ACCOUNT_EVIDENCE_MISSING','CONDITIONAL_BALANCE_UNAVAILABLE','NEW_STATE_ZERO_CONDITIONAL_BALANCES','OWNED_STOPPED_INVENTORY_MATCH','CONDITIONAL_INVENTORY_UNMATCHED','STOPPED_HANDOFF_INCOMPLETE'},
+    'inventory_handoff':{'OWNED_OPEN_ORDERS_REMAIN','FRESH_ZERO_EXECUTION_RISK_CLEARED','CONDITIONAL_IDENTITY_UNAVAILABLE','ACCOUNT_EVIDENCE_MISSING','CONDITIONAL_BALANCE_UNAVAILABLE','NEW_STATE_ZERO_CONDITIONAL_BALANCES','OWNED_STOPPED_INVENTORY_MATCH','CONDITIONAL_INVENTORY_UNMATCHED','STOPPED_HANDOFF_INCOMPLETE'},
     'port':{'PORT_OWNER','SERVICE_EVIDENCE_MISSING'},
     'service':{'EFFECTIVE_SERVICE_CONTRACT','SERVICE_EVIDENCE_MISSING'},
     'balance':{'BALANCE_CAPITAL','ACCOUNT_EVIDENCE_MISSING'},
@@ -106,6 +106,9 @@ def normalize_report(profile,report):
         elif not fresh(row.get('as_of')):
             status='UNKNOWN';reason='CHECK_STALE_OR_MISSING_TIME'
         checks[key]=dict(status=status if status in ('PASS','FAIL') else 'UNKNOWN',reason=reason)
+        if key in ('inventory_handoff','legacy_orders') and compatible:
+            from lp_v2.inventory_evidence import safe_details
+            checks[key].update(safe_details(row))
     checks['public_market']=public_check(profile,report.get('public_market'))
     statuses=[check['status'] for check in checks.values()]
     return dict(schema_version=1,status='PASS' if all(s=='PASS' for s in statuses) else 'FAIL' if 'FAIL' in statuses else 'UNKNOWN',checks=checks)
@@ -181,6 +184,8 @@ def on(profile, *, action_id=None, window_end=None, prepare_env=False):
         opening=facts['checks']['public_market']['checks']['opening_eligibility']
         if 'details' in opening:
             opening['details'].pop('as_of',None)
+        for row in facts['checks'].get('inventory_handoff',{}).get('numbers',{}).get('inventory',[]):
+            row.pop('observed_at',None)
         return facts
     if confirmation_facts(current)!=confirmation_facts(report) or (current['status']!='PASS' and not preparable):
         return dict(status='UNKNOWN',reason='CONFIRMATION_FACTS_CHANGED',checks=current['checks'])
@@ -221,7 +226,7 @@ def verify_start(profile,started,*,action_id):
             snapshot=request(profile,'observe',run_id=run_id)
         except Exception:
             break
-        moment=valid_round(profile,run_id,snapshot,started['started_at'])
+        moment=valid_round(profile,run_id,snapshot,started['started_at'],action_id=action_id)
         if moment is not None and (previous is None or all(value>old for value,old in zip(moment,previous))):
             rounds+=1; previous=moment
             if rounds==2:
@@ -248,17 +253,26 @@ def verify_start(profile,started,*,action_id):
     return dict(status='UNKNOWN',reason='START_NOT_VERIFIED',phase='verify_live',run_id=run_id,action_id=action_id,rollback=rollback)
 
 
-def valid_round(profile,run_id,snapshot,started_at):
+def valid_round(profile,run_id,snapshot,started_at, *, action_id=None):
     from lp_v2.live_control.profiles import timestamp
     from lp_v2.live_control.identity import same_identity,matching_tail
     try:
         row=snapshot['summary']; markets=row['markets']; accounting=row['accounting']
+        seed=profile['trading']['market_condition_id']
+        market=markets[0]['condition_id'] if len(markets)==1 else None
+        if market!=seed:
+            proof=snapshot['rotation_verification']
+            if (action_id is None or proof.get('status')!='PASS' or proof['action_id']!=action_id
+                    or proof['run_id']!=run_id or proof['seed_market']!=seed or proof['current_market']!=market
+                    or timestamp(proof['started_at'])!=timestamp(started_at)
+                    or not timestamp(started_at)<timestamp(proof['window_end'])):
+                return None
         if (snapshot['run_id']!=run_id or snapshot['executor_running'] is not True or snapshot['readonly_stopped'] is not True
                 or not same_identity(snapshot['identity'],profile['identity']) or row['mode']!='live'
                 or row['capital_usdc']!=profile['trading']['capital_usdc']
                 or row['run']['code_sha']!=profile['release']['expected_sha']
                 or not matching_tail(row['run']['wallet_tail'],profile['identity']['wallet_address'])
-                or len(markets)!=1 or markets[0]['condition_id']!=profile['trading']['market_condition_id']
+                or len(markets)!=1 or market is None
                 or markets[0].get('eligible') is not True or markets[0].get('skip_reason','MISSING') is not None
                 or accounting['status']!='SUCCESS'
                 or not all(fresh(value) and timestamp(value)>timestamp(started_at) for value in

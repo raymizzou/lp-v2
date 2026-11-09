@@ -1026,13 +1026,11 @@ def test_restart_drains_retained_owned_history(tmp_path):
 
 
 def test_fast_scan_cannot_rotate_before_seed_start_verification(tmp_path,monkeypatch):
-    import copy,json
+    import json
     from pathlib import Path
     from datetime import datetime as RealDateTime
     import datetime as datetime_module
     from lp_v2.live_runtime import create_live_runner
-    from lp_v2.live_control.profiles import atomic_json
-    from lp_v2.journal import Journal
     config,ex,current,record,seen=factory_boundary(tmp_path,monkeypatch)
     class Clock(RealDateTime):
         @classmethod
@@ -1044,37 +1042,44 @@ def test_fast_scan_cannot_rotate_before_seed_start_verification(tmp_path,monkeyp
     runner.step(current[0])
     assert runner.current.condition_id==CID
     assert tuple(s.token_id for s in ex.posts)==TOKENS
+    assert tuple(s.taker_amount for s in ex.posts)==(10000000,10000000)
+    assert runner.entered_count==0
+    runner.step(current[0]) # Reusing the same successful observation is not round two.
+    assert runner.current.condition_id==CID and runner.entered_count==0
+    assert tuple(s.token_id for s in ex.posts)==TOKENS
+    path=Path(config.state_dir)/'live-control-run.json'
+    assert 'startup_verified' not in json.loads(path.read_text())
     from lp_v2.live_control.host import record_start_observation
     request=dict(profile=record['profile'],run_id=record['run_id'],action_id=record['action_id'])
     def observation(runtime):
         return dict(run_id=record['run_id'],executor_running=True,readonly_stopped=True,
                     identity=record['profile']['identity'],summary=runtime.snapshot())
-    current[0]+=timedelta(seconds=10);runner.step(current[0])
+    current[0]+=timedelta(seconds=10);report=runner.step(current[0])
+    assert report['rotation']['current']==BID and report['rotation']['entered_count']==1
+    assert tuple(s.token_id for s in ex.posts)==('101','102','201','202')
+    assert len(ex.posts)==4
+    assert 'startup_verified' not in json.loads(path.read_text())
+    # External observation remains compatible, but follows the legitimate local
+    # admission rather than manufacturing a required pair of seed observations.
     assert record_start_observation(request,observation(runner))['verified_rounds']==1
+    runner.step(current[0])
     assert record_start_observation(request,observation(runner))['verified_rounds']==1
-    runner.close()
-    runner=create_live_runner(config,clock=lambda:current[0])
-    runner.scanner.scan_once(current[0])
+    assert runner.current.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
     current[0]+=timedelta(seconds=10);runner.step(current[0])
-    assert runner.current.condition_id==CID and len(ex.posts)==2
     result=record_start_observation(request,observation(runner))
     assert result['status']=='PASS' and result['verified_rounds']==2
-    path=Path(config.state_dir)/'live-control-run.json'
-    verified=json.loads(path.read_text())
-    for field in ('action_id','run_id'):
-        corrupt=copy.deepcopy(verified);corrupt['startup_verified'][field]='f'*32
-        atomic_json(path,corrupt)
-        current[0]+=timedelta(seconds=10);runner.step(current[0])
-        assert runner.current.condition_id==CID and len(ex.posts)==2
-    atomic_json(path,verified)
-    current[0]+=timedelta(seconds=10);report=runner.step(current[0])
-    assert report['rotation']['current']==BID
-    assert tuple(s.token_id for s in ex.posts)==('101','102','201','202')
+    verified=json.loads(path.read_text())['startup_verified']
+    assert (verified['action_id'],verified['run_id'],verified['window_end'])==(record['action_id'],record['run_id'],record['window_end'])
+    assert json.loads((Path(config.state_dir)/'process.json').read_text())['run_id']==record['run_id']
+    # Actual action/run/process/window tamper and duplicate/failed/restarted
+    # pre-admission proofs are independently exercised by the seven public
+    # test_self_proof_preserves_current_binding_and_consecutive_rounds cases.
     before=tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))
+    assert len(before)==2
     runner.close()
     runner=create_live_runner(config,clock=lambda:current[0])
     current[0]+=timedelta(seconds=10);runner.step(current[0])
-    assert runner.current.condition_id==BID and len(ex.posts)==4
+    assert runner.current.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
     assert tuple(p['request_id'] for _,p in runner.sdk.journal.events('signed'))==before
     runner.close()
 
