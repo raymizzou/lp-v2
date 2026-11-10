@@ -15,11 +15,12 @@ class _CandidateCheckFailure(ValueError):
 
 class RotationRunner:
     def __init__(self, config, current, scanner, *, action_id, window_end,
-                 clock=lambda: datetime.now(UTC), account_identity=None, relayer=None, control_run_id=None):
+                 clock=lambda: datetime.now(UTC), account_identity=None, relayer=None, control_run_id=None, exit_only=False):
         self.config, self.current, self.scanner = config, current, scanner
         self.clock, self.action_id, self.window_end = clock, action_id, window_end
         self.account_identity, self.relayer = account_identity, relayer
         self.control_run_id = control_run_id
+        self._exit_only = exit_only
         self._candidate_failures = []
         self._failed_sweeps = 0
         self._next_retry_at = None
@@ -80,6 +81,16 @@ class RotationRunner:
                 self._transition('running', 'initial_market', current.condition_id, current.condition_id)
             for historical in historical_identities:
                 self._runner_for_market(historical['condition_id'],tuple(historical['token_ids']))
+            if self._exit_only:
+                if action_id is None or control_run_id is None or window_end is None:
+                    raise ValueError('exit-only recovery authorization missing')
+                if not any(fact['action_id']==action_id and fact['run_id']==control_run_id
+                        and fact['window_end']==window_end and fact['market']==self.current.condition_id
+                        for _,fact in self.journal.events('recovery_mode')):
+                    self.journal.append('recovery_mode',dict(mode='exit_only',action_id=action_id,
+                        run_id=control_run_id,window_end=window_end,market=self.current.condition_id,
+                        source_seq=self.journal.last_sequence('rotation')))
+                self.reason='exit_only_recovery'
             if (events and action_id is not None and action_id != events[-1][1]['action_id']):
                 # A new confirmed on starts from its checked seed only after every
                 # retained market independently proves flat. Restarting the same on
@@ -128,7 +139,8 @@ class RotationRunner:
             if seconds >= 900:
                 stuck_minutes = seconds / 60
         rotation = dict(current=self.current.condition_id if self.phase in ('running','exiting') else None, candidate=ranking.leader.condition_id if ranking.leader else None,
-            phase=self.phase, reason=self.reason, blocker=self.blocker, exit_observation=self._exit_observation,
+            phase=self.phase, reason=self.reason, recovery_mode='exit_only' if self._exit_only else 'normal',
+            blocker=self.blocker, exit_observation=self._exit_observation,
             candidate_failures=self._candidate_failures,next_retry_at=self._next_retry_at, stuck_minutes=stuck_minutes, score_version=SCORE_VERSION,
             candidates=[dict(condition_id=c.condition_id,score=c.score,executable=c.reason is None,reason=c.reason)
                         for c in ranking.candidates],
@@ -151,6 +163,11 @@ class RotationRunner:
                 valid is True and observed is not None and self.current.sdk.orders_verified())
         def policy(valid, at, *, round_observation=None):
             self._entry_blocker = None
+            if self._exit_only:
+                self._record_self_proof(self.current,at,False)
+                if self.phase!='exiting':
+                    self._transition('exiting','exit_only_recovery',self.current.condition_id,None)
+                return False
             record_round(valid, at)
             # A seed that has never signed is still a new-market entry on restart.
             # Keep its entry gate without skipping the active runner's step.
@@ -181,7 +198,7 @@ class RotationRunner:
             self.current.step(now, opening_policy=policy)
         elif self.phase in ('cleared','revalidating'):
             recovery_observation = None
-            if self.control_run_id is not None and not self._startup_ready(self.current, now):
+            if not self._exit_only and self.control_run_id is not None and not self._startup_ready(self.current, now):
                 # A restarted cleared executor still owns its journal. Collect real
                 # serialized rounds without reopening either old or candidate quotes.
                 self.current.stop.clear()
@@ -386,6 +403,10 @@ class RotationRunner:
         return None
 
     def _enter(self, now, old, scan):
+        if self._exit_only:
+            self._entry_blocker=dict(code='needs_new_on')
+            self.reason='exit_only_requires_new_on'
+            return
         if self.window_end is None or now >= self.window_end:
             self._entry_blocker = None
             self.reason = 'needs_new_on'

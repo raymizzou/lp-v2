@@ -18,7 +18,7 @@ WAIT_POLICIES = {
         (1800, 'Inspect scan coverage and candidate check failures; retry after correction.')),
     **dict.fromkeys(('waiting_seed_start_verification', 'STOPPED_HANDOFF_INCOMPLETE'),
         (0, 'Check bound startup/stopped-run proof with operator; existing admission gates remain.')),
-    **dict.fromkeys(('needs_new_on', 'window_expired'),
+    **dict.fromkeys(('needs_new_on', 'window_expired', 'exit_only_recovery', 'exit_only_requires_new_on'),
         (0, 'Request a new explicitly confirmed live on authorization.')),
     **dict.fromkeys(('current_invalid', 'higher_score'),
         (3600, 'Inspect exit recovery blockers; wait for existing risk clearance.')),

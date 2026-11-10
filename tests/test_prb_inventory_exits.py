@@ -1056,3 +1056,202 @@ def test_saved_rotation_factory_rejects_malformed_authorization(tmp_path,monkeyp
     finally:
         if restored is not None:restored.close()
     assert facts()==before and len(ex.posts)==posts and ex.sdk.create_limit_order.call_count==signed
+
+
+def active_market_recovery_http(monkeypatch,ex,market):
+    route=httpx.HTTPTransport.handle_request
+    state=dict(market=market,region='allowed',seed_closed=False)
+    def handle(self,r):
+        response=route(self,r)
+        cid=r.url.params.get('condition_ids')
+        if r.url.path=='/markets/keyset' and cid in (CID,BID):
+            if cid==BID and state['market']=='network':return httpx.Response(503,json={},request=r)
+            data=response.json()
+            data['markets']=[dict(row,closed=(state['seed_closed'] if row['conditionId']==CID else state['market']=='closed'))
+                             for row in data['markets']]
+            return httpx.Response(200,json=data,request=r)
+        if r.url.path=='/markets/'+BID:
+            return httpx.Response(200,json=dict(in_play=None if state['market']=='unknown' else state['market']=='in_play'),request=r)
+        if r.url.path=='/api/geoblock' and state['region']!='allowed':
+            if state['region']=='network':return httpx.Response(503,json={},request=r)
+            return httpx.Response(200,json=dict(blocked=None if state['region']=='unknown' else True,
+                country='JP' if state['region']=='jp-closed-only' else 'US'),request=r)
+        if r.url.path=='/auth/ban-status/closed-only' and state['region']=='jp-closed-only':
+            return httpx.Response(200,json=dict(closed_only=True),request=r)
+        if r.url.path=='/balance-allowance' and r.url.params.get('asset_type')=='CONDITIONAL':
+            return httpx.Response(200,json=dict(balance=str(int(ex.quantities.get(r.url.params['token_id'],D(0))*1000000)),allowances={}),request=r)
+        return response
+    monkeypatch.setattr(httpx.HTTPTransport,'handle_request',handle)
+    return state
+
+
+def active_recovery_world(tmp_path,monkeypatch,phase,market,*,filled=False):
+    from tests.test_rotation_live import factory_boundary
+    from lp_v2.live_runtime import create_live_runner
+    config,ex,clock,record,seen=factory_boundary(tmp_path,monkeypatch)
+    read_clock=shared_runtime_clock(monkeypatch,clock,'advancing')
+    runner=create_live_runner(config,clock=read_clock)
+    try:
+        runner.scanner.scan_once(clock[0]);runner.step(clock[0])
+        clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+        assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
+        state=active_market_recovery_http(monkeypatch,ex,market)
+        if filled:
+            own_id=next(result.order.order_id for _,result in runner.sdk.journal.events('order_result')
+                if result.order is not None and result.request.quote.condition_id==BID
+                and result.request.quote.token_id=='201' and result.request.purpose=='opening')
+            ex.fill(own_id,'1','.40',at=clock[0]+timedelta(seconds=1))
+            trade=ex.trades[-1];wallet=runner.sdk.wallet
+            ex.trades[-1]=trade.model_copy(update=dict(maker_address=wallet,
+                maker_orders=[m.model_copy(update=dict(maker_address=wallet)) for m in trade.maker_orders]))
+            clock[0]+=timedelta(seconds=10);runner.current.step(clock[0],allow_open=False)
+            position=runner.current.ledger.snapshot().positions[0]
+            assert position.quantity==D(1) and position.cost_usdc==D('.40')
+        if phase=='exiting':
+            ex.cancel_unknown=True;clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+        assert runner.phase==phase
+        ex.orders['foreign']=ex.orders['order-3'].model_copy(update=dict(id='foreign',maker_address='0x'+'9'*40))
+        runner.close();ex.cancel_unknown=False
+        return ex,clock,record,seen,config,state
+    except BaseException:
+        runner.close();raise
+
+
+@pytest.mark.parametrize('phase,market',[('running','closed'),('running','in_play'),('exiting','closed'),('exiting','in_play')],
+    ids=['running-closed','running-in_play','exiting-closed','exiting-in_play'])
+def test_ineligible_active_restart_drains_without_replay(tmp_path,monkeypatch,phase,market):
+    from lp_v2.live_runtime import create_live_runner
+    from lp_v2.journal import Journal
+    from pathlib import Path
+    ex,clock,record,seen,config,state=active_recovery_world(tmp_path,monkeypatch,phase,market)
+    path=Path(config.state_dir)/'markets'/BID/'journal.sqlite'
+    journal=Journal(path,readonly=True);before=(journal.events('intent'),journal.events('signed'));journal.close()
+    runner=None
+    try:
+        runner=create_live_runner(config,clock=lambda:clock[0])
+        for _ in range(3):
+            clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+            assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
+            assert ex.orders['foreign'].status=='LIVE'
+        assert report['phase']=='cleared' and report['reason']=='exit_only_requires_new_on'
+        assert report['recovery_mode']=='exit_only'
+        assert ex.orders['order-3'].status==ex.orders['order-4'].status=='CANCELED'
+        assert (runner.sdk.journal.events('intent'),runner.sdk.journal.events('signed'))==before
+        runner.close();runner=None
+        runner=create_live_runner(config,clock=lambda:clock[0])
+        state['market']='eligible'
+        for _ in range(3):
+            clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+            assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
+            assert report['reason']=='exit_only_requires_new_on' and report['recovery_mode']=='exit_only'
+            assert ex.orders['foreign'].status=='LIVE'
+        assert (runner.sdk.journal.events('intent'),runner.sdk.journal.events('signed'))==before
+    finally:
+        if runner is not None:runner.close()
+
+
+@pytest.mark.parametrize('phase,market',[('running','closed'),('running','in_play'),('exiting','closed'),('exiting','in_play')],
+    ids=['running-closed','running-in_play','exiting-closed','exiting-in_play'])
+def test_ineligible_active_restart_preserves_owned_inventory(tmp_path,monkeypatch,phase,market):
+    from lp_v2.live_runtime import create_live_runner
+    ex,clock,record,seen,config,state=active_recovery_world(tmp_path,monkeypatch,phase,market,filled=True)
+    runner=None
+    try:
+        runner=create_live_runner(config,clock=lambda:clock[0])
+        original_openings=tuple(p['request'].request_id for _,p in runner.sdk.journal.events('intent') if p['request'].purpose=='opening')
+        fills=runner.sdk.journal.events('fill');foreign=ex.orders['foreign']
+        clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+        position=runner.current.ledger.snapshot().positions[0]
+        assert position.condition_id==BID and position.token_id=='201'
+        assert position.quantity==D(1) and position.cost_usdc==D('.40')
+        assert report['phase']=='exiting' and report['recovery_mode']=='exit_only'
+        assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
+        ex.quantities['201']=D(0)
+        clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+        row=report['blocker']['numbers']['inventory'][0]
+        assert (row['exchange'],row['ledger'],row['difference'])==('0','1','-1')
+        assert row['upstream_precision']==row['upstream_unit']=='UNKNOWN'
+        assert runner.current.ledger.snapshot().positions[0]==position
+        assert report['phase']=='exiting' and runner.entered_count==1 and len(ex.posts)==4
+        ex.quantities['201']=D(1)
+        clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
+        assert runner.current.ledger.snapshot().positions[0]==position
+        assert report['phase']=='exiting' and len(ex.posts)==4
+        assert runner.sdk.journal.events('fill')==fills
+        state['market']='eligible'
+        clock[0]+=timedelta(seconds=10);runner.step(clock[0])
+        requests=tuple(p['request'] for _,p in runner.sdk.journal.events('intent'))
+        assert tuple(r.request_id for r in requests if r.purpose=='opening')==original_openings
+        assert any(r.purpose=='hedge' and r.quote.condition_id==BID for r in requests)
+        assert all(r.purpose in ('opening','hedge') and r.quote.condition_id==BID for r in requests)
+        assert runner.entered_count==1 and runner.condition_id==BID
+        assert runner.current.ledger.snapshot().positions[0]==position
+        assert ex.orders['foreign']==foreign
+    finally:
+        if runner is not None:runner.close()
+
+
+def owned_execution_facts(state):
+    from pathlib import Path
+    from lp_v2.journal import Journal
+    result={}
+    for path in (Path(state)/'markets').glob('*/journal.sqlite'):
+        journal=Journal(path,readonly=True)
+        result[str(path)]=(journal.events('intent'),journal.events('signed'));journal.close()
+    return result
+
+
+@pytest.mark.parametrize('problem',['market-network','market-unknown','region-denied','region-unknown','region-network','jp-closed-only','new-on-closed-seed'])
+def test_ineligible_active_factory_refuses_untrusted_recovery(tmp_path,monkeypatch,problem):
+    from dataclasses import replace
+    from lp_v2.live_runtime import create_live_runner
+    from lp_v2.live_control.profiles import atomic_json
+    from pathlib import Path
+    ex,clock,record,seen,config,state=active_recovery_world(tmp_path,monkeypatch,'running','closed')
+    if problem in ('market-network','market-unknown'):
+        state['market']='network' if problem=='market-network' else 'unknown'
+    elif problem in ('region-denied','region-unknown','region-network'):
+        state['region']=problem.removeprefix('region-')
+    elif problem=='jp-closed-only':
+        state['region']='jp-closed-only';ex.sdk.get_closed_only_mode.return_value=True
+    else:
+        state['seed_closed']=True;clock[0]+=timedelta(seconds=10)
+        path=Path(config.state_dir)
+        current=dict(record,action_id='c'*32,run_id='d'*32,started_at=clock[0].isoformat())
+        atomic_json(path/'live-control-run.json',current)
+        atomic_json(path/'process.json',dict(run_id='d'*32,pid=1234,identity='fake-boot:123'))
+        config=replace(config,started_at=clock[0])
+    before=owned_execution_facts(config.state_dir);posts=len(ex.posts);signed=ex.sdk.create_limit_order.call_count
+    runner=None
+    try:
+        with pytest.raises(ValueError):runner=create_live_runner(config,clock=lambda:clock[0])
+    finally:
+        if runner is not None:runner.close()
+    assert owned_execution_facts(config.state_dir)==before
+    assert len(ex.posts)==posts and ex.sdk.create_limit_order.call_count==signed
+
+
+@pytest.mark.parametrize('field',['mode','action','run','window','market'])
+def test_exit_only_recovery_rejects_corrupt_binding(tmp_path,monkeypatch,field):
+    from pathlib import Path
+    from lp_v2.live_runtime import create_live_runner
+    from lp_v2.journal import Journal
+    ex,clock,record,seen,config,state=active_recovery_world(tmp_path,monkeypatch,'running','closed')
+    recovered=create_live_runner(config,clock=lambda:clock[0])
+    recovered.close();state['market']='eligible'
+    journal=Journal(Path(config.state_dir)/'rotation.sqlite');fact=journal.events('recovery_mode')[-1][1]
+    changed=dict(fact)
+    if field=='mode':changed['mode']='UNKNOWN'
+    if field=='action':changed['action_id']='c'*32
+    if field=='run':changed['run_id']='c'*32
+    if field=='window':changed['window_end']=fact['window_end']+timedelta(seconds=1)
+    if field=='market':changed['market']=CID
+    journal.append('recovery_mode',changed);journal.close()
+    before=owned_execution_facts(config.state_dir);posts=len(ex.posts);signed=ex.sdk.create_limit_order.call_count
+    runner=None
+    try:
+        with pytest.raises(ValueError):runner=create_live_runner(config,clock=lambda:clock[0])
+    finally:
+        if runner is not None:runner.close()
+    assert owned_execution_facts(config.state_dir)==before
+    assert len(ex.posts)==posts and ex.sdk.create_limit_order.call_count==signed

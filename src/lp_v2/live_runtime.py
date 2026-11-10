@@ -473,7 +473,7 @@ def _saved_rotation(config, action_id, window_end):
     """Validate persisted serial identity before consulting retired seed markets."""
     from pathlib import Path
     from lp_v2.cli import owner_file
-    from lp_v2.journal import Journal
+    from lp_v2.journal import Journal,decode
     from lp_v2.rotation_state import validate_histories,active_market,market_path,runtime_proof_binding
     from lp_v2.live_control.profiles import read_json
     state=Path(config.state_dir);path=state/'rotation.sqlite'
@@ -498,6 +498,8 @@ def _saved_rotation(config, action_id, window_end):
     journal=Journal(path,readonly=True)
     try:
         known=journal.events('rotation_identity');events=journal.events('rotation')
+        modes=journal.events('recovery_mode')
+        sources={seq:decode(payload) for seq,payload in journal.db.execute("SELECT seq,payload FROM events WHERE kind='rotation'")}
     finally:
         journal.close()
     expected=dict(owner=owner,wallet=config.credentials.wallet_address,signer=config.credentials.signer_address,
@@ -517,7 +519,26 @@ def _saved_rotation(config, action_id, window_end):
             raise ValueError('persisted rotation authorization malformed')
     if last['action_id']==action_id and last['window_end']!=window_end:
         raise ValueError('persisted rotation window changed')
-    return dict(seed_tokens=seed_tokens,active=active,active_tokens=tuple(histories[active]['token_ids']),
+    exit_only=False
+    for _,fact in modes:
+        if (not isinstance(fact,dict) or fact.get('mode')!='exit_only'
+                or type(fact.get('source_seq')) is not int or fact['source_seq'] not in sources
+                or not isinstance(fact.get('action_id'),str) or not re.fullmatch('[0-9a-f]{32}',fact['action_id'])
+                or not isinstance(fact.get('run_id'),str) or not re.fullmatch('[0-9a-f]{32}',fact['run_id'])
+                or not isinstance(fact.get('window_end'),datetime) or fact['window_end'].tzinfo is None
+                or fact['window_end'].utcoffset() is None):
+            raise ValueError('persisted recovery mode malformed')
+        source=sources[fact['source_seq']]
+        market=source['new_market'] if source['phase']=='running' else source['old_market']
+        if (source['phase'] not in ('running','exiting') or fact.get('market') not in histories
+                or fact['market']!=market or fact['action_id']!=source['action_id']
+                or fact['window_end']!=source['window_end']):
+            raise ValueError('persisted recovery source mismatch')
+        if fact['action_id']==action_id:
+            if (fact['run_id']!=process['run_id'] or fact['window_end']!=window_end or fact['market']!=active):
+                raise ValueError('persisted recovery binding mismatch')
+            exit_only=True
+    return dict(exit_only=exit_only,seed_tokens=seed_tokens,active=active,active_tokens=tuple(histories[active]['token_ids']),
                 phase=last['phase'],same_on=last['action_id']==action_id)
 
 
@@ -555,10 +576,12 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         if not 1 <= len(selected) <= 3 or len(set(selected)) != len(selected):
             raise ValueError('invalid frozen market list')
         saved = None
+        exit_only = False
         if len(selected)==1:
             from lp_v2.rotation_state import read_control_window
             action_id,window_end=read_control_window(config)
             saved=_saved_rotation(config,action_id,window_end)
+            exit_only=saved is not None and saved['exit_only']
         markets = {}
         for cid in selected:
             actual = saved['active'] if saved is not None and saved['same_on'] else cid
@@ -566,9 +589,11 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
                 rows=observations.read_fixed_market(clock() if saved is not None and saved['same_on'] else config.started_at,actual)
             except Exception as error:
                 from lp_v2.readonly_sdk import FixedMarketIneligible
-                if (saved is None or not saved['same_on'] or saved['phase'] not in ('cleared','revalidating')
+                if (saved is None or not saved['same_on'] or saved['phase'] not in ('running','exiting','cleared','revalidating')
                         or not isinstance(error,FixedMarketIneligible)):
                     raise MarketCheckFailure(actual) from None
+                if saved['phase'] in ('running','exiting'):
+                    exit_only=True
             else:
                 observed_tokens=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
                 if saved is not None and saved['same_on'] and observed_tokens!=saved['active_tokens']:
@@ -587,6 +612,17 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         if (client.wallet_type != 'POLY_PROXY' or str(client.wallet).lower() != c.wallet_address.lower()
                 or str(client.signer).lower() != c.signer_address.lower()):
             raise ValueError('signing and L2 identities disagree')
+        if exit_only:
+            from httpx import HTTPStatusError
+            try:
+                region=observations.read_region_policy()
+                blocked,country=region.get('blocked'),region.get('country')
+                allowed=(type(blocked) is bool and isinstance(country,str) and len(country)==2
+                    and (blocked is False or (country=='JP' and client.get_closed_only_mode() is False)))
+            except HTTPStatusError:
+                raise ValueError('exit-only recovery region unavailable or denied') from None
+            if not allowed:
+                raise ValueError('exit-only recovery region unavailable or denied')
         identity=dict(owner='lp-v2:'+c.wallet_address.lower(),condition_id=selected[0],token_ids=tokens)
         shared_path=Path(config.state_dir)/'journal.sqlite'
         frozen_markets = len(selected) > 1
@@ -622,7 +658,7 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         scanner = ScanWorker(observations.new_scan_sdk(),clock=clock)
         return RotationRunner(config,current,scanner,action_id=action_id,window_end=window_end,clock=clock,
             account_identity=dict(signer_address=c.signer_address,wallet_address=c.wallet_address,signature_type=c.signature_type),
-            relayer=relayer_payload,control_run_id=control_run_id)
+            relayer=relayer_payload,control_run_id=control_run_id,exit_only=exit_only)
     except BaseException:
         if scanner is not None:
             scanner.stop(0)
