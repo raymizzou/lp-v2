@@ -82,6 +82,7 @@ class LiveRunner:
                 if not reconciled:
                     raise ValueError('owned order readback remains uncertain')
                 self._accounting_at = now
+                execution_clear = self.sdk.execution_risk_verified()
                 unavailable = set()
                 market_ineligible = False
                 if hasattr(self.observations,'read_fixed_market'):
@@ -151,7 +152,11 @@ class LiveRunner:
                     # Missing observations still deny opening without ending the run.
                     valid = (False if market_ineligible or region_valid is False or any(not eligible_market(p.market) for p in plans)
                              else True if allowed and plans else None)
-                    allow_open = opening_policy(valid, now)
+                    allow_open = opening_policy(valid, now, round_observation=dict(
+                        condition_id=self.condition_id,accounting_at=accounting_at,
+                        accounting_verified=reconciled,orders_verified=self.sdk.orders_verified(),
+                        execution_clear=execution_clear,market_ineligible=market_ineligible,
+                        region_allowed=allowed))
                 decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
                 if decision is not None:
                     for c in decision.cancel:
@@ -185,7 +190,7 @@ class LiveRunner:
                 self.blocker = self.sdk.unexpected_error or self.sdk.readback_blocker or unexpected_error(error, source)
                 if opening_policy is not None:
                     from lp_v2.readonly_sdk import FixedMarketIneligible
-                    opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)
+                    opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now, round_observation=None)
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
                 self._valuation_at = self._income_at = None
                 self._valuations.clear()
@@ -464,6 +469,58 @@ class MarketCheckFailure(ValueError):
         super().__init__(self.reason_code)
 
 
+def _saved_rotation(config, action_id, window_end):
+    """Validate persisted serial identity before consulting retired seed markets."""
+    from pathlib import Path
+    from lp_v2.cli import owner_file
+    from lp_v2.journal import Journal
+    from lp_v2.rotation_state import validate_histories,active_market,market_path,runtime_proof_binding
+    from lp_v2.live_control.profiles import read_json
+    state=Path(config.state_dir);path=state/'rotation.sqlite'
+    if not path.exists() and not path.is_symlink():
+        return None
+    if action_id is None:
+        raise ValueError('persisted rotation authorization missing')
+    process=read_json(state/'process.json')
+    runtime_proof_binding(config,action_id,window_end,process['run_id'])
+    owner='lp-v2:'+config.credentials.wallet_address.lower()
+    import sqlite3
+    try:
+        histories={row['condition_id']:row for row in validate_histories(state,owner)}
+    except sqlite3.Error:
+        raise ValueError('persisted market history unavailable') from None
+    for cid in histories:
+        with owner_file(market_path(state,cid)):pass
+    if config.market not in histories:
+        raise ValueError('persisted seed identity missing')
+    seed_tokens=tuple(histories[config.market]['token_ids'])
+    with owner_file(path):pass
+    journal=Journal(path,readonly=True)
+    try:
+        known=journal.events('rotation_identity');events=journal.events('rotation')
+    finally:
+        journal.close()
+    expected=dict(owner=owner,wallet=config.credentials.wallet_address,signer=config.credentials.signer_address,
+                  seed_market=config.market,seed_tokens=seed_tokens)
+    if not known or any(identity!=expected for _,identity in known) or not events:
+        raise ValueError('persisted rotation identity unavailable')
+    active=active_market(state,config.market,owner)
+    last=events[-1][1]
+    import re
+    if 'action_id' not in last or 'window_end' not in last:
+        raise ValueError('persisted rotation authorization missing')
+    saved_action,saved_end=last['action_id'],last['window_end']
+    if saved_action is not None or saved_end is not None:
+        if (not isinstance(saved_action,str) or not re.fullmatch('[0-9a-f]{32}',saved_action)
+                or not isinstance(saved_end,datetime) or saved_end.tzinfo is None
+                or saved_end.utcoffset() is None):
+            raise ValueError('persisted rotation authorization malformed')
+    if last['action_id']==action_id and last['window_end']!=window_end:
+        raise ValueError('persisted rotation window changed')
+    return dict(seed_tokens=seed_tokens,active=active,active_tokens=tuple(histories[active]['token_ids']),
+                phase=last['phase'],same_on=last['action_id']==action_id)
+
+
 def create_live_runner(config, *, public=None, http=None, clock=None):
     import json
     from pathlib import Path
@@ -497,13 +554,26 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         selected = config.markets or (config.market,)
         if not 1 <= len(selected) <= 3 or len(set(selected)) != len(selected):
             raise ValueError('invalid frozen market list')
+        saved = None
+        if len(selected)==1:
+            from lp_v2.rotation_state import read_control_window
+            action_id,window_end=read_control_window(config)
+            saved=_saved_rotation(config,action_id,window_end)
         markets = {}
         for cid in selected:
+            actual = saved['active'] if saved is not None and saved['same_on'] else cid
             try:
-                rows=observations.read_fixed_market(config.started_at,cid)
-            except Exception:
-                raise MarketCheckFailure(cid) from None
-            markets[cid]=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
+                rows=observations.read_fixed_market(clock() if saved is not None and saved['same_on'] else config.started_at,actual)
+            except Exception as error:
+                from lp_v2.readonly_sdk import FixedMarketIneligible
+                if (saved is None or not saved['same_on'] or saved['phase'] not in ('cleared','revalidating')
+                        or not isinstance(error,FixedMarketIneligible)):
+                    raise MarketCheckFailure(actual) from None
+            else:
+                observed_tokens=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
+                if saved is not None and saved['same_on'] and observed_tokens!=saved['active_tokens']:
+                    raise ValueError('persisted active token identity changed')
+            markets[cid]=(saved['seed_tokens'] if saved is not None and saved['same_on'] else observed_tokens)
         tokens=markets[selected[0]]
         with owner_file(config.relayer_credentials_file) as source:
             try:

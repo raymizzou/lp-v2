@@ -149,7 +149,7 @@ class RotationRunner:
             observed = self.current._accounting_at
             self._record_self_proof(self.current, observed if valid is True else at,
                 valid is True and observed is not None and self.current.sdk.orders_verified())
-        def policy(valid, at):
+        def policy(valid, at, *, round_observation=None):
             self._entry_blocker = None
             record_round(valid, at)
             # A seed that has never signed is still a new-market entry on restart.
@@ -180,16 +180,29 @@ class RotationRunner:
         if self.phase in ('running','exiting'):
             self.current.step(now, opening_policy=policy)
         elif self.phase in ('cleared','revalidating'):
+            recovery_observation = None
             if self.control_run_id is not None and not self._startup_ready(self.current, now):
                 # A restarted cleared executor still owns its journal. Collect real
                 # serialized rounds without reopening either old or candidate quotes.
                 self.current.stop.clear()
                 self.current.exit_code = None
-                def recovery_policy(valid, at):
-                    record_round(valid, at)
+                def recovery_policy(valid, at, *, round_observation=None):
+                    nonlocal recovery_observation
+                    # Only this actual already-cleared executor cycle may use the
+                    # explicit market exclusion; region/UNKNOWN failures never do.
+                    facts = round_observation or {}
+                    if (valid is False and facts.get('condition_id') == self.current.condition_id
+                            and all(facts.get(key) is True for key in ('accounting_verified',
+                                'orders_verified','execution_clear','market_ineligible','region_allowed'))):
+                        recovery_observation = facts['accounting_at']
+                    else:
+                        recovery_observation = None
+                        record_round(valid, at)
                     return False
                 self.current.step(now,opening_policy=recovery_policy)
             waiting = self._clearance_reason(now)
+            if recovery_observation is not None:
+                self._record_self_proof(self.current,recovery_observation,waiting is None)
             if waiting:
                 self._transition('exiting',waiting,self.current.condition_id,None)
             else:
