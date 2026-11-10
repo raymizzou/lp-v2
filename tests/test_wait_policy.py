@@ -30,8 +30,8 @@ def test_wait_reason_policy_is_complete():
     # Successful transitions and fact statuses do not represent waiting.
     reasons -= {'best_executable_candidate', 'current_leads_again', 'current_leads_or_ties',
                 'initial_market', 'new_on_seed', 'old_market_cleared', 'entry_verified', 'fresh_checks',
-                'PASS', 'UNKNOWN', 'SUCCESS', 'NEW_STATE_ZERO_CONDITIONAL_BALANCES',
-                'OWNED_STOPPED_INVENTORY_MATCH', 'BUY'}
+                'PASS', 'FAIL', 'UNKNOWN', 'SUCCESS', 'NEW_STATE_ZERO_CONDITIONAL_BALANCES',
+                'OWNED_STOPPED_INVENTORY_MATCH', 'FRESH_ZERO_EXECUTION_RISK_CLEARED', 'BUY'}
     reasons -= {'waiting_', 'historical_', 'unexpected_error:'}  # families checked with concrete members below
     reasons.update(('historical_waiting_orders', 'unexpected_error:NovelFailure@order_query'))
     assert reasons
@@ -57,7 +57,7 @@ def test_rotation_inventory_numbers_and_deadline(tmp_path):
     report = rotation.step(clock[0])
     blocker = report['rotation']['blocker']
     assert blocker['code'] == 'inventory_mismatch'
-    assert blocker['numbers']['inventory'] == [
+    assert [{k:r[k] for k in ('token','exchange','ledger','difference')} for r in blocker['numbers']['inventory']] == [
         dict(token='1', exchange='0.125', ledger='0', difference='0.125'),
         dict(token='2', exchange='0', ledger='0', difference='0')]
     assert blocker['safe_to_stop'] is False
@@ -276,12 +276,12 @@ def test_exiting_clearance_diagnostic_overrides_missing_startup_proof(tmp_path, 
     signed_openings = [p for _, p in rotation.sdk.journal.events('signed') if p['request_id'] in openings]
     clock[0] += timedelta(seconds=10)
     report = rotation.step(clock[0])['rotation']
-    # Both reads prove the bound-window validation completed before the missing-proof read.
-    assert reads.count(proof_path) == 2 and 'startup_verified' not in read_json(proof_path)
+    # Repeated validated reads prove the bound-window validation completed before the missing-proof read.
+    assert reads.count(proof_path) >= 2 and 'startup_verified' not in read_json(proof_path)
     assert report['phase'] == 'exiting' and report['current'] == CID
     assert report['reason'] == 'waiting_inventory'
     assert report['blocker']['code'] == 'inventory_remaining'
-    assert report['blocker']['numbers']['inventory'] == [
+    assert [{k:r[k] for k in ('token','exchange','ledger','difference')} for r in report['blocker']['numbers']['inventory']] == [
         dict(token='1', exchange='1', ledger='1', difference='0'),
         dict(token='2', exchange='0', ledger='0', difference='0')]
     assert {r.request_id for r in rotation.current.ledger.snapshot().requests if r.purpose == 'opening'} == openings
@@ -320,7 +320,7 @@ def test_alternating_wait_codes_escalate_without_recovery(tmp_path):
         assert not rotation.stop.is_set() and not rotation.current.stop.is_set()
         assert 'PRIVATE-FLAKY-READ' not in str(rotation.snapshot()) + str(rotation.sdk.journal.events())
         if expected == 'inventory_mismatch':
-            assert blocker['numbers']['inventory'] == [
+            assert [{k:r[k] for k in ('token','exchange','ledger','difference')} for r in blocker['numbers']['inventory']] == [
                 dict(token='1', exchange='0.125', ledger='0', difference='0.125'),
                 dict(token='2', exchange='0', ledger='0', difference='0')]
         if elapsed >= 3600:

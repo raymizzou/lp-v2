@@ -356,7 +356,9 @@ def test_conditional_inventory_is_independent_of_opening_eligibility():
         try:
             assert sdk.public_preflight(AT,CID)['in_play']['status']=='BLOCKED'
             data=sdk.read_conditional_inventory(AT,CID)
-            assert data==dict(condition_id=CID,token_ids=('101','102'),quantities={'101':D('0'),'102':D('1.234567')},as_of=AT.isoformat())
+            assert {k:data[k] for k in ('condition_id','token_ids','quantities','as_of')}==dict(condition_id=CID,token_ids=('101','102'),quantities={'101':D('0'),'102':D('1.234567')},as_of=AT.isoformat())
+            assert data['source']=='authenticated GET /balance-allowance CONDITIONAL'
+            assert data['upstream_unit']==data['upstream_precision']=='UNKNOWN'
             for bad in (True,'NaN','-1','0.5',None):
                 scenario['balance']=bad
                 with pytest.raises(ValueError):sdk.read_conditional_inventory(AT,CID)

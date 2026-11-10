@@ -82,6 +82,7 @@ class LiveRunner:
                 if not reconciled:
                     raise ValueError('owned order readback remains uncertain')
                 self._accounting_at = now
+                execution_clear = self.sdk.execution_risk_verified()
                 unavailable = set()
                 market_ineligible = False
                 if hasattr(self.observations,'read_fixed_market'):
@@ -151,7 +152,11 @@ class LiveRunner:
                     # Missing observations still deny opening without ending the run.
                     valid = (False if market_ineligible or region_valid is False or any(not eligible_market(p.market) for p in plans)
                              else True if allowed and plans else None)
-                    allow_open = opening_policy(valid, now)
+                    allow_open = opening_policy(valid, now, round_observation=dict(
+                        condition_id=self.condition_id,accounting_at=accounting_at,
+                        accounting_verified=reconciled,orders_verified=self.sdk.orders_verified(),
+                        execution_clear=execution_clear,market_ineligible=market_ineligible,
+                        region_allowed=allowed))
                 decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
                 if decision is not None:
                     for c in decision.cancel:
@@ -185,7 +190,7 @@ class LiveRunner:
                 self.blocker = self.sdk.unexpected_error or self.sdk.readback_blocker or unexpected_error(error, source)
                 if opening_policy is not None:
                     from lp_v2.readonly_sdk import FixedMarketIneligible
-                    opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now)
+                    opening_policy(False if isinstance(error, FixedMarketIneligible) else None, now, round_observation=None)
                 self._m4 = {key:UNKNOWN for key in (*M4_FIELDS,'net_profit')}
                 self._valuation_at = self._income_at = None
                 self._valuations.clear()
@@ -373,6 +378,18 @@ class LiveRunner:
             except Exception:
                 self.sdk.journal.append('diagnostic',dict(at=self.clock(),reason='owned cancel unavailable'))
 
+    def finish_verified_exit(self, observation):
+        """Rotation's fresh zero-risk observation ends execution, retaining accounting."""
+        self.stop.set()
+        state = self.ledger.snapshot()
+        self.sdk.journal.append('exit_observation', observation)
+        self.sdk.journal.append('stop_result', dict(at=self.clock(), exit_code=0,
+            orders=state.orders,pending=state.pending,positions=state.positions,merges=state.merges,
+            reconciliation=UNKNOWN,accounting_as_of=self._accounting_at,exit_observation=observation,
+            inventory=self._audit(self.clock(),False,self._last_plans)['inventory']))
+        self.exit_code = 0
+        return 0
+
     def drain(self, *, timeout_s=90, monotonic=None, wait=None):
         from time import monotonic as real_monotonic, sleep
         from lp_v2.models import OrderStatus
@@ -452,6 +469,79 @@ class MarketCheckFailure(ValueError):
         super().__init__(self.reason_code)
 
 
+def _saved_rotation(config, action_id, window_end):
+    """Validate persisted serial identity before consulting retired seed markets."""
+    from pathlib import Path
+    from lp_v2.cli import owner_file
+    from lp_v2.journal import Journal,decode
+    from lp_v2.rotation_state import validate_histories,active_market,market_path,runtime_proof_binding
+    from lp_v2.live_control.profiles import read_json
+    state=Path(config.state_dir);path=state/'rotation.sqlite'
+    if not path.exists() and not path.is_symlink():
+        return None
+    if action_id is None:
+        raise ValueError('persisted rotation authorization missing')
+    process=read_json(state/'process.json')
+    runtime_proof_binding(config,action_id,window_end,process['run_id'])
+    owner='lp-v2:'+config.credentials.wallet_address.lower()
+    import sqlite3
+    try:
+        histories={row['condition_id']:row for row in validate_histories(state,owner)}
+    except sqlite3.Error:
+        raise ValueError('persisted market history unavailable') from None
+    for cid in histories:
+        with owner_file(market_path(state,cid)):pass
+    if config.market not in histories:
+        raise ValueError('persisted seed identity missing')
+    seed_tokens=tuple(histories[config.market]['token_ids'])
+    with owner_file(path):pass
+    journal=Journal(path,readonly=True)
+    try:
+        known=journal.events('rotation_identity');events=journal.events('rotation')
+        modes=journal.events('recovery_mode')
+        sources={seq:decode(payload) for seq,payload in journal.db.execute("SELECT seq,payload FROM events WHERE kind='rotation'")}
+    finally:
+        journal.close()
+    expected=dict(owner=owner,wallet=config.credentials.wallet_address,signer=config.credentials.signer_address,
+                  seed_market=config.market,seed_tokens=seed_tokens)
+    if not known or any(identity!=expected for _,identity in known) or not events:
+        raise ValueError('persisted rotation identity unavailable')
+    active=active_market(state,config.market,owner)
+    last=events[-1][1]
+    import re
+    if 'action_id' not in last or 'window_end' not in last:
+        raise ValueError('persisted rotation authorization missing')
+    saved_action,saved_end=last['action_id'],last['window_end']
+    if saved_action is not None or saved_end is not None:
+        if (not isinstance(saved_action,str) or not re.fullmatch('[0-9a-f]{32}',saved_action)
+                or not isinstance(saved_end,datetime) or saved_end.tzinfo is None
+                or saved_end.utcoffset() is None):
+            raise ValueError('persisted rotation authorization malformed')
+    if last['action_id']==action_id and last['window_end']!=window_end:
+        raise ValueError('persisted rotation window changed')
+    exit_only=False
+    for _,fact in modes:
+        if (not isinstance(fact,dict) or fact.get('mode')!='exit_only'
+                or type(fact.get('source_seq')) is not int or fact['source_seq'] not in sources
+                or not isinstance(fact.get('action_id'),str) or not re.fullmatch('[0-9a-f]{32}',fact['action_id'])
+                or not isinstance(fact.get('run_id'),str) or not re.fullmatch('[0-9a-f]{32}',fact['run_id'])
+                or not isinstance(fact.get('window_end'),datetime) or fact['window_end'].tzinfo is None
+                or fact['window_end'].utcoffset() is None):
+            raise ValueError('persisted recovery mode malformed')
+        source=sources[fact['source_seq']]
+        market=source['new_market'] if source['phase']=='running' else source['old_market']
+        if (source['phase'] not in ('running','exiting') or fact.get('market') not in histories
+                or fact['market']!=market or fact['action_id']!=source['action_id']
+                or fact['window_end']!=source['window_end']):
+            raise ValueError('persisted recovery source mismatch')
+        if fact['action_id']==action_id:
+            if (fact['run_id']!=process['run_id'] or fact['window_end']!=window_end or fact['market']!=active):
+                raise ValueError('persisted recovery binding mismatch')
+            exit_only=True
+    return dict(exit_only=exit_only,seed_tokens=seed_tokens,active=active,active_tokens=tuple(histories[active]['token_ids']),
+                phase=last['phase'],same_on=last['action_id']==action_id)
+
+
 def create_live_runner(config, *, public=None, http=None, clock=None):
     import json
     from pathlib import Path
@@ -485,13 +575,30 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         selected = config.markets or (config.market,)
         if not 1 <= len(selected) <= 3 or len(set(selected)) != len(selected):
             raise ValueError('invalid frozen market list')
+        saved = None
+        exit_only = False
+        if len(selected)==1:
+            from lp_v2.rotation_state import read_control_window
+            action_id,window_end=read_control_window(config)
+            saved=_saved_rotation(config,action_id,window_end)
+            exit_only=saved is not None and saved['exit_only']
         markets = {}
         for cid in selected:
+            actual = saved['active'] if saved is not None and saved['same_on'] else cid
             try:
-                rows=observations.read_fixed_market(config.started_at,cid)
-            except Exception:
-                raise MarketCheckFailure(cid) from None
-            markets[cid]=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
+                rows=observations.read_fixed_market(clock() if saved is not None and saved['same_on'] else config.started_at,actual)
+            except Exception as error:
+                from lp_v2.readonly_sdk import FixedMarketIneligible
+                if (saved is None or not saved['same_on'] or saved['phase'] not in ('running','exiting','cleared','revalidating')
+                        or not isinstance(error,FixedMarketIneligible)):
+                    raise MarketCheckFailure(actual) from None
+                if saved['phase'] in ('running','exiting'):
+                    exit_only=True
+            else:
+                observed_tokens=tuple(t.token_id for t in rows[0]['plan'].market.tokens)
+                if saved is not None and saved['same_on'] and observed_tokens!=saved['active_tokens']:
+                    raise ValueError('persisted active token identity changed')
+            markets[cid]=(saved['seed_tokens'] if saved is not None and saved['same_on'] else observed_tokens)
         tokens=markets[selected[0]]
         with owner_file(config.relayer_credentials_file) as source:
             try:
@@ -505,6 +612,17 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         if (client.wallet_type != 'POLY_PROXY' or str(client.wallet).lower() != c.wallet_address.lower()
                 or str(client.signer).lower() != c.signer_address.lower()):
             raise ValueError('signing and L2 identities disagree')
+        if exit_only:
+            from httpx import HTTPStatusError
+            try:
+                region=observations.read_region_policy()
+                blocked,country=region.get('blocked'),region.get('country')
+                allowed=(type(blocked) is bool and isinstance(country,str) and len(country)==2
+                    and (blocked is False or (country=='JP' and client.get_closed_only_mode() is False)))
+            except HTTPStatusError:
+                raise ValueError('exit-only recovery region unavailable or denied') from None
+            if not allowed:
+                raise ValueError('exit-only recovery region unavailable or denied')
         identity=dict(owner='lp-v2:'+c.wallet_address.lower(),condition_id=selected[0],token_ids=tokens)
         shared_path=Path(config.state_dir)/'journal.sqlite'
         frozen_markets = len(selected) > 1
@@ -540,7 +658,7 @@ def create_live_runner(config, *, public=None, http=None, clock=None):
         scanner = ScanWorker(observations.new_scan_sdk(),clock=clock)
         return RotationRunner(config,current,scanner,action_id=action_id,window_end=window_end,clock=clock,
             account_identity=dict(signer_address=c.signer_address,wallet_address=c.wallet_address,signature_type=c.signature_type),
-            relayer=relayer_payload,control_run_id=control_run_id)
+            relayer=relayer_payload,control_run_id=control_run_id,exit_only=exit_only)
     except BaseException:
         if scanner is not None:
             scanner.stop(0)
