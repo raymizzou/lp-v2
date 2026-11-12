@@ -58,9 +58,9 @@ def test_recover_current_leader_and_expired_window():
     assert (result.action, result.target, result.reason) == ('resume', 'a', 'current_leads_again')
     ranking = rank_candidates((a, replace(b, market=replace(b.market, rewards_daily_rate=1000))), startup_cap=D('100'))
     for phase, valid, current, expected in (
-        ('running', True, 'a', ('hold', None, 'window_expired')),
+        ('running', True, 'a', ('exit', 'b', 'higher_score')),
         ('running', False, 'a', ('exit', None, 'current_invalid')),
-        ('cleared', False, None, ('hold', None, 'needs_new_on')),
+        ('cleared', False, None, ('enter', 'b', 'best_executable_candidate')),
     ):
         result = evaluate_rotation(ranking, current=current, phase=phase, complete=True,
             current_valid=valid, now=AT+timedelta(minutes=5), window_end=AT+timedelta(minutes=5))

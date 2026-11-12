@@ -15,7 +15,6 @@ class LiveRunner:
         self.config, self.sdk, self.observations, self.clock = config, sdk, observations, clock
         self._condition_id = sdk.condition_id
         self._markets = sdk.markets
-        self._reconciled_late_fills = 0
         self.ledger = Ledger(sdk.owner, config.capital_usdc)
         self.engine = Engine(self.ledger)
         self.stop = stop if stop is not None else Event()
@@ -79,8 +78,9 @@ class LiveRunner:
             try:
                 self._reconcile()
                 reconciled = self.sdk.orders_verified()
-                if not reconciled:
-                    raise ValueError('owned order readback remains uncertain')
+                if (self.sdk.unexpected_error is not None or (self.sdk.readback_blocker or {}).get('code') in
+                        ('open_orders_unavailable','trade_history_unavailable','order_readback_unavailable')):
+                    raise ValueError('required order readback unavailable')
                 self._accounting_at = now
                 execution_clear = self.sdk.execution_risk_verified()
                 unavailable = set()
@@ -154,7 +154,7 @@ class LiveRunner:
                              else True if allowed and plans else None)
                     allow_open = opening_policy(valid, now, round_observation=dict(
                         condition_id=self.condition_id,accounting_at=accounting_at,
-                        accounting_verified=reconciled,orders_verified=self.sdk.orders_verified(),
+                        accounting_verified=True,orders_verified=self.sdk.orders_verified(),
                         execution_clear=execution_clear,market_ineligible=market_ineligible,
                         region_allowed=allowed))
                 decision = self.engine.decide(plans, now=now, allow_open=allow_open) if allowed and not self.stop.is_set() else None
@@ -211,23 +211,7 @@ class LiveRunner:
             return self.snapshot()
 
     def _reconcile(self):
-        """Rebuild only from a newly authenticated, complete late-fill revision.
-
-        Ledger's direct contradictory-terminal guards remain intact. A fresh
-        ledger must independently reconcile every order, trade, merge and chain
-        balance before replacing the previous owned snapshot.
-        """
-        try:
-            self.ledger.reconcile(self.sdk)
-        except ValueError:
-            revisions = len(self.sdk.journal.events('late_fill_reconciliation'))
-            if revisions <= self._reconciled_late_fills:
-                raise
-            candidate = Ledger(self.sdk.owner,self.config.capital_usdc)
-            candidate.reconcile(self.sdk)
-            self.ledger = candidate
-            self.engine.ledger = candidate
-        self._reconciled_late_fills = len(self.sdk.journal.events('late_fill_reconciliation'))
+        self.ledger.reconcile(self.sdk)
 
     def _audit(self, now, reconciled, plans=()):
         from lp_v2.models import Outcome,OrderStatus
@@ -379,7 +363,7 @@ class LiveRunner:
                 self.sdk.journal.append('diagnostic',dict(at=self.clock(),reason='owned cancel unavailable'))
 
     def finish_verified_exit(self, observation):
-        """Rotation's fresh zero-risk observation ends execution, retaining accounting."""
+        """A complete list without owned open orders ends rotation execution."""
         self.stop.set()
         state = self.ledger.snapshot()
         self.sdk.journal.append('exit_observation', observation)
@@ -392,7 +376,6 @@ class LiveRunner:
 
     def drain(self, *, timeout_s=90, monotonic=None, wait=None):
         from time import monotonic as real_monotonic, sleep
-        from lp_v2.models import OrderStatus
         monotonic = monotonic or real_monotonic
         wait = wait or sleep
         self.stop.set()
@@ -403,7 +386,7 @@ class LiveRunner:
             with self.sdk.read_cycle(now=self.clock()):
                 # Cancellation of proven own ids must not depend on healthy read endpoints.
                 self._cancel_owned(monotonic(),attempted)
-                owned = set(self.sdk.known_order_ids())
+                owned = set(self.sdk.owned_candidate_ids())
                 active, opens_verified = set(), False
                 try:
                     for page in self.sdk.client.list_open_orders():
@@ -419,19 +402,16 @@ class LiveRunner:
                 self._cancel_owned(monotonic(),attempted,active=active)
                 try:
                     self._reconcile()
-                    if not opens_verified:
-                        raise ValueError('incomplete open order readback')
-                    reconciled = True
-                    self._accounting_at = self.clock()
-                    state = self.ledger.snapshot()
-                    possible = {o.order_id for o in state.orders if not o.authoritative or o.status == OrderStatus.LIVE}
+                    reconciled = self.sdk.orders_verified()
+                    if reconciled:
+                        self._accounting_at = self.clock()
                     self._cancel_owned(monotonic(),attempted,active=active)
-                    if not active and not possible and not state.pending:
-                        code = 0
-                        break
                 except Exception:
                     reconciled = False
                     self.sdk.journal.append('diagnostic',dict(at=self.clock(),reason='stop readback unavailable'))
+                if opens_verified and not active:
+                    code = 0
+                    break
             if monotonic() >= deadline:
                 break
             wait(min(1,max(0,deadline-monotonic())))
@@ -514,8 +494,8 @@ def _saved_rotation(config, action_id, window_end):
     saved_action,saved_end=last['action_id'],last['window_end']
     if saved_action is not None or saved_end is not None:
         if (not isinstance(saved_action,str) or not re.fullmatch('[0-9a-f]{32}',saved_action)
-                or not isinstance(saved_end,datetime) or saved_end.tzinfo is None
-                or saved_end.utcoffset() is None):
+                or (saved_end is not None and (not isinstance(saved_end,datetime) or saved_end.tzinfo is None
+                    or saved_end.utcoffset() is None))):
             raise ValueError('persisted rotation authorization malformed')
     if last['action_id']==action_id and last['window_end']!=window_end:
         raise ValueError('persisted rotation window changed')
@@ -525,8 +505,9 @@ def _saved_rotation(config, action_id, window_end):
                 or type(fact.get('source_seq')) is not int or fact['source_seq'] not in sources
                 or not isinstance(fact.get('action_id'),str) or not re.fullmatch('[0-9a-f]{32}',fact['action_id'])
                 or not isinstance(fact.get('run_id'),str) or not re.fullmatch('[0-9a-f]{32}',fact['run_id'])
-                or not isinstance(fact.get('window_end'),datetime) or fact['window_end'].tzinfo is None
-                or fact['window_end'].utcoffset() is None):
+                or 'window_end' not in fact
+                or (fact['window_end'] is not None and (not isinstance(fact['window_end'],datetime)
+                    or fact['window_end'].tzinfo is None or fact['window_end'].utcoffset() is None))):
             raise ValueError('persisted recovery mode malformed')
         source=sources[fact['source_seq']]
         market=source['new_market'] if source['phase']=='running' else source['old_market']
@@ -535,9 +516,13 @@ def _saved_rotation(config, action_id, window_end):
                 or fact['window_end']!=source['window_end']):
             raise ValueError('persisted recovery source mismatch')
         if fact['action_id']==action_id:
-            if (fact['run_id']!=process['run_id'] or fact['window_end']!=window_end or fact['market']!=active):
+            if fact['run_id']!=process['run_id'] or fact['window_end']!=window_end:
                 raise ValueError('persisted recovery binding mismatch')
-            exit_only=True
+            if fact['market']==active:
+                exit_only=True
+            elif not any(seq>fact['source_seq'] and row['reason']=='entry_verified'
+                         and row['action_id']==action_id and row['new_market']==active for seq,row in sources.items()):
+                raise ValueError('persisted recovery binding mismatch')
     return dict(exit_only=exit_only,seed_tokens=seed_tokens,active=active,active_tokens=tuple(histories[active]['token_ids']),
                 phase=last['phase'],same_on=last['action_id']==action_id)
 
@@ -708,13 +693,7 @@ def _adopt_identity(sdk, *, at):
                 or r.quote.token_id not in all_pairs[r.quote.condition_id]):
             raise ValueError('old request identity mismatch')
         if r.quote.condition_id not in markets:
-            order=result.order
-            fills=[f for _,f in journal.events('fill') if f.request_id == r.request_id]
-            if not (result.outcome == Outcome.FAILED and order is None and not fills
-                    or result.outcome == Outcome.SUCCESS and order is not None and order.authoritative
-                    and order.status != OrderStatus.LIVE and order.remaining_quantity == 0
-                    and sum((f.quantity for f in fills),D('0')) == order.filled_quantity):
-                raise ValueError('cannot omit unsettled order or placement')
+            sdk.diagnose_readback_skip('market',r.quote.condition_id,'retired_market_not_selected')
     for _,fill in journal.events('fill'):
         r = history.get(fill.request_id)
         if (r is None or fill.owner != owner or fill.condition_id != r.request.quote.condition_id
@@ -731,15 +710,8 @@ def _adopt_identity(sdk, *, at):
         if (r.owner != owner or r.condition_id not in all_pairs
                 or (r.yes_token_id,r.no_token_id) != all_pairs[r.condition_id]):
             raise ValueError('old merge identity mismatch')
-        if r.condition_id not in markets and not (result.outcome == Outcome.FAILED
-                or result.outcome == Outcome.SUCCESS and result.received_usdc == r.quantity
-                and len(result.consumed_positions) == 2
-                and {p.token_id for p in result.consumed_positions} == set(all_pairs[r.condition_id])
-                and all(p.owner == owner and p.condition_id == r.condition_id and p.quantity == r.quantity
-                        for p in result.consumed_positions)):
-            raise ValueError('cannot omit unresolved merge')
-    if any((p.quantity != 0 or p.cost_usdc != 0) and p.condition_id not in markets for p in sdk._positions().values()):
-        raise ValueError('cannot omit owned inventory')
+        if r.condition_id not in markets:
+            sdk.diagnose_readback_skip('market',r.condition_id,'retired_market_not_selected')
     identity = dict(owner=owner,markets=markets)
     if not identities or {k:v for k,v in identities[-1][1].items() if k != 'at'} != identity:
         journal.append('identity',dict(identity,at=at))

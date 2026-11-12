@@ -104,9 +104,14 @@ def test_missing_preflight_capability_is_not_pass(config_home,profile,monkeypatc
 
 
 def test_on_requires_current_confirmation(config_home,profile,monkeypatch,capsys):
-    for scenario in ('missing','expired','profile_change','identity_change'):
+    for scenario in ('missing','profile_change','identity_change','expired'):
         calls=[]; data=ready_report(profile)
-        def handler(req): calls.append(req['action']); return data
+        now=datetime.now(UTC);rounds=iter([now-timedelta(seconds=2),now-timedelta(seconds=1)])
+        def handler(req):
+            calls.append(req['action'])
+            if req['action']=='on':return dict(status='ACCEPTED',run_id='f'*32,started_at=(now-timedelta(seconds=3)).isoformat())
+            if req['action']=='observe':return live_snapshot(profile,'f'*32,next(rounds).isoformat())
+            return data
         install_ssh(monkeypatch,handler)
         path=config_home/'profiles/tokyo.json'; path.write_text(json.dumps(profile))
         def confirm(prompt):
@@ -117,10 +122,16 @@ def test_on_requires_current_confirmation(config_home,profile,monkeypatch,capsys
             return '' if scenario=='missing' else 'on'
         monkeypatch.setattr('builtins.input',confirm)
         end='2000-01-01T00:00:00+00:00' if scenario=='expired' else '2099-01-01T00:00:00+00:00'
-        assert main(['live','on','--window-end',end])==2
-        assert 'on' not in calls
-        assert not (config_home/'operations').exists() or not list((config_home/'operations').glob('*.json'))
-        assert any(word in capsys.readouterr().out for word in ('CONFIRMATION','CHANGED','FAIL'))
+        assert main(['live','on','--window-end',end])==(0 if scenario=='expired' else 2)
+        output=capsys.readouterr().out
+        if scenario=='expired':
+            assert calls==['check','check','on','observe','observe']
+            assert json.loads(output.splitlines()[-1])['verified_rounds']==2
+            assert len(list((config_home/'operations').glob('*.json')))==1
+        else:
+            assert 'on' not in calls
+            assert not (config_home/'operations').exists() or not list((config_home/'operations').glob('*.json'))
+            assert any(word in output for word in ('CONFIRMATION','CHANGED','FAIL'))
 
 
 def live_snapshot(profile,run_id,at):
@@ -423,10 +434,16 @@ def test_on_rejects_fresh_protective_pause(combined_world,monkeypatch,capsys):
     world=combined_world;monkeypatch.setattr('builtins.input',lambda _:'on')
     for scenario in ('protective','missing'):
         world.pause=scenario;before=len(world.mutations)
-        assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
+        assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==(0 if scenario=='protective' else 2)
         report=json.loads(capsys.readouterr().out.splitlines()[-1])
-        assert report['phase']=='verify_live' and report['status']!='PASS'
-        assert report['rollback']['drain']=='PASS' and report['rollback']['readonly_restored'] is True
+        if scenario=='protective':
+            assert report['status']=='PASS' and report['reason']=='INELIGIBLE' and report['verified_rounds']==2
+            assert 'rollback' not in report and world.lease is not None
+            assert world.mutations[before:]==[('stop','lp-v2.service'),('start','lp-v2-live.service')]
+            assert main(['live','off'])==0;capsys.readouterr()
+        else:
+            assert report['phase']=='verify_live' and report['status']!='PASS'
+            assert report['rollback']['drain']=='PASS' and report['rollback']['readonly_restored'] is True
         assert world.mutations[before:]==[('stop','lp-v2.service'),('start','lp-v2-live.service'),('stop','lp-v2-live.service'),('start','lp-v2.service')]
         assert world.lease is None and world.readonly is True
     world.pause=None
@@ -471,7 +488,7 @@ def test_handoff_rechecked_under_lock_before_switch(combined_world,monkeypatch,c
     def lock_boundary(path,*args,**kw):
         fd=original_open(path,*args,**kw)
         if str(path)==str(Path(profile['files']['state_dir'])/'control.lock'):
-            held.append(scenario)
+            held.append((scenario,world.requests[-1]['action']))
             if scenario=='legacy':world.legacy_active=True
             if scenario=='alternate':world.extra_processes[45678]=['/alternate/lp-v2','run','--live','--state-dir','/elsewhere']
             if scenario=='inventory':world.conditional['102']='1'
@@ -484,11 +501,21 @@ def test_handoff_rechecked_under_lock_before_switch(combined_world,monkeypatch,c
             before=original_env.replace(b'LP_V2_CAPITAL_USDC=100',b'LP_V2_CAPITAL_USDC=99') if preparation else original_env
             env.write_bytes(before)
             options=['--prepare-run-env'] if preparation else []
-            assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00',*options])==2
+            count=len(world.mutations)
+            assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00',*options])==(0 if scenario=='inventory' else 2)
             report=json.loads(capsys.readouterr().out.splitlines()[-1])
-            assert report['status']!='PASS' and held[-1]==scenario
-            assert world.mutations==[] and world.readonly is True and env.read_bytes()==before
-            assert sum(request['action'] in ('on','prepare') for request in world.requests)==len(held)
+            assert held[-1][0]==scenario
+            if scenario=='inventory':
+                assert report['status']=='PASS' and world.lease is not None
+                assert dict(line.split(b'=',1) for line in env.read_bytes().splitlines())==dict(line.split(b'=',1) for line in original_env.splitlines())
+                if preparation:assert env.with_name(env.name+'.bak').read_bytes()==before
+                else:assert env.read_bytes()==before
+            else:
+                assert report['status']!='PASS'
+                assert len(world.mutations)==count and world.readonly is True and env.read_bytes()==before
+            assert sum(request['action'] in ('on','prepare') for request in world.requests)==sum(action in ('on','prepare') for _,action in held)
+            if scenario=='inventory':
+                assert main(['live','off'])==0;capsys.readouterr()
 
 
 @pytest.mark.parametrize('presentation',('lower','checksum','mixed'))

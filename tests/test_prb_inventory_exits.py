@@ -35,14 +35,16 @@ def test_balance_evidence_reports_source_time_and_unknowns(tmp_path):
     assert later['observed_at']==(AT+timedelta(seconds=5)).isoformat()
     assert later['exchange_as_of']=='UNKNOWN'
     rotation,ex,obs,clock=rotation_world(tmp_path)
-    obs.read_conditional_inventory=lambda now,cid:dict(data,as_of=now.isoformat(),observed_at=now.isoformat())
+    inventory_reads=[]
+    def inventory(now,cid):
+        inventory_reads.append(cid)
+        return dict(data,as_of=now.isoformat(),observed_at=now.isoformat())
+    obs.read_conditional_inventory=inventory
     rotation.step(AT)
     clock[0]+=timedelta(seconds=10);rotation.scanner.scan_once(clock[0])
     report=rotation.step(clock[0])['rotation']
-    rows=report['blocker']['numbers']['inventory']
-    assert [(r['exchange'],r['ledger'],r['difference']) for r in rows]==[('1.234567','0','1.234567'),('0','0','0')]
-    assert rows[0]['explanation']=='exchange_balance_differs_from_historical_ledger'
-    assert rows[0]['source']==data['source'] and rows[0]['observed_at']==clock[0].isoformat()
+    assert report['phase']=='running' and report['current']==BID
+    assert report['blocker']=='UNKNOWN' and inventory_reads==[]
     assert 'sentinel' not in str(report)
     sdk.close();rotation.close()
 
@@ -134,15 +136,13 @@ def test_zero_exchange_balance_keeps_unreconciled_ledger_blocked(tmp_path):
     rotation.scanner.scan_once(clock[0])
     clock[0]+=timedelta(seconds=10)
     report=rotation.step(clock[0])['rotation']
-    assert report['phase']=='exiting' and report['current']==CID and report['entered_count']==0
+    assert report['phase']=='cleared' and report['current'] is None and report['entered_count']==0
     assert old.ledger.snapshot().positions==before
-    assert not old.sdk.journal.events('exit_observation')
-    assert not old.stop.is_set()
-    row=report['blocker']['numbers']['inventory'][0]
-    assert row['exchange']=='0' and row['ledger']=='1' and row['difference']=='-1'
-    assert row['source']==row['upstream_unit']==row['upstream_precision']=='UNKNOWN'
-    assert report['blocker']['code']=='inventory_mismatch'
-    assert report['exit_observation']=='UNKNOWN'
+    assert old.sdk.journal.events('exit_observation') and old.stop.is_set()
+    assert report['blocker']['code']=='no_revalidated_candidate'
+    assert report['blocker']['numbers']=='UNKNOWN'
+    assert report['exit_observation']['source']=='open_orders'
+    assert report['exit_observation']['complete'] is True and report['exit_observation']['owned_open_count']==0
     assert old.sdk.journal.events('fill')[-1][1].quantity==1
     assert {p.token_id for p in ex.posts}<=set(TOKENS)
     rotation.close()
@@ -151,7 +151,7 @@ def test_zero_exchange_balance_keeps_unreconciled_ledger_blocked(tmp_path):
 def test_nonzero_inventory_blocker_keeps_complete_evidence(tmp_path):
     rotation,ex,obs,clock=rotation_world(tmp_path)
     rotation.step(AT)
-    # Dust requires manual handling; no tolerance or automatic transfer.
+    # Dust stays outside program handling; no balance read or automatic transfer.
     ex.quantities['101']=D('.008133')
     clock[0]+=timedelta(seconds=10);rotation.scanner.scan_once(clock[0])
     first=clock[0]
@@ -159,17 +159,15 @@ def test_nonzero_inventory_blocker_keeps_complete_evidence(tmp_path):
     for elapsed in (0,3599,3600):
         if elapsed:
             clock[0]=first+timedelta(seconds=elapsed);report=rotation.step(clock[0])['rotation']
-        row,other=report['blocker']['numbers']['inventory']
-        assert (row['exchange'],row['ledger'],row['difference'])==('0.008133','0','0.008133')
-        assert row['upstream_unit']==row['upstream_precision']=='UNKNOWN'
-        assert other['exchange']=='0' and row['explanation']=='exchange_balance_differs_from_historical_ledger'
-        assert report['blocker']['escalated']==(elapsed==3600)
-        assert 'externally' in report['blocker']['next_step']
-        assert report['phase']=='exiting' and report['entered_count']==0
+        assert report['phase']=='running' and report['current']==BID and report['entered_count']==1
+        assert ex.quantities['101']==D('.008133')
+        if isinstance(report['blocker'],dict):assert report['blocker']['code']=='window_expired'
+        assert sum(p.token_id in TOKENS for p in ex.posts)==2
+        assert all(c.kwargs['asset_type']!='CONDITIONAL' for c in ex.sdk.get_balance_allowance.call_args_list)
     ex.quantities['101']=D('0');clock[0]+=timedelta(seconds=10)
     report=rotation.step(clock[0])['rotation']
-    assert report['phase']=='cleared' and report['reason']=='needs_new_on'
-    assert len(ex.posts)==2
+    assert report['phase']=='running' and report['current']==BID and report['entered_count']==1
+    assert sum(p.token_id in TOKENS for p in ex.posts)==2
     rotation.close()
 
 
@@ -214,17 +212,17 @@ def test_self_proof_recovers_after_old_accounting_failure(tmp_path,monkeypatch):
     old=runner.current;before=old.ledger.snapshot().positions
     ex.quantities['101']=D(0)
     clock[0]+=timedelta(seconds=10);runner.scanner.scan_once(clock[0]);report=runner.step(clock[0])['rotation']
-    assert report['phase']=='exiting' and report['entered_count']==0
-    assert report['blocker']['code'] in ('inventory_mismatch','reconciliation_unavailable')
-    assert {s.token_id for s in ex.posts}<=set(TOKENS)
-    runner.step(clock[0]);assert runner.entered_count==0
+    assert report['phase']=='running' and report['current']==BID and report['entered_count']==1
+    assert report['blocker']=='UNKNOWN'
+    assert tuple(s.token_id for s in ex.posts)==('101','102','201','202')
+    runner.step(clock[0]);assert runner.entered_count==1 and len(ex.posts)==4
     ex.quantities['101']=D(1)
     for _ in range(2):
         clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
-        assert report['current']==CID and report['entered_count']==0
-        assert old.ledger.snapshot().positions==before and not old.stop.is_set()
+        assert report['current']==BID and report['entered_count']==1
+        assert old.ledger.snapshot().positions==before and old.stop.is_set()
     assert old.sdk.journal.events('fill')[-1][1].quantity==1
-    assert {s.token_id for s in ex.posts}<=set(TOKENS)
+    assert tuple(s.token_id for s in ex.posts)==('101','102','201','202')
     runner.close()
     # Actual read failure can recover when both financial sources really agree.
     # Clean candidate retry evidence now lives in the legal cleared-restart case.
@@ -274,7 +272,7 @@ def test_target_foreign_orders_are_scoped_and_report_tails():
     sdk.close()
 
 
-from tests.test_live_control_host import combined_world, target, operator_os
+from tests.test_live_control_host import combined_world, target, operator_os, seal_fixture_journals
 from tests.test_live_control_profiles import profile, config_home
 
 
@@ -295,18 +293,19 @@ def stopped_history(world):
     journal.append('stop_result',dict(at=at,exit_code=1,orders=[],pending=[],positions=[Position(owner,market,'101',D('1.25'),D('.5'),at)],
         merges=[],inventory=[],reconciliation='UNKNOWN',accounting_as_of=at))
     journal.close();(state/'journal.sqlite').chmod(0o600)
+    seal_fixture_journals(state)
     return state
 
 
 def test_clean_live_handoff_ignores_previous_exit_one(combined_world,capsys):
     from lp_v2.cli import main
     world=combined_world;state=stopped_history(world)
+    seal_fixture_journals(state)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     assert main(['live','check'])==0
     import json
     report=json.loads(capsys.readouterr().out)
-    assert report['checks']['inventory_handoff']['status']=='PASS'
-    assert report['checks']['inventory_handoff']['reason']=='FRESH_ZERO_EXECUTION_RISK_CLEARED'
+    assert 'inventory_handoff' not in report['checks']
     assert frozen=={p:p.read_bytes() for p in frozen}
     assert world.mutations==[]
     # Failed accounting can leave the final ledger's order snapshot stale even
@@ -321,9 +320,10 @@ def test_clean_live_handoff_ignores_previous_exit_one(combined_world,capsys):
     order=Order('previous-order',req,D(0),D(10),OrderStatus.LIVE,drain['at'],False)
     journal.append('order_result',OrderResult(req,Outcome.UNKNOWN,order,drain['at']))
     journal.append('stop_result',dict(drain,orders=[order]));journal.close()
+    seal_fixture_journals(state)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     assert main(['live','check'])==0
-    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in json.loads(capsys.readouterr().out)['checks']
     assert frozen=={p:p.read_bytes() for p in frozen} and world.mutations==[]
 
 
@@ -348,16 +348,17 @@ def test_dirty_handoff_numbers_survive_cli_normalization(combined_world,capsys,d
         journal.append('merge_intent',dict(request=req))
         drain=dict(drain,merges=[MergeResult(req,Outcome.UNKNOWN,D(0),drain['at'])])
     journal.append('stop_result',drain);journal.close()
-    assert main(['live','check'])==2
-    report=json.loads(capsys.readouterr().out);row=report['checks']['inventory_handoff']
-    assert row['status']==('UNKNOWN' if dirty=='merge' else 'FAIL')
-    first,second=row['numbers']['inventory']
-    assert first['exchange']==('0.008133' if dirty=='balance' else '0')
-    assert first['ledger']=='1.25'
-    assert first['difference']==('-1.241867' if dirty=='balance' else '-1.25')
-    assert first['upstream_unit']=='UNKNOWN' and second['exchange']=='0'
-    assert row['owned_open_count']==(1 if dirty=='order' else 0)
-    assert row['merge_count']==(1 if dirty=='merge' else 0)
+    seal_fixture_journals(state)
+    frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    assert main(['live','check'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert 'inventory_handoff' not in report['checks']
+    assert report['checks']['legacy_orders']['status']=='PASS'
+    assert drain['positions'][0].quantity==D('1.25') and drain['positions'][0].cost_usdc==D('.5')
+    if dirty=='merge':
+        assert drain['merges'][0].outcome==Outcome.UNKNOWN and drain['merges'][0].received_usdc==0
+    assert not any(r.url.params.get('asset_type')=='CONDITIONAL' for r in world.http_requests)
+    assert frozen=={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     assert 'SECRET' not in str(report) and 'owned-secret-prefix' not in str(report)
     assert world.mutations==[]
 
@@ -399,7 +400,8 @@ def test_all_candidate_failures_back_off_with_visible_reasons(tmp_path):
     clock[0]=AT+timedelta(seconds=1810);report=rotation.step(clock[0])['rotation']
     assert report['blocker']['escalated'] and report['blocker']['next_step']
     clock[0]=rotation.window_end;report=rotation.step(clock[0])['rotation']
-    assert report['reason']=='needs_new_on' and len(ex.posts)==2
+    assert report['reason']=='no_revalidated_candidate' and len(ex.posts)==2
+    assert report['next_retry_at'] > clock[0].isoformat()
     rotation.close()
 
 
@@ -506,13 +508,12 @@ def test_self_proof_preserves_current_binding_and_consecutive_rounds(tmp_path,mo
     assert runner.condition_id==BID and runner.entered_count==1
     assert tuple(p.token_id for p in ex.posts[-2:])==('201','202')
     assert sum(p.token_id in ('201','202') for p in ex.posts)==2
-    # Once authorization expires, confirmed current ineligibility may clear old
-    # execution but cannot admit any fresh candidate.
+    # Old window metadata does not expire admission; real candidate failure still blocks it.
     clock[0]=runner.window_end
     def excluded(now,cid):raise FixedMarketIneligible('confirmed closed')
     runner.observations.read_fixed_market=excluded
     signed=len(ex.posts);report=runner.step(clock[0])['rotation']
-    assert report['reason']=='needs_new_on' and report['entered_count']==1 and len(ex.posts)==signed
+    assert report['reason']=='no_revalidated_candidate' and report['entered_count']==1 and len(ex.posts)==signed
     runner.close()
 
 
@@ -593,13 +594,18 @@ def test_handoff_retains_unknown_accounting_after_proven_expired_absence(combine
         if variant=='partial' and r.url.params.get('next_cursor'):return httpx.Response(503,json={},request=r)
         return httpx.Response(200,json=dict(data=[dict(id=ids[0],market=CID)] if variant=='present' else [],next_cursor='next' if variant=='partial' else 'LTE='),request=r)
     monkeypatch.setattr(httpx.HTTPTransport,'handle_request',pages)
+    seal_fixture_journals(state)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     code=main(['live','check']);result=json.loads(capsys.readouterr().out)
-    handoff=result['checks']['inventory_handoff']
-    if variant=='clean':
-        assert code==0 and handoff['status']=='PASS', (handoff,len(observations),{k:v['status'] for k,v in result['checks'].items()})
-        assert len(observations)>=3 and observations[-1]>observations[-2]
-    else:assert code==2 and handoff['status']!='PASS'
+    assert 'inventory_handoff' not in result['checks']
+    if variant=='partial':
+        assert code==2 and result['checks']['legacy_orders']['status']=='UNKNOWN'
+    else:
+        assert code==0 and result['checks']['legacy_orders']['status']=='PASS'
+    assert observations
+    assert drain['reconciliation']=='UNKNOWN' and len(drain['pending'])==(3 if variant=='missing-signature' else 2)
+    if variant=='unknown-merge':
+        assert drain['merges'][0].outcome==Outcome.UNKNOWN and drain['merges'][0].received_usdc==0
     assert frozen=={p:p.read_bytes() for p in frozen} and world.mutations==[]
 
 
@@ -628,18 +634,15 @@ def test_current_owned_presence_blocks_legacy_clean_handoff(combined_world,monke
             return httpx.Response(200,json=dict(data=[],next_cursor='later'),request=r)
         return httpx.Response(200,json=dict(data=[dict(id=order.order_id,market=market)] if dirty[0] else [],next_cursor='LTE='),request=r)
     monkeypatch.setattr(httpx.HTTPTransport,'handle_request',pages)
+    seal_fixture_journals(state)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
-    assert main(['live','check'])==2
-    result=json.loads(capsys.readouterr().out);row=result['checks']['inventory_handoff']
-    if evidence=='present':
-        assert result['checks']['legacy_orders']['status']=='PASS'
-        assert row['status']=='FAIL' and row['owned_open_count']==1
-    else:assert row['status']=='UNKNOWN'
-    assert [r['exchange'] for r in row['numbers']['inventory']]==['0','0']
-    assert [r['ledger'] for r in row['numbers']['inventory']]==['0','0']
+    assert main(['live','check'])==(2 if evidence=='incomplete' else 0)
+    result=json.loads(capsys.readouterr().out)
+    assert 'inventory_handoff' not in result['checks']
+    assert result['checks']['legacy_orders']['status']==('UNKNOWN' if evidence=='incomplete' else 'PASS')
     dirty[0]=False
     assert main(['live','check'])==0
-    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in json.loads(capsys.readouterr().out)['checks']
     assert world.mutations==[] and frozen=={p:p.read_bytes() for p in frozen}
 
 
@@ -672,6 +675,7 @@ def retained_handoff_world(world,history='acknowledged'):
         order=Order(oid,req,D(0),D(0),OrderStatus.CANCELLED,drain['at'],True)
         journal.append('order_result',OrderResult(req,Outcome.SUCCESS,order,drain['at']))
     journal.close()
+    seal_fixture_journals(state)
     return state,state/'markets'/retained/'journal.sqlite',oid,retained
 
 
@@ -685,15 +689,15 @@ def test_retained_owned_order_blocks_host_handoff(combined_world,monkeypatch,cap
         if r.url.path!='/data/orders':return route(self,r)
         return httpx.Response(200,json=dict(data=[dict(id=oid,market=retained)] if dirty[0] else [],next_cursor='LTE='),request=r)
     monkeypatch.setattr(httpx.HTTPTransport,'handle_request',pages)
+    seal_fixture_journals(state)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
-    assert main(['live','check'])==2
+    assert main(['live','check'])==0
     result=json.loads(capsys.readouterr().out)
     assert result['checks']['legacy_orders']['status']=='PASS'
-    row=result['checks']['inventory_handoff']
-    assert row['status']=='FAIL' and row['owned_open_count']==1
+    assert 'inventory_handoff' not in result['checks']
     dirty[0]=False
     assert main(['live','check'])==0
-    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in json.loads(capsys.readouterr().out)['checks']
     assert world.mutations==[] and world.readonly is True
     assert all(r.method=='GET' for r in world.http_requests)
     assert frozen=={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
@@ -708,17 +712,21 @@ def test_retained_owned_history_fails_closed(combined_world,capsys,problem):
     if problem=='foreign-owner':
         history=Journal(path);identity=history.events('identity')[0][1]
         history.append('identity',dict(identity,owner='lp-v2:foreign'));history.close()
+        seal_fixture_journals(state)
     elif problem=='symlink':
         destination=path.with_name('retained.sqlite');path.rename(destination);path.symlink_to(destination.name)
     else:
         sidecar=path.with_name(path.name+'-wal');sidecar.write_bytes(b'unsettled');sidecar.chmod(0o600)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
-    assert main(['live','check'])==2
+    assert main(['live','check'])==(0 if problem=='unsettled-wal' else 2)
     report=json.loads(capsys.readouterr().out)
-    assert report['checks']['inventory_handoff']['status']!='PASS'
+    assert 'inventory_handoff' not in report['checks']
+    if problem!='unsettled-wal':assert any(row['status']!='PASS' for row in report['checks'].values())
     assert world.mutations==[] and world.readonly is True
     assert all(r.method=='GET' for r in world.http_requests)
-    assert frozen=={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
+    # SQLite may rebuild its shared-memory cache; durable database/WAL bytes stay unchanged.
+    assert {p:v for p,v in frozen.items() if not p.name.endswith('-shm')}=={
+        p:p.read_bytes() for p in state.rglob('*') if p.is_file() and not p.name.endswith('-shm')}
 
 
 def test_settlement_lag_keeps_old_market_owned(tmp_path):
@@ -730,17 +738,16 @@ def test_settlement_lag_keeps_old_market_owned(tmp_path):
     assert before[0].quantity==D('1') and before[0].cost_usdc==D('.40')
     ex.quantities['101']=D(0);rotation.scanner.scan_once(clock[0])
     clock[0]+=timedelta(seconds=10);report=rotation.step(clock[0])['rotation']
-    assert report['current']==CID and report['entered_count']==0
-    assert report['phase']=='exiting'
-    assert report['blocker']['code'] in ('inventory_mismatch','reconciliation_unavailable')
-    assert rotation.current is old and not old.stop.is_set()
-    assert tuple(p.token_id for p in ex.posts)==TOKENS
-    assert old.ledger.snapshot().positions==before and not old.sdk.journal.events('exit_observation')
+    assert report['current']==BID and report['entered_count']==1 and report['phase']=='running'
+    assert report['blocker']=='UNKNOWN'
+    assert rotation.current is not old and old.stop.is_set()
+    assert tuple(p.token_id for p in ex.posts)==('101','102','201','202')
+    assert old.ledger.snapshot().positions==before and old.sdk.journal.events('exit_observation')
     ex.quantities['101']=D(1)
     for _ in range(3):
         clock[0]+=timedelta(seconds=10);report=rotation.step(clock[0])['rotation']
-        assert report['current']==CID and report['entered_count']==0 and report['phase']=='exiting'
-        assert not old.stop.is_set() and {p.token_id for p in ex.posts}<=set(TOKENS)
+        assert report['current']==BID and report['entered_count']==1 and report['phase']=='running'
+        assert old.stop.is_set() and tuple(p.token_id for p in ex.posts)==('101','102','201','202')
         assert old.ledger.snapshot().positions==before
     assert old.sdk.journal.events('fill')[-1][1].quantity==D(1)
     rotation.close()
@@ -782,12 +789,12 @@ def test_candidate_clean_reads_do_not_count_as_executor_rounds(tmp_path,monkeypa
         return sum(r.url.path=='/balance-allowance' and r.url.params.get('asset_type')=='CONDITIONAL'
                    and r.url.params.get('token_id')==token for r in seen)
     before={token:reads(token) for token in ('201','202')}
-    runner.step(first_at) # Exact same supplied observation; real candidate reads still happen.
-    assert all(reads(token)>before[token] for token in before)
+    runner.step(first_at) # Repeated candidate checks cannot manufacture a fresh executor round.
+    assert all(reads(token)==before[token]==0 for token in before)
     assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
     before={token:reads(token) for token in ('201','202')}
     clock[0]=first_at+timedelta(seconds=1);runner.step(clock[0])
-    assert all(reads(token)>before[token] for token in before)
+    assert all(reads(token)==before[token]==0 for token in before)
     assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
     clock[0]=first_at+timedelta(seconds=10);runner.step(clock[0])
     assert runner.condition_id==BID and runner.entered_count==1
@@ -853,7 +860,7 @@ def test_cleared_ineligible_executor_rounds_allow_rotation(tmp_path,monkeypatch,
     assert runner.phase=='cleared' and runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
     for at in (first_at,first_at+timedelta(seconds=1)):
         before=candidate_balance_reads(seen);clock[0]=max(clock[0],at);runner.step(at)
-        assert all(candidate_balance_reads(seen)[token]>count for token,count in before.items())
+        assert all(candidate_balance_reads(seen)[token]==count==0 for token,count in before.items())
         assert runner.entered_count==0 and tuple(p.token_id for p in ex.posts)==TOKENS
     clock[0]=first_at+timedelta(seconds=10);runner.step(clock[0])
     assert runner.condition_id==BID and runner.entered_count==1
@@ -1104,6 +1111,7 @@ def active_recovery_world(tmp_path,monkeypatch,phase,market,*,filled=False):
             trade=ex.trades[-1];wallet=runner.sdk.wallet
             ex.trades[-1]=trade.model_copy(update=dict(maker_address=wallet,
                 maker_orders=[m.model_copy(update=dict(maker_address=wallet)) for m in trade.maker_orders]))
+            if phase=='exiting':ex.cancel_unknown=True
             clock[0]+=timedelta(seconds=10);runner.current.step(clock[0],allow_open=False)
             position=runner.current.ledger.snapshot().positions[0]
             assert position.quantity==D(1) and position.cost_usdc==D('.40')
@@ -1133,8 +1141,8 @@ def test_ineligible_active_restart_drains_without_replay(tmp_path,monkeypatch,ph
             clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
             assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
             assert ex.orders['foreign'].status=='LIVE'
-        assert report['phase']=='cleared' and report['reason']=='exit_only_requires_new_on'
-        assert report['recovery_mode']=='exit_only'
+        assert report['phase']=='cleared' and report['reason']=='no_executable_candidate'
+        assert report['recovery_mode']=='normal'
         assert ex.orders['order-3'].status==ex.orders['order-4'].status=='CANCELED'
         assert (runner.sdk.journal.events('intent'),runner.sdk.journal.events('signed'))==before
         runner.close();runner=None
@@ -1143,7 +1151,7 @@ def test_ineligible_active_restart_drains_without_replay(tmp_path,monkeypatch,ph
         for _ in range(3):
             clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
             assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
-            assert report['reason']=='exit_only_requires_new_on' and report['recovery_mode']=='exit_only'
+            assert report['reason']=='no_executable_candidate' and report['recovery_mode']=='normal'
             assert ex.orders['foreign'].status=='LIVE'
         assert (runner.sdk.journal.events('intent'),runner.sdk.journal.events('signed'))==before
     finally:
@@ -1164,25 +1172,24 @@ def test_ineligible_active_restart_preserves_owned_inventory(tmp_path,monkeypatc
         position=runner.current.ledger.snapshot().positions[0]
         assert position.condition_id==BID and position.token_id=='201'
         assert position.quantity==D(1) and position.cost_usdc==D('.40')
-        assert report['phase']=='exiting' and report['recovery_mode']=='exit_only'
+        assert report['phase']=='cleared' and report['recovery_mode']=='normal'
         assert runner.condition_id==BID and runner.entered_count==1 and len(ex.posts)==4
         ex.quantities['201']=D(0)
         clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
-        row=report['blocker']['numbers']['inventory'][0]
-        assert (row['exchange'],row['ledger'],row['difference'])==('0','1','-1')
-        assert row['upstream_precision']==row['upstream_unit']=='UNKNOWN'
+        assert report['blocker']['code']=='no_executable_candidate'
+        assert report['blocker']['numbers']=='UNKNOWN'
         assert runner.current.ledger.snapshot().positions[0]==position
-        assert report['phase']=='exiting' and runner.entered_count==1 and len(ex.posts)==4
+        assert report['phase']=='cleared' and runner.entered_count==1 and len(ex.posts)==4
         ex.quantities['201']=D(1)
         clock[0]+=timedelta(seconds=10);report=runner.step(clock[0])['rotation']
         assert runner.current.ledger.snapshot().positions[0]==position
-        assert report['phase']=='exiting' and len(ex.posts)==4
+        assert report['phase']=='cleared' and len(ex.posts)==4
         assert runner.sdk.journal.events('fill')==fills
         state['market']='eligible'
         clock[0]+=timedelta(seconds=10);runner.step(clock[0])
         requests=tuple(p['request'] for _,p in runner.sdk.journal.events('intent'))
         assert tuple(r.request_id for r in requests if r.purpose=='opening')==original_openings
-        assert any(r.purpose=='hedge' and r.quote.condition_id==BID for r in requests)
+        assert not any(r.purpose=='hedge' for r in requests)
         assert all(r.purpose in ('opening','hedge') and r.quote.condition_id==BID for r in requests)
         assert runner.entered_count==1 and runner.condition_id==BID
         assert runner.current.ledger.snapshot().positions[0]==position

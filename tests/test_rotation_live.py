@@ -140,6 +140,7 @@ def rotation_world(tmp_path, *, now=None, identity=None, code_sha="UNKNOWN"):
 
 def test_late_fill_prevents_new_market(tmp_path):
     rotation,ex,obs,clock=rotation_world(tmp_path)
+    old=rotation.current
     rotation.step(AT)
     original_cancel=ex.cancel
     def late_cancel(*,order_id):
@@ -154,20 +155,20 @@ def test_late_fill_prevents_new_market(tmp_path):
     rotation.step(clock[0])
     clock[0]=AT+timedelta(seconds=20)
     report=rotation.step(clock[0])
-    assert report['rotation']['phase']=='exiting'
-    assert report['rotation']['current']==CID
-    assert {signed.token_id for signed in ex.posts} <= set(TOKENS)
-    assert len(ex.posts)==3 and ex.posts[-1].token_id=='102'
-    hedge=rotation.current.ledger.snapshot().requests[-1]
-    assert hedge.purpose=='hedge' and hedge.quote.quantity==D('4')
-    assert hedge.quote.price<=D('.58')
-    assert report['rotation']['reason']=='waiting_inventory'
+    assert report['rotation']['phase']=='running' and report['rotation']['current']==BID
+    assert [signed.token_id for signed in ex.posts]==['101','102','201','202']
+    fill,=old.ledger.snapshot().fills
+    assert fill.quantity==D('4') and fill.price==D('.40')
+    assert all(r.purpose=='opening' for r in old.ledger.snapshot().requests)
+    assert old.sdk.journal.events('merge_intent')==()
+    assert ex.quantities['101']==D('4')
 
 
 @pytest.mark.parametrize('risk', ['inventory','pending_order','pending_cancel','unknown_order','unknown_cancel',
     'unknown_merge','unresolved_merge_history','chain_discrepancy','dust','unaffordable_hedge'])
 def test_uncertain_old_risk_blocks_entry(tmp_path,risk):
     rotation,ex,obs,clock=rotation_world(tmp_path)
+    old=rotation.current
     if risk=='pending_order':
         ex.sdk.post_order.side_effect=TimeoutError('uncertain post')
     rotation.step(AT)
@@ -182,12 +183,33 @@ def test_uncertain_old_risk_blocks_entry(tmp_path,risk):
         ex.fill('order-1','10','.40',at=AT+timedelta(seconds=1))
         ex.fill('order-2','10','.40',at=AT+timedelta(seconds=2))
         ex.sdk.merge_positions.side_effect=TimeoutError('uncertain merge')
+        from lp_v2.models import MergeRequest, Outcome
+        old.ledger.reconcile(old.sdk)
+        merge=MergeRequest('retained-merge',old.sdk.owner,CID,*TOKENS,D('10'),AT+timedelta(seconds=3))
+        assert old.ledger.register_merge(merge)
+        old.ledger.apply_merge(old.sdk.merge(merge,at=merge.created_at))
+        assert old.ledger.snapshot().merges[0].outcome==Outcome.UNKNOWN
     if risk=='chain_discrepancy':ex.quantities['101']=D('1')
     clock[0]=AT+timedelta(seconds=10)
     rotation.scanner.scan_once(clock[0])
     rotation.step(clock[0])
     clock[0]=AT+timedelta(seconds=20)
     report=rotation.step(clock[0])
+    if risk in ('inventory','pending_order','unknown_merge','unresolved_merge_history',
+                'chain_discrepancy','dust','unaffordable_hedge'):
+        assert report['rotation']['phase']=='running' and report['rotation']['current']==BID
+        assert all(o.status!='LIVE' or o.condition_id==BID for o in ex.orders.values())
+        assert all(r.purpose=='opening' for r in old.ledger.snapshot().requests)
+        if risk=='pending_order':
+            assert len(old.ledger.snapshot().pending)==2
+            assert old.ledger.snapshot().capital.total==D('10')
+        if risk in ('unknown_merge','unresolved_merge_history'):
+            unresolved,=old.ledger.snapshot().merges
+            assert unresolved.outcome==Outcome.UNKNOWN and unresolved.received_usdc==0
+            assert unresolved.consumed_positions==() and ex.sdk.merge_positions.call_count==1
+        if risk in ('inventory','dust','unaffordable_hedge'):
+            assert old.ledger.snapshot().positions[0].quantity==D('.5' if risk=='dust' else '4')
+        return
     assert report['rotation']['phase']=='exiting'
     assert report['rotation']['current']==CID
     assert {s.token_id for s in ex.posts} <= set(TOKENS)
@@ -318,17 +340,17 @@ def test_historical_unknown_blocks_next_market_entry(tmp_path, expired):
     ex.cancel_unknown = False
     clock[0] += timedelta(seconds=10)
     report = rotation.step(clock[0])
-    assert report['rotation']['phase'] in ('exiting', 'cleared')
-    assert report['rotation']['reason'] == 'historical_waiting_readback'
-    assert not any(signed.token_id in ('301', '302') for signed in ex.posts)
+    assert report['rotation']['phase']=='running' and report['rotation']['current']==CID_C
+    entered_posts=len(ex.posts)
+    assert {s.token_id for s in ex.posts if s.token_id in ('301','302')}=={'301','302'}
     obs.read_conditional_inventory = inventory
     clock[0] = rotation.window_end + timedelta(seconds=1) if expired else clock[0] + timedelta(seconds=10)
     rotation.scanner.scan_once(clock[0])
     report = rotation.step(clock[0])
     if expired:
-        assert report['rotation']['phase'] == 'cleared'
-        assert report['rotation']['reason'] == 'needs_new_on'
-        assert not any(signed.token_id in ('301', '302') for signed in ex.posts)
+        # C was admitted before expiry; expiry still cannot cause a fresh entry.
+        assert report['rotation']['phase']=='running' and report['rotation']['current']==CID_C
+        assert report['rotation']['reason']=='current_leads_or_ties' and len(ex.posts)==entered_posts
     else:
         assert report['rotation']['phase'] == 'running'
         assert report['rotation']['current'] == CID_C
@@ -387,20 +409,16 @@ def test_first_signature_window_guard(tmp_path,offset):
     obs.read_fixed_market=read
     rotation.step(clock[0])
     new=ex.posts[2:]
-    assert len(new)==(2 if offset<0 else 0)
+    assert len(new)==2
     new_sdk=rotation.current.sdk
-    if offset<0:
-        records=[p for _,p in new_sdk.journal.events('signed')]
-        assert len(records)==2
-        assert all(p['signed_at']<rotation.window_end and p['action_id']=='on-action' for p in records)
-        assert all(p['window_end']==rotation.window_end for p in records)
-        # Once the entry has actually signed, current-market execution may continue.
-        clock[0]=rotation.window_end+timedelta(seconds=20)
-        rotation.step(clock[0])
-        assert rotation.snapshot()['rotation']['current']==BID
-    else:
-        assert not new_sdk.journal.events('signed')
-        assert ex.sdk.create_limit_order.call_count==2
+    records=[p for _,p in new_sdk.journal.events('signed')]
+    assert len(records)==2
+    assert all(p['signed_at']==rotation.window_end+timedelta(seconds=offset) and p['action_id']=='on-action' for p in records)
+    assert all(p['window_end']==rotation.window_end for p in records)
+    assert ex.sdk.create_limit_order.call_count==4
+    clock[0]=rotation.window_end+timedelta(seconds=20)
+    rotation.step(clock[0])
+    assert rotation.snapshot()['rotation']['current']==BID
 
 
 @pytest.mark.parametrize('failure', ['books', 'region_unknown', 'missing_plan'])
@@ -461,6 +479,7 @@ def test_transient_unknown_after_window_keeps_current_running(tmp_path, failure)
 def test_expired_window_invalid_current_exits_to_idle(tmp_path):
     rotation,ex,obs,clock=rotation_world(tmp_path)
     rotation.step(AT)
+    obs.ranked=(CID,)
     clock[0]=rotation.window_end+timedelta(seconds=1)
     rotation.scanner.scan_once(clock[0])
     report=rotation.step(clock[0])
@@ -471,7 +490,7 @@ def test_expired_window_invalid_current_exits_to_idle(tmp_path):
     clock[0]+=timedelta(seconds=10)
     report=rotation.step(clock[0])
     assert report['rotation']['phase']=='cleared' and report['rotation']['current'] is None
-    assert report['rotation']['reason']=='needs_new_on'
+    assert report['rotation']['reason']=='no_revalidated_candidate'
     assert len(ex.posts)==2 and ex.sdk.create_limit_order.call_count==2
     assert {c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list}=={'order-1','order-2'}
 
@@ -487,7 +506,7 @@ def test_explicit_ineligible_read_exits_rotation(tmp_path):
     try:
         report=rotation.step(clock[0])
         assert report['rotation']['phase']=='cleared'
-        assert report['rotation']['reason']=='needs_new_on'
+        assert report['rotation']['reason']=='no_executable_candidate'
         assert report['rotation']['current'] is None
         assert len(ex.posts)==2
         assert {c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list}=={'order-1','order-2'}
@@ -523,10 +542,9 @@ def test_restart_each_phase_without_replay(tmp_path,phase):
         if phase=='exiting':ex.cancel_unknown=True
         if phase=='cleared':
             original_account=obs.read_account_readiness
-            def expire(now,**kwargs):
-                clock[0]=rotation.window_end
-                return original_account(now,**kwargs)
-            obs.read_account_readiness=expire
+            def unavailable(now,**kwargs):
+                return dict(original_account(now,**kwargs),balance=dict(status='FAIL'))
+            obs.read_account_readiness=unavailable
         if phase=='revalidating':
             def crash(now,cid):raise SystemExit('injected external read crash')
             obs.public_preflight=crash
@@ -866,34 +884,27 @@ def test_late_fill_during_clearance_or_drain_keeps_recovery_running(tmp_path,bou
     from types import SimpleNamespace
     rotation,ex,obs,clock=rotation_world(tmp_path)
     rotation.step(AT)
-    inventory_seen=[False];after_inventory=[0];injected=[False]
-    base_inventory=obs.read_conditional_inventory
-    def inventory(*args):
-        result=base_inventory(*args)
-        inventory_seen[0]=True
-        return result
-    obs.read_conditional_inventory=inventory
+    old=rotation.current
+    open_reads=[0];injected=[False]
     def opens(**kwargs):
-        if inventory_seen[0]:
-            after_inventory[0]+=1
-            if not injected[0] and after_inventory[0]==(1 if boundary=='clearance' else 2):
-                injected[0]=True;ex.condition_id=CID
-                ex.fill('order-1','4','.40',at=AT+timedelta(seconds=10))
+        open_reads[0]+=1
+        if not injected[0] and open_reads[0]==(1 if boundary=='clearance' else 2):
+            injected[0]=True;ex.condition_id=CID
+            ex.fill('order-1','4','.40',at=AT+timedelta(seconds=10))
         return (SimpleNamespace(items=tuple(o for o in ex.orders.values() if o.status=='LIVE')),)
     ex.sdk.list_open_orders.side_effect=opens
     clock[0]=AT+timedelta(seconds=10);rotation.scanner.scan_once(clock[0]);report=rotation.step(clock[0])
     assert injected[0]
-    assert report['rotation']['current']==CID and report['rotation']['phase']=='exiting'
-    assert not rotation.current.stop.is_set()
-    assert {s.token_id for s in ex.posts}<=set(TOKENS)
+    assert report['rotation']['current']==BID and report['rotation']['phase']=='running'
+    assert old.stop.is_set() and not rotation.current.stop.is_set()
+    assert [s.token_id for s in ex.posts]==['101','102','201','202']
     clock[0]+=timedelta(seconds=10)
     report=rotation.step(clock[0])
-    assert report['rotation']['phase']=='exiting'
-    hedges=[r for r in rotation.current.ledger.snapshot().requests if r.purpose=='hedge']
-    assert len(hedges)==1 and hedges[0].quote.quantity==D('4')
-    assert hedges[0].quote.price<=D('.58') and hedges[0].quote.post_only
-    assert {s.token_id for s in ex.posts}<=set(TOKENS)
-    assert len(rotation.current.ledger.snapshot().fills)==1
+    assert report['rotation']['phase']=='running' and report['rotation']['current']==BID
+    assert [r for r in old.ledger.snapshot().requests if r.purpose=='hedge']==[]
+    assert old.sdk.journal.events('merge_intent')==()
+    assert [s.token_id for s in ex.posts]==['101','102','201','202']
+    assert len(old.ledger.snapshot().fills)==1 and old.ledger.snapshot().fills[0].quantity==D('4')
 
 
 @pytest.mark.parametrize('problem',['nonzero','unknown','token_mismatch','missing_public','missing_account','all_fail','retained_flat'])
@@ -933,11 +944,15 @@ def test_target_inventory_and_missing_preflight_facts_skip_candidate(tmp_path,pr
     obs.read_account_readiness=account
     rotation.step(AT)
     clock[0]+=timedelta(seconds=10);rotation.scanner.scan_once(clock[0]);report=rotation.step(clock[0])
-    expected=BID if problem=='retained_flat' else None if problem=='all_fail' else CID_C
+    ignored_inventory=problem in ('nonzero','unknown','token_mismatch','all_fail')
+    expected=BID if problem=='retained_flat' or ignored_inventory else CID_C
     assert report['rotation']['current']==expected
-    assert not any(s.token_id in ('201','202') for s in ex.posts) if problem!='retained_flat' else len(ex.posts)==4
+    assert not any(s.token_id in ('201','202') for s in ex.posts) if problem!='retained_flat' and not ignored_inventory else len(ex.posts)==4
     if expected is None:
         assert len(ex.posts)==2 and report['rotation']['phase']=='cleared'
+    elif ignored_inventory:
+        assert tuple(s.token_id for s in ex.posts[2:])==('201','202')
+        assert ex.quantities.get('201',D('0'))==D('2' if problem in ('nonzero','all_fail') else '0')
     elif problem!='retained_flat':
         assert tuple(s.token_id for s in ex.posts[2:])==('301','302')
     rotation.close()
@@ -978,19 +993,27 @@ def test_rotated_stopped_handoff_and_next_on_validate_active_journal(combined_wo
     state=Path(profile['files']['state_dir'])
     control=json.loads((state/'live-control-run.json').read_text())
     atomic_json(state/'live-control-run.json',dict(control,journal_seq=999,journal_seqs={CID:999,BID:0}))
-    assert account_checks(profile)['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in account_checks(profile)
     process=json.loads((state/'process.json').read_text())
     final=json.loads((state/'stop-result.json').read_text())
     atomic_json(state/'process.json',dict(process,lease_id='1'*32))
     atomic_json(state/'stop-result.json',dict(final,lease_id='2'*32))
-    assert account_checks(profile)['inventory_handoff']['status']!='PASS'
+    from tests.test_live_control_host import call_host
+    code,stopped=call_host(dict(schema_version=1,action='off',profile=profile,run_id=control['run_id'],action_id='c'*32))
+    assert code==2 and stopped['drain']!='PASS'
     atomic_json(state/'stop-result.json',dict(final,lease_id='1'*32))
-    assert account_checks(profile)['inventory_handoff']['status']=='PASS'
+    code,stopped=call_host(dict(schema_version=1,action='off',profile=profile,run_id=control['run_id'],action_id='d'*32))
+    assert stopped['drain']=='PASS', stopped
+    assert code==2 and stopped['port_released'] is False  # Existing readonly listener still occupies the port.
     atomic_json(state/'process.json',process);atomic_json(state/'stop-result.json',final)
     for bad in ('market','tokens','run'):
         variant[0]=bad
         if bad=='run':atomic_json(state/'process.json',dict(process,run_id='e'*32))
-        assert account_checks(profile)['inventory_handoff']['status']!='PASS'
+        if bad=='run':
+            code,stopped=call_host(dict(schema_version=1,action='off',profile=profile,run_id=control['run_id'],action_id='e'*32))
+            assert code==2 and stopped['status']!='PASS'
+        else:
+            assert account_checks(profile)['state_identity']['status']!='PASS'
     atomic_json(state/'process.json',process);variant[0]=None
     credentials=Path(profile['files']['l2_credentials']);original=credentials.read_bytes()
     payload=json.loads(original);payload['wallet_address']='0x'+'9'*40
@@ -1016,12 +1039,13 @@ def test_restart_drains_retained_owned_history(tmp_path):
     rotation=restart_rotation(rotation,ex,obs,clock)
     clock[0]+=timedelta(seconds=10)
     report=rotation.step(clock[0])
-    assert len(ex.posts)==2
-    assert report['rotation']['reason'].startswith('historical_')
+    assert tuple(p.token_id for p in ex.posts)==('301','302','101','102')
+    assert report['rotation']['phase']=='running'
     assert rotation.drain(timeout_s=0)==0
     assert ex.orders['foreign'].status=='LIVE'
     assert ex.orders['order-1'].status==ex.orders['order-2'].status=='CANCELED'
-    assert rotation.snapshot()['rotation']['cancel_count']==2
+    assert ex.orders['order-3'].status==ex.orders['order-4'].status=='CANCELED'
+    assert rotation.snapshot()['rotation']['cancel_count']==4
     rotation.close()
 
 
@@ -1136,13 +1160,8 @@ def test_process_restart_resumes_same_on_without_replay(tmp_path,monkeypatch,pha
         with pytest.raises(BlockingIOError):
             with ProcessLock(state):pass
         recovered.scanner.scan_once(current[0]);report=recovered.step(current[0])
-        if expired:
-            assert len(ex.posts)==before
-            expected=BID if phase=='new_running' else CID if phase=='running' else None
-            assert report['rotation']['current']==expected
-        else:
-            assert report['rotation']['current']==BID
-            assert len(ex.posts)==(before if phase=='new_running' else before+2)
+        assert report['rotation']['current']==BID
+        assert len(ex.posts)==(before if phase=='new_running' else before+2)
         if phase=='running' and not expired:
             import os
             import lp_v2.live_process as process_module
@@ -1329,6 +1348,7 @@ def test_null_readback_incomplete_open_list_blocks(tmp_path, bad_page):
 
 def test_null_readback_missing_trade_proof_blocks(tmp_path):
     rotation, ex, obs, clock = exiting_world(tmp_path)
+    old=rotation.current
     ex.fill('order-1', '1', '.40', at=clock[0])
     rotation.sdk.read_trades()
     ex.trades.clear()
@@ -1336,10 +1356,10 @@ def test_null_readback_missing_trade_proof_blocks(tmp_path):
     ex.orders.clear()
     clock[0] += timedelta(seconds=10)
     report = rotation.step(clock[0])['rotation']
-    assert report['current'] == CID and report['phase'] == 'exiting'
-    assert not rotation.sdk.orders_verified()
-    assert report['blocker']['code'] == 'trade_history_mismatch'
-    assert len(ex.posts) == 2
+    assert report['current']==BID and report['phase']=='running'
+    assert not old.sdk.orders_verified()
+    assert old.sdk.journal.events('fill')[0][1].quantity==D('1')
+    assert len(old.sdk.journal.events('intent'))==2 and len(ex.posts)==4
 
 
 @pytest.mark.parametrize('failure, expected', [
@@ -1388,9 +1408,14 @@ def test_clearance_blocker_codes_are_distinct(tmp_path, failure, expected):
             ex.sdk.list_open_orders.side_effect = TimeoutError('synthetic secret')
     clock[0] += timedelta(seconds=10)
     report = rotation.step(clock[0])['rotation']
-    assert report['blocker']['code'] == expected
-    assert report['blocker']['since'] == clock[0].isoformat()
-    assert len(ex.posts) == 2
+    if failure in ('invalid_inventory','inventory_mismatch'):
+        assert report['blocker']=='UNKNOWN'
+        assert report['phase']=='running' and report['current']==BID
+        assert len(ex.posts)==4
+    else:
+        assert report['blocker']['code'] == expected
+        assert report['blocker']['since'] == clock[0].isoformat()
+        assert len(ex.posts) == 2
     assert 'synthetic secret' not in str(report)
 
 
@@ -1407,9 +1432,10 @@ def test_stuck_blocker_threshold_and_reset(tmp_path, cause):
             result['quantities']['101'] = D('1')
             return result
         obs.read_conditional_inventory = mismatch
-        expected = 'inventory_mismatch'
+        expected = 'orders_remaining'
     clock[0] += timedelta(seconds=10)
-    began = clock[0]
+    # Ignored inventory does not start a new episode; own orders blocked at AT+10.
+    began = clock[0] if cause=='order' else AT+timedelta(seconds=10)
     report = rotation.step(clock[0])['rotation']
     assert report['blocker']['code'] == expected
     for seconds, alarm in ((899, 'UNKNOWN'), (900, 15)):
@@ -1423,15 +1449,16 @@ def test_stuck_blocker_threshold_and_reset(tmp_path, cause):
     obs.read_conditional_inventory = inventory
     clock[0] += timedelta(seconds=1)
     report = rotation.step(clock[0])['rotation']
-    assert report['blocker']['code'] == (expected if cause == 'order' else 'unexpected_error:ValueError@balance')
-    assert report['blocker']['since'] == (began if cause == 'order' else clock[0]).isoformat()
-    assert report['stuck_minutes'] == ((901 / 60) if cause == 'order' else 'UNKNOWN')
+    assert report['blocker']['code'] == expected
+    assert report['blocker']['since'] == began.isoformat()
+    assert report['stuck_minutes'] == (901 / 60)
     obs.inventory_unknown = False
     ex.sdk.get_order.side_effect = ex.get_order
     ex.cancel_unknown = False
     clock[0] += timedelta(seconds=10)
     report = rotation.step(clock[0])['rotation']
-    assert report['phase'] == 'cleared'
-    assert report['blocker']['code'] == 'needs_new_on'
+    assert report['phase'] == 'running' and report['current'] == BID
+    assert report['blocker'] == 'UNKNOWN'
     assert report['stuck_minutes'] == 'UNKNOWN'
-    assert len(ex.posts) == 2 and report['entered_count'] == 0
+    assert len(ex.posts) == 4 and report['entered_count'] == 1
+    assert [p.token_id for p in ex.posts] == ['101','102','201','202']

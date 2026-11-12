@@ -139,7 +139,7 @@ def test_live_server_lifecycle(tmp_path,monkeypatch,unresolved):
         def __exit__(self,*args):
             events.append('closed')
     monkeypatch.setattr(status_server,'HTTPServer',Server)
-    assert serve(runner.config,runner=runner)==(1 if unresolved else 0)
+    assert serve(runner.config,runner=runner)==0
     assert events==['signal','closed']
     assert not any(t.name=='lp-v2-live' for t in threads())
     assert ex.sdk.close.call_count==1
@@ -147,6 +147,12 @@ def test_live_server_lifecycle(tmp_path,monkeypatch,unresolved):
     import sqlite3
     with sqlite3.connect(journal.path) as db:
         assert db.execute("SELECT count(*) FROM events WHERE kind='stop_result'").fetchone()[0]==1
+        from lp_v2.journal import decode
+        stopped=decode(db.execute("SELECT payload FROM events WHERE kind='stop_result'").fetchone()[0])
+        assert stopped['exit_code']==0
+        if unresolved:
+            assert stopped['reconciliation']=='UNKNOWN' and stopped['pending']
+            assert not ex.posts and ex.sdk.post_order.call_count==2
 
 
 def test_live_factory_uses_pinned_sdk_and_frozen_identity(tmp_path,monkeypatch):

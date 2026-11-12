@@ -42,7 +42,6 @@ def open_market_journal(state_dir, identity):
 def _history_connection(path, *, immutable=False):
     import sqlite3
     if immutable:
-        import os
         from lp_v2.cli import owner_file
         with owner_file(path):
             pass
@@ -50,10 +49,8 @@ def _history_connection(path, *, immutable=False):
             sidecar=path.with_name(path.name+suffix)
             try:sidecar.lstat()
             except FileNotFoundError:continue
-            with owner_file(sidecar) as source:
-                if suffix in ('-wal','-journal') and os.fstat(source.fileno()).st_size:
-                    raise ValueError('unsettled journal history')
-    return sqlite3.connect(path.as_uri()+'?mode=ro'+('&immutable=1' if immutable else ''),uri=True)
+            with owner_file(sidecar):pass
+    return sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
 
 
 def read_market_identity(state_dir, condition_id, *, immutable=False):
@@ -169,10 +166,8 @@ def carry_legacy_journal(state_dir, identity):
     for suffix in ('-wal','-shm','-journal'):
         sidecar = source.with_name(source.name+suffix)
         if sidecar.exists() or sidecar.is_symlink():
-            with owner_file(sidecar) as stream:
-                if suffix != '-shm' and __import__('os').fstat(stream.fileno()).st_size:
-                    raise ValueError('unsettled legacy history')
-    old = sqlite3.connect(source.as_uri()+'?mode=ro&immutable=1',uri=True)
+            with owner_file(sidecar):pass
+    old = sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)
     try:
         prefix = list(old.execute('SELECT kind,payload FROM events ORDER BY seq'))
         identities = [decode(p) for k,p in prefix if k == 'identity']
@@ -214,13 +209,13 @@ def read_control_window(config, *, on_error=None):
         credentials = config.credentials
         identity = dict(wallet_address=credentials.wallet_address,signer_address=credentials.signer_address,
                         signature_type=credentials.signature_type)
-        action, end = record['action_id'], timestamp(record['window_end'])
+        action, end = record['action_id'], timestamp(record['window_end']) if record['window_end'] is not None else None
         started = timestamp(record['started_at'])
         if (not re.fullmatch('[0-9a-f]{32}',action) or not re.fullmatch('[0-9a-f]{32}',process['run_id'])
                 or record['run_id'] not in (None,process['run_id']) or not same_identity(profile['identity'],identity)
                 or profile['trading']['market_condition_id'] != config.market
                 or Decimal(profile['trading']['capital_usdc']) != config.capital_usdc
-                or profile['release']['expected_sha'] != config.code_sha or not started < end
+                or profile['release']['expected_sha'] != config.code_sha
                 or started > config.started_at
                 or Path(profile['files']['state_dir']).resolve() != state.resolve()
                 or Path(profile['files']['signing_key']).resolve() != Path(config.private_key_file).resolve()
@@ -301,7 +296,7 @@ def start_verification_passed(config, action_id, window_end, run_id, now, *, on_
         verified = timestamp(proof['verified_at'])
         return (action == action_id and end == window_end and process['run_id'] == record['run_id'] == run_id
             and proof['action_id'] == action_id and proof['run_id'] == run_id
-            and timestamp(proof['window_end']) == window_end and proof['seed_market'] == config.market
+            and (timestamp(proof['window_end']) if proof['window_end'] is not None else None) == window_end and proof['seed_market'] == config.market
             and type(proof['verified_rounds']) is int and proof['verified_rounds'] == 2
             and len(moments) == 2 and all(len(row) == 3 for row in moments)
             and all(value > timestamp(record['started_at']) and value <= verified
@@ -340,7 +335,7 @@ def recoverable_run(state, previous):
             identity=decode(db.execute("SELECT payload FROM events WHERE kind='rotation_identity' ORDER BY seq LIMIT 1").fetchone()[0])
         finally:db.close()
         account=control['profile']['identity']
-        if (phase['action_id']!=control['action_id'] or phase['window_end']!=timestamp(control['window_end'])
+        if (phase['action_id']!=control['action_id'] or phase['window_end']!=(timestamp(control['window_end']) if control['window_end'] is not None else None)
                 or identity['seed_market']!=control['profile']['trading']['market_condition_id']
                 or identity['owner']!='lp-v2:'+account['wallet_address'].lower()
                 or identity['wallet'].lower()!=account['wallet_address'].lower()
@@ -384,14 +379,14 @@ def verified_start_rotation(profile, record, process, summary):
             event=decode(db.execute("SELECT payload FROM events WHERE kind='rotation' ORDER BY seq DESC LIMIT 1").fetchone()[0])
         finally:db.close()
         proof=event['admission_proof']
-        started=timestamp(record['started_at']);end=timestamp(record['window_end'])
+        started=timestamp(record['started_at']);end=timestamp(record['window_end']) if record['window_end'] is not None else None
         moments=[timestamp(at) for at in proof['moments']]
         if (event['phase']!='running' or event['reason']!='entry_verified' or event['new_market']!=active
                 or event['action_id']!=record['action_id'] or event['window_end']!=end
                 or proof['action_id']!=record['action_id'] or proof['run_id']!=record['run_id']
-                or timestamp(proof['window_end'])!=end or proof['process_sha256']!=fingerprint(process)
+                or (timestamp(proof['window_end']) if proof['window_end'] is not None else None)!=end or proof['process_sha256']!=fingerprint(process)
                 or proof['source_market'] not in {i['condition_id'] for i in identities}
-                or len(moments)!=2 or not started<=moments[0]<moments[1]<=event['at']<end):
+                or len(moments)!=2 or not started<=moments[0]<moments[1]<=event['at']):
             raise ValueError()
         path=market_path(profile['files']['state_dir'],active)
         with owner_file(path):pass
@@ -399,8 +394,7 @@ def verified_start_rotation(profile, record, process, summary):
         try:
             occupation=decode(db.execute("SELECT payload FROM events WHERE kind='occupation' ORDER BY seq DESC LIMIT 1").fetchone()[0])
         finally:db.close()
-        if (occupation['reconciliation']!='SUCCESS'
-                or occupation['accounting_as_of']!=timestamp(summary['accounting']['as_of'])
+        if (occupation['accounting_as_of']!=timestamp(summary['accounting']['as_of'])
                 or occupation['at']!=timestamp(summary['as_of'])):
             raise ValueError()
         return dict(status='PASS',action_id=record['action_id'],run_id=record['run_id'],

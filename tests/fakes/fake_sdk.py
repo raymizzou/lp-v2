@@ -27,6 +27,10 @@ class FakeSDK:
         self._fill_notifications = []
         self._merge_scripts = {}
         self._merge_results = {(r.request.owner, r.request.merge_id): r for r in balance.merge_results or ()}
+        self.readback_skips = set()
+
+    def diagnose_readback_skip(self, kind, identity, reason):
+        self.readback_skips.add((kind, identity, reason))
 
     def script_place(self, request: OrderRequest, outcome: Outcome) -> None:
         self._place_scripts[request] = outcome

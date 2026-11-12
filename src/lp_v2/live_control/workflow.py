@@ -2,7 +2,7 @@
 from lp_v2.live_control.remote import request
 
 
-REQUIRED=('release','artifacts','files','private_identity','run_env','state_identity','single_executor','port','service','balance','allowance','closed_only','legacy_orders','region','relayer_auth','proxy_execution','operator_authority','legacy_service','inventory_handoff')
+REQUIRED=('release','artifacts','files','private_identity','run_env','state_identity','single_executor','port','service','balance','allowance','closed_only','legacy_orders','region','relayer_auth','proxy_execution','operator_authority','legacy_service')
 PUBLIC=('market_identity','token_identity','fees','state','political','in_play','rewards','constraints','books','opening_eligibility','market_inputs')
 
 
@@ -16,7 +16,6 @@ STEP_REASONS={
     'state_identity':{'JOURNAL_FROZEN_IDENTITY','EXPLICIT_NEW_STATE','STATE_IDENTITY_UNAVAILABLE'},
     'single_executor':{'EXECUTOR_AND_LOCK','SERVICE_EVIDENCE_MISSING','LOCAL_EXECUTOR_HANDOFF','COMPETING_LOCAL_EXECUTOR','LOCAL_EXECUTOR_SCAN_INCOMPLETE'},
     'legacy_service':{'LEGACY_SERVICE_HANDOFF','LEGACY_SERVICE_UNAVAILABLE'},
-    'inventory_handoff':{'OWNED_OPEN_ORDERS_REMAIN','FRESH_ZERO_EXECUTION_RISK_CLEARED','CONDITIONAL_IDENTITY_UNAVAILABLE','ACCOUNT_EVIDENCE_MISSING','CONDITIONAL_BALANCE_UNAVAILABLE','NEW_STATE_ZERO_CONDITIONAL_BALANCES','OWNED_STOPPED_INVENTORY_MATCH','CONDITIONAL_INVENTORY_UNMATCHED','STOPPED_HANDOFF_INCOMPLETE'},
     'port':{'PORT_OWNER','SERVICE_EVIDENCE_MISSING'},
     'service':{'EFFECTIVE_SERVICE_CONTRACT','SERVICE_EVIDENCE_MISSING'},
     'balance':{'BALANCE_CAPITAL','ACCOUNT_EVIDENCE_MISSING'},
@@ -106,7 +105,7 @@ def normalize_report(profile,report):
         elif not fresh(row.get('as_of')):
             status='UNKNOWN';reason='CHECK_STALE_OR_MISSING_TIME'
         checks[key]=dict(status=status if status in ('PASS','FAIL') else 'UNKNOWN',reason=reason)
-        if key in ('inventory_handoff','legacy_orders') and compatible:
+        if key=='legacy_orders' and compatible:
             from lp_v2.inventory_evidence import safe_details
             checks[key].update(safe_details(row))
     checks['public_market']=public_check(profile,report.get('public_market'))
@@ -163,17 +162,17 @@ def on(profile, *, action_id=None, window_end=None, prepare_env=False):
                 return result
             return verify_start(prior['profile'],started,action_id=action_id)
         return dict(status='UNKNOWN',reason='REMOTE_OUTCOME_UNKNOWN')
-    if not window_end or timestamp(window_end)<=datetime.now(UTC):
-        return dict(status='UNKNOWN',reason='CONFIRMATION_REQUIRED')
+    if window_end is not None:
+        timestamp(window_end)
     report=check(profile)
     preparable=prepare_env and all(row['status']=='PASS' for key,row in report['checks'].items() if key!='run_env')
     if report.get('status')!='PASS' and not preparable:
         return report
     print(json.dumps(dict(action='on',action_id=action_id,profile=profile,window_end=window_end,prepare_run_env=prepare_env,rollback='Owned stop/drain; restore readonly only after executor/port release.')))
-    if input('Type on to confirm this target and window: ')!='on':
+    if input('Type on to confirm this target: ')!='on':
         return dict(status='UNKNOWN',reason='CONFIRMATION_REQUIRED')
     from lp_v2.live_control.profiles import load
-    if load(profile['name'])!=profile or timestamp(window_end)<=datetime.now(UTC):
+    if load(profile['name'])!=profile:
         return dict(status='UNKNOWN',reason='CONFIRMATION_TARGET_CHANGED')
     current=check(profile)
     def confirmation_facts(sample):
@@ -184,8 +183,6 @@ def on(profile, *, action_id=None, window_end=None, prepare_env=False):
         opening=facts['checks']['public_market']['checks']['opening_eligibility']
         if 'details' in opening:
             opening['details'].pop('as_of',None)
-        for row in facts['checks'].get('inventory_handoff',{}).get('numbers',{}).get('inventory',[]):
-            row.pop('observed_at',None)
         return facts
     if confirmation_facts(current)!=confirmation_facts(report) or (current['status']!='PASS' and not preparable):
         return dict(status='UNKNOWN',reason='CONFIRMATION_FACTS_CHANGED',checks=current['checks'])
@@ -233,6 +230,9 @@ def verify_start(profile,started,*,action_id):
                 if 'startup_verification' in snapshot and snapshot['startup_verification'].get('status')!='PASS':
                     break
                 result = dict(status='PASS',run_id=run_id,action_id=action_id,verified_rounds=2)
+                market = snapshot['summary']['markets'][0]
+                if market['eligible'] is False:
+                    result['reason'] = market['skip_reason']
                 from lp_v2.live_control.profiles import read_json
                 operation = config_root()/'operations'/(action_id+'.json')
                 prior = read_json(operation)
@@ -264,8 +264,7 @@ def valid_round(profile,run_id,snapshot,started_at, *, action_id=None):
             proof=snapshot['rotation_verification']
             if (action_id is None or proof.get('status')!='PASS' or proof['action_id']!=action_id
                     or proof['run_id']!=run_id or proof['seed_market']!=seed or proof['current_market']!=market
-                    or timestamp(proof['started_at'])!=timestamp(started_at)
-                    or not timestamp(started_at)<timestamp(proof['window_end'])):
+                    or timestamp(proof['started_at'])!=timestamp(started_at)):
                 return None
         if (snapshot['run_id']!=run_id or snapshot['executor_running'] is not True or snapshot['readonly_stopped'] is not True
                 or not same_identity(snapshot['identity'],profile['identity']) or row['mode']!='live'
@@ -273,8 +272,10 @@ def valid_round(profile,run_id,snapshot,started_at, *, action_id=None):
                 or row['run']['code_sha']!=profile['release']['expected_sha']
                 or not matching_tail(row['run']['wallet_tail'],profile['identity']['wallet_address'])
                 or len(markets)!=1 or market is None
-                or markets[0].get('eligible') is not True or markets[0].get('skip_reason','MISSING') is not None
-                or accounting['status']!='SUCCESS'
+                or type(markets[0].get('eligible')) is not bool
+                or (markets[0]['eligible'] and markets[0].get('skip_reason','MISSING') is not None)
+                or (not markets[0]['eligible'] and (not isinstance(markets[0].get('skip_reason'),str) or not markets[0]['skip_reason']))
+                or accounting['status'] not in ('SUCCESS','UNKNOWN')
                 or not all(fresh(value) and timestamp(value)>timestamp(started_at) for value in
                            (row['as_of'],accounting['as_of'],row['freshness']['decision_as_of']))):
             return None

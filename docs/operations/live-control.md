@@ -1,7 +1,7 @@
 # One-command live control
 
 `lp-v2 live` wraps the single-market executor and its serial rotation controller. Code and offline tests do
-not authorize deployment, enabling live mode, trading, or a new run window.
+not authorize deployment, enabling live mode, trading, or a new live run.
 Installation, effective service permissions and field acceptance remain separate.
 
 ## Existing default profile
@@ -100,7 +100,7 @@ fills, receipts, frozen startup identity, 10-second decisions, 30-second wallet 
 their own time meaning.
 On confirmation, only the validated nested opening diagnostic `as_of` is excluded
 from comparing the two fresh reports. Displayed reports retain that timestamp.
-Liquidity, midpoint, thresholds, blockers, statuses, reasons, profile/window and
+Liquidity, midpoint, thresholds, blockers, statuses, reasons, profile and
 identity changes still refuse; stale/future/missing authoritative observation
 times remain invalid. Offline verification does not establish current target or
 market readiness.
@@ -111,50 +111,79 @@ responses remain unknown/refused. Preflight and the SDK use this same rule; othe
 market and private checks remain independent.
 No force/bypass flag exists.
 
-After separate authorization specifying target, wallet, exact code, market,
-capital and window, an operator can request:
+After separate authorization specifying target, wallet, exact code, market and
+capital, an operator can request:
 
 ```sh
-lp-v2 live on --window-end 2099-01-01T00:00:00+00:00
+lp-v2 live on
 # Review the concrete target, revision, preparation and rollback, then type on.
 lp-v2 live off
 ```
 
-The displayed date is a syntax example, not an approved window. `on` requires a
-future timezone-aware window end, checks before confirmation, rechecks after
-confirmation and rechecks on the target under its mutation lock. It starts once.
-The window is an authorization bound checked at execution, not a scheduler.
-Use `off` to stop; this command does not install a future automatic shutdown job.
+`on` checks before confirmation, rechecks after confirmation and rechecks on the
+target under its mutation lock. It starts once and remains authorized until `off`;
+there is no admission expiry or automatic shutdown timer. Legacy `--window-end`
+values and persisted window metadata remain readable but do not limit signing or
+rotation. Manual `on` confirmation and action/run/process identity still apply.
 
-If an authorized preparation explicitly includes changing non-secret run.env
-values, use `on --prepare-run-env --window-end ...`. Only MARKET, CAPITAL and SHA
-can be changed, exactly to the displayed profile values, with backup and readback.
-All other gates must already pass. Other run.env lines, credential files, journal,
-restart policy and boot enablement are preserved. Unit installation, missing
-secrets or a new release require their own authorized preparation/deployment.
+If authorized preparation includes changing non-secret run.env values, use
+`on --prepare-run-env`. Only MARKET, CAPITAL and SHA can be changed, exactly to the
+displayed profile values, with backup and readback. Other run.env lines,
+credential files, restart policy and boot enablement are preserved. Unit
+installation, missing secrets or a new release require separate authorization.
 
-Two fresh snapshots must independently prove the same run, full validated account,
-code, capital, unique startup seed market, live process, stopped read-only process and
-SUCCESS accounting. Accounting, decision and snapshot times must advance. A
-systemctl 0, HTTP 200, mode=live alone or protective pause is insufficient proof
-of successful quoting. Both accepted rounds require `eligible=true` and
-`skip_reason=null` for the single matching market. A pause, a missing eligibility
-field or a skip reason triggers bounded owned rollback and remains nonzero;
-a running process does not prove orders were placed or scored.
+Two fresh snapshots must independently prove the same run, full account identity,
+code, capital, matching market and live process, with the read-only process stopped.
+Readback, decision and snapshot times must advance. Accounting can remain UNKNOWN:
+that is not a settlement receipt. A temporary market pause keeps the process up and
+returns its safe reason; it does not trigger rollback merely because quoting is
+unavailable. Missing, stale or foreign identity evidence still fails bounded
+startup verification. A running process does not prove orders were placed or scored.
+
+Preflight has no `inventory_handoff` and does not read conditional-token balances.
+Wallet cash, allowances, region, external target orders, public market, account,
+file, service, process and token identities remain required checks. Reported
+positions are owned ledger facts, not a comparison with exchange balances.
 
 `off` uses the frozen run record even after market/capital edits. It does not need
-opening-market checks. A changed target/root/state is ambiguous and is refused;
-do not select a different executor by editing the profile. The original process
-record, matching stop-result run ID and a new successful journal drain after the
-frozen run boundary must agree. Inventory is retained and reported. Process stop,
-drain, port release and read-only restoration are separate facts; restoring the
-read-only service never converts a missing/failed drain to success. No sell,
-foreign cancel, cancel-all, journal deletion or kill -9 path exists.
-Drain also requires complete valid merge history. Missing/malformed history,
-UNKNOWN outcomes or acknowledgement without settlement keep drain and the
-overall result UNKNOWN, even if readonly is restored. `merge_history` reports the
-uncertainty separately and retains inventory. Empty complete history or known
-terminal results do not replace the other drain proofs; no merge is replayed.
+opening-market checks. A changed target/root/state is ambiguous and is refused.
+The current physical process result, matching run/lease and a fresh successful
+journal drain after the frozen boundary must agree. Drain cancels known owned
+orders and succeeds only after a complete open-order list contains none of the
+owned IDs, including signed candidates. Incomplete pages or remaining own orders
+cannot prove success. Historical UNKNOWN orders, accounting or merge receipts do
+not prevent stopping, and are retained as UNKNOWN rather than rewritten.
+
+Overall stop success requires the executor stopped, its port released, matching
+exit 0 and verified read-only restoration. `merge_history` and retained ledger
+inventory are informational; an uncertain merge stays uncertain even when stop
+succeeds. No merge is replayed and no sell, foreign cancel, cancel-all, journal
+deletion or kill -9 path exists.
+
+Journal readers use ordinary SQLite read-only access, including committed WAL
+records. A nonempty `-wal` or `-journal` is not itself a refusal. SQLite may rebuild
+its SHM cache; the application does not rewrite database/WAL data or delete journal
+files. Ownership, private modes, symlinks, orphan sidecars and actual read failures
+remain checked.
+
+## Authorized live rollout sequence
+
+An approved live rollout follows this order:
+
+1. `lp-v2 live off` if live is running; verify the stop evidence.
+2. Run the existing `deploy-lp-v2 <SHA>` to install the approved version.
+3. Pin that deployed SHA with `lp-v2 live profile set tokyo --code-sha <SHA>`, then
+   `lp-v2 live on --prepare-run-env` with the approved profile and confirmation.
+
+The deploy script itself is unchanged. An installation-only authorization stops
+at disk installation and does not authorize restart, enablement or changes to live
+trading. This documentation and PR execute none of these steps.
+
+For the first upgrade from the old reconciliation-gated version, its `off` may
+report UNKNOWN despite stopping (a code-derived expectation, not field proof).
+The authorized operator must independently verify the process stopped, port freed
+and complete exchange list without owned orders before switching versions. Later
+runs use the new `off` criteria above.
 
 ## Loss, concurrency and recovery
 
@@ -244,27 +273,14 @@ paths. Incomplete inspection, including a hidden-PID proc mount, is UNKNOWN. The
 process environments, and sends no signals. It does not claim distributed wallet
 exclusivity or inventory knowledge in unrelated markets.
 
-The two selected tokens come from verified fixed-market metadata. Authenticated
-GET `/balance-allowance` with CONDITIONAL/token_id/signature_type=1 reads each
-quantity in integer base units (divided by 1,000,000). Fresh exact condition and
-binary Yes/No token identity authorize this observational GET independently of
-opening eligibility. An in-play or liquidity refusal still blocks `on`; it does
-not turn an unread balance into zero. `CONDITIONAL_IDENTITY_UNAVAILABLE` separates
-metadata/account identity failures from `CONDITIONAL_BALANCE_UNAVAILABLE` for
-actual balance HTTP/parsing failures. A new state needs both
-quantities explicitly zero; an empty directory cannot establish that. Existing
-history needs a matching latest stopped process/control/result, full owned
-wallet/market/token identity, successful complete reconciliation, terminal known
-orders/merges and complete finite nonnegative Position quantities/costs exactly
-matching both fresh balances. Missing, foreign, interrupted or unmatched history
-is UNKNOWN. Checks read journal snapshots without constructing a writing Journal,
-replaying a ledger, adopting inventory or changing allowances. Unsettled WAL
-history also remains UNKNOWN. Orphan WAL/SHM/rollback sidecars, including empty
-or dangling artifacts without the main database, cannot be treated as new state.
-A nonempty rollback journal alongside the database also blocks immutable reads;
-check never recovers, checkpoints, deletes or replaces such history. All
-handoff/account/executor facts are read again inside the target control lock before stopping readonly. Explicit environment
-preparation also repeats the handoff proofs under that lock before writing run.env.
+The selected tokens still come from verified fixed-market metadata. Historical
+wallet, market and token identities must match that metadata, without reading
+conditional-token balances or requiring an inventory handoff. Journal snapshots
+are read without constructing a writing Journal, adopting inventory or changing
+allowances. Orphan WAL/SHM/rollback sidecars, including empty or dangling artifacts
+without the main database, cannot be treated as new state. Required account and
+executor facts are read again under the target control lock before stopping
+readonly, and before authorized run.env preparation.
 
 Authenticated L2 GETs prove balance, explicit spender allowances, closed-only
 state and order observations independently. Authenticated relayer `/transactions`
@@ -308,12 +324,12 @@ must also compare the current private operator SOP before field acceptance.
 | Target/version | Existing SSH trust + exact pin; current release/COMPLETE/source/runtime match SHA | Refuse; no release switch |
 | Files/wallet | Owned private files; derived signer + complete Proxy/L2 identity | Independent FAIL/UNKNOWN; no signing client |
 | Config/state | Exact market/capital/SHA; original 0700 state/journal identity | Refuse drift; preserve all state |
-| Executor/handoff | Inactive/disabled legacy service, no alternate local live executor, readonly active, fixed lock/unit/port, zero authenticated orders; both verified token balances match a complete owned stopped snapshot (or explicit new-state zeros) | Busy/conflict/incomplete or unmatched inventory blocks new start |
+| Executor/orders | Inactive/disabled legacy service, no alternate local live executor, readonly active, fixed lock/unit/port and complete external-target-order check | Busy/conflict/incomplete or external orders block new start; no inventory handoff |
 | Public market | #14 scope/identity/time and every required public check | Missing capability UNKNOWN; no duplicate fee policy |
 | Private account | Balance, explicit allowances, closed-only, region, relayer auth and concrete supported Proxy configuration | Missing required evidence UNKNOWN blocks; runtime merge remains NOT_RUN |
 | Service/preparation | Existing operator authority, immutable release, effective unit paths, user, env, conflicts, restart/boot policy | Service-owned app state; finite privileged unit actions; no permission install |
-| Switch | Same revision/facts/window before and after confirmation, target mutation lock | No unconfirmed mutation; action receipt before start |
-| Live readback | Actual protected PID arguments and full derived account identity; two fresh advancing same-run snapshots with accounting SUCCESS | Bounded observation; owned drain/read-only rollback |
+| Switch | Same revision/facts before and after confirmation, target mutation lock | No unconfirmed mutation; action receipt before start |
+| Live readback | Actual protected PID arguments and full derived account identity; two fresh advancing same-run snapshots; UNKNOWN accounting stays UNKNOWN | Bounded observation; owned drain/read-only rollback |
 | Stop/drain | Existing ExecStop; matching process result + fresh successful journal drain | Preserve failed/old/missing results and residuals |
 | Restore | Executor lock released and port free, then read-only identity/mode readback | Restore separate from drain; overall remains nonzero on uncertainty |
 | Evidence | Whitelisted JSON statuses and local protected operation/run records | No raw credentials, response bodies or transaction history |
@@ -324,13 +340,13 @@ or field acceptance is claimed by this implementation's offline verification.
 ## Single-market rotation
 
 `trading.market_condition_id` and `LP_V2_MARKET` name the startup seed. Initial
-`verify_start` still requires two fresh eligible rounds for that seed. The host records those two independently verified seed rounds in the bound
+`verify_start` requires two fresh identity-bound observations for that seed. The host records those two independently verified seed rounds in the bound
 on/run record. The scanner may finish earlier, but automatic rotation stays
 locked until that durable same-action/same-run proof exists. Subsequent score
 changes have no cooldown or debounce. Repeating an already verified on action
 returns that action's result, including after its active market has rotated.
-A new confirmed on can return to the seed only after all retained owned markets
-prove flat; restarting the same on restores its last recorded phase instead.
+A new confirmed on starts from its checked seed; retained inventories are not an
+admission gate. Restarting the same on restores its last recorded phase.
 That recovery retains the logical on/run identity only when the prior physical
 lease, action, frozen profile and durable rotation state agree. The replacement
 executor takes a fresh exclusive lease and records its current PID/start identity;
@@ -348,26 +364,26 @@ their observation time; entry rereads books and all named public/account checks.
 A partial round may be displayed but cannot initiate active rotation.
 
 Only a strictly higher executable score from a complete round initiates exit.
-If the current market leads again during exit, opening resumes in that same
-market. Ineligibility starts exit on the next decision round even with an expired
-window. Exit stops opening, cancels owned opening orders immediately, and keeps
-covered BUY hedges and merges. Dust, unaffordable hedges, UNKNOWN requests/cancels,
-unsettled merges or inconsistent balances keep the market in recovery; there is
-no sale, taker chase or forced liquidation.
+If the current market leads again during exit, opening can resume in that market.
+Ineligibility starts exit on the next decision round. Exit cancels owned orders
+and stops old-market execution; it does not wait for hedges or merges, even for
+tradable one-sided inventory. A complete open list with no owned candidate IDs
+permits leaving. Required network read failures still pause ordinary rounds and
+cancel owned orders; an incomplete open list never proves exit.
 
-Before entry, old-market owned orders, pending requests and uncertainty must be
-absent, complete merge history terminal, and both conditional balances zero and
-consistent with the owned ledger. Clearance is checked again after drain: a late
-fill returns to recovery instead of allowing another market. Target inventory
-must independently prove flat, including retained journal history. A rejected
-candidate is skipped before activation; once a candidate owns execution, failures
-remain its recovery responsibility.
+Residuals, including 0.008133, remain in the wallet for the operator to handle
+outside this program. There are no conditional-balance comparisons, inventory
+entry/exit gates, residual sales, transfers or automatic residual merges. Valid
+owned fills continue to be booked for capital, hedging and merging while their
+market is active. Inconsistent readback rows are skipped with one diagnostic per
+row/reason; direct new-order validation, capital limits and no-replay rules remain.
 
-The confirmed action id/window are read from the bound host run record. Selection
-checks the window, and the actual first-signature boundary checks it again.
-Valid current execution can continue after expiry, but no new market can enter;
-invalid current execution exits to flat and displays `needs_new_on`. A standalone
-live command without a bound control action invents no automatic-entry window.
+Entry does not recheck retired markets for flatness or inspect target inventory.
+It still refreshes candidate books, public/account facts and external target
+orders. Once a candidate becomes active, its execution failures remain that
+market's recovery responsibility. The same authenticated on can sign and rotate
+after any old window timestamp until off. A standalone command without a bound
+control action receives no automatic-entry authorization.
 
 State consists of append-only `rotation.sqlite` phase events and one immutable
 identity per `markets/<condition_id>/journal.sqlite`. Historical journals are
@@ -377,8 +393,7 @@ market paths, symlinks, short-prefix collisions and historical request-id collis
 are refused. Order and merge ids include the market prefix. Restart restores
 running/exiting/cleared/revalidating phases without resubmitting old intents.
 
-Host checks and stopped inventory handoff resolve the active journal from the
-original seed profile and retain full wallet, token, process/run, sequence and
-path proof. Sequence numbers are scoped to their own market database. `off` stops
+Host identity checks and stop evidence resolve the active journal from the
+original seed profile and retain wallet/token, process/run, sequence and path proof. Sequence numbers are scoped to their own market database. `off` stops
 the recorded process and drains every retained owned market, preserving foreign
 manual orders. This remains a single-host guard, not distributed wallet exclusivity.

@@ -75,7 +75,7 @@ def owned_order_ids(profile):
 def account_checks(profile):
     from lp_v2.readonly_sdk import L2Credentials, ReadOnlySDK
     from datetime import datetime, UTC
-    names=('private_identity','balance','allowance','closed_only','legacy_orders','region','relayer_auth','relayer_merge','proxy_execution','inventory_handoff')
+    names=('private_identity','balance','allowance','closed_only','legacy_orders','region','relayer_auth','relayer_merge','proxy_execution')
     result={name:fact('UNKNOWN','ACCOUNT_EVIDENCE_MISSING') for name in names}
     try:
         credentials=L2Credentials(**read_json(profile['files']['l2_credentials']))
@@ -101,23 +101,15 @@ def account_checks(profile):
             result.update(sdk.read_account_readiness(datetime.now(UTC),capital_usdc=profile['trading']['capital_usdc'],
                 identity=identity,relayer=relayer,condition_id=active_profile['trading']['market_condition_id'],known_order_ids=own))
             try:
-                from lp_v2.readonly_sdk import ConditionalIdentityUnavailable
-                from lp_v2.live_control.handoff import inventory_handoff
-                from lp_v2.rotation_state import control_market_profile
-                active_profile=control_market_profile(profile)
-                quantities=sdk.read_conditional_inventory(datetime.now(UTC),active_profile['trading']['market_condition_id'])
-                orders=sdk.read_orders(datetime.now(UTC),condition_id=active_profile['trading']['market_condition_id'],known_order_ids=own)
-                absence_orders=()
-                if orders.get('complete') is True and orders.get('owned_open_count')==0 and journal_present(profile):
-                    stopped=journal_rows(profile,'stop_result')
-                    if stopped and stopped[-1][1].get('pending'):
-                        absence_orders=(sdk.read_orders(datetime.now(UTC),
-                            condition_id=active_profile['trading']['market_condition_id'],known_order_ids=own),)
-                result['inventory_handoff']=inventory_handoff(profile,quantities,orders=orders,absence_orders=absence_orders)
-            except ConditionalIdentityUnavailable:
-                result['inventory_handoff']=fact('UNKNOWN','CONDITIONAL_IDENTITY_UNAVAILABLE')
+                if journal_present(profile):
+                    from lp_v2.live_control.identity import single_market_tokens
+                    market=active_profile['trading']['market_condition_id']
+                    expected=sdk.read_token_ids(market)
+                    if any(single_market_tokens(row,'lp-v2:'+identity['wallet_address'].lower(),market)!=expected
+                           for _,row in journal_rows(profile,'identity')):
+                        result['state_identity']=fact('FAIL','JOURNAL_FROZEN_IDENTITY')
             except Exception:
-                result['inventory_handoff']=fact('UNKNOWN','CONDITIONAL_BALANCE_UNAVAILABLE')
+                result['state_identity']=fact('UNKNOWN','STATE_IDENTITY_UNAVAILABLE')
         finally:
             sdk.close()
     except Exception:
@@ -126,12 +118,11 @@ def account_checks(profile):
 
 
 def confirmed(request,operation):
-    from lp_v2.live_control.profiles import fingerprint,timestamp
+    from lp_v2.live_control.profiles import fingerprint
     from lp_v2.live_control.workflow import fresh
-    from datetime import datetime,UTC
     proof=request.get('confirmation',{})
     return (proof.get('operation')==operation and proof.get('profile_sha256')==fingerprint(request['profile'])
-            and fresh(proof.get('issued_at')) and timestamp(proof.get('window_end'))>datetime.now(UTC))
+            and fresh(proof.get('issued_at')))
 
 
 def prepare(request):
@@ -151,7 +142,7 @@ def prepare(request):
     from lp_v2.live_control.workflow import normalize_report
     readiness=normalize_report(profile,check(profile))
     if any(readiness['checks'][key]['status']!='PASS' for key in
-           ('private_identity','single_executor','legacy_service','legacy_orders','inventory_handoff')):
+           ('private_identity','state_identity','single_executor','legacy_service','legacy_orders')):
         return readiness
     path=Path(profile['files']['run_env'])
     with owner_file(path) as source:
@@ -193,7 +184,6 @@ def journal_present(profile):
 
 
 def _journal_present(path):
-    import os
     try:
         path.lstat();present=True
     except FileNotFoundError:
@@ -205,9 +195,7 @@ def _journal_present(path):
         if not present:raise ValueError('orphan journal history')
         # owner_file refuses symlinks, unreadable/foreign modes and non-regular
         # files without following a sidecar into unrelated data.
-        with owner_file(sidecar) as source:
-            if suffix in ('-wal','-journal') and os.fstat(source.fileno()).st_size:
-                raise ValueError('unsettled journal history')
+        with owner_file(sidecar):pass
     return present
 
 
@@ -221,7 +209,7 @@ def _journal_rows(path,kind=None):
     # No Journal constructor, pragmas or database creation on observational reads.
     if not _journal_present(path):raise ValueError('journal missing')
     with owner_file(path): pass
-    db=sqlite3.connect(path.as_uri()+'?mode=ro&immutable=1',uri=True)
+    db=sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)
     try:
         if kind is None:
             return [(seq,event,decode(payload)) for seq,event,payload in db.execute('SELECT seq,kind,payload FROM events ORDER BY seq')]
@@ -318,9 +306,9 @@ def off(request):
         final=read_json(state/'stop-result.json')
         from lp_v2.live_process import stop_result_matches
         if (stop_result_matches(process,final) and type(final['exit_code']) is int and final['exit_code']==0
-                and type(drain['exit_code']) is int and drain['exit_code']==0 and drain['reconciliation']=='SUCCESS'
-                and seq>run_journal_sequence(record,control_market_profile(profile)['trading']['market_condition_id']) and timestamp(drain['at'].isoformat())>timestamp(record['started_at'])
-                and merges['status']=='PASS' and not drain['pending'] and all(order.authoritative and order.status.value in ('filled','cancelled') for order in drain['orders'])):
+                and type(drain['exit_code']) is int and drain['exit_code']==0
+                and seq>run_journal_sequence(record,control_market_profile(profile)['trading']['market_condition_id'])
+                and timestamp(drain['at'].isoformat())>timestamp(record['started_at'])):
             drained='PASS'
         elif stop_result_matches(process,final) and final['exit_code']!=0:
             drained='FAIL'
@@ -601,7 +589,7 @@ def record_start_observation(request,snapshot):
         fcntl.flock(fd,fcntl.LOCK_EX)
         record=read_json(state/'live-control-run.json');process=read_json(state/'process.json')
         if (record['profile']!=profile or record['run_id']!=request['run_id'] or process['run_id']!=record['run_id']
-                or request.get('action_id',record['action_id'])!=record['action_id'] or not record['window_end']):
+                or request.get('action_id',record['action_id'])!=record['action_id']):
             raise ValueError('startup proof run mismatch')
         from lp_v2.rotation_state import verified_start_rotation
         snapshot['rotation_verification']=verified_start_rotation(profile,record,process,snapshot['summary'])
@@ -645,7 +633,7 @@ def start(request):
     from lp_v2.live_control.invocation import binding,file_snapshot
     invocation=dict(argv=binding(profile,system_properties(profile['services']['live_unit'],prove_exec=True),env_values(profile),run),
                     snapshot=file_snapshot(profile))
-    record=dict(profile=profile,run_id=None,started_at=now(),journal_seq=seq,journal_seqs=journal_seqs,action_id=request['action_id'],window_end=request['window_end'],invocation=invocation)
+    record=dict(profile=profile,run_id=None,started_at=now(),journal_seq=seq,journal_seqs=journal_seqs,action_id=request['action_id'],window_end=request.get('window_end'),invocation=invocation)
     atomic_json(state/'live-control-run.json',record)
     if run(['systemctl','stop',profile['services']['readonly_unit']]).returncode:
         return dict(status='UNKNOWN',reason='READONLY_STOP_FAILED')

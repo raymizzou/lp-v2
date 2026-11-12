@@ -274,11 +274,11 @@ def test_fixed_market_rotation_distinguishes_confirmed_invalid_and_unknown(tmp_p
         confirmed = case in ('accepting_orders_false', 'in_play_true', 'rewards_disabled',
                              'active_false', 'closed_true', 'order_book_disabled')
         assert report['rotation']['switch_count'] == (1 if confirmed else 0)
-        assert report['rotation']['phase'] == ('exiting' if confirmed else 'running')
+        assert report['rotation']['phase'] == ('cleared' if confirmed else 'running')
         invalid_exits = [event for _, event in rotation.journal.events('rotation')
                          if event['phase'] == 'exiting' and event['reason'] == 'current_invalid']
         assert len(invalid_exits) == (1 if confirmed else 0)
-        assert report['rotation']['current'] == CID
+        assert report['rotation']['current'] == (None if confirmed else CID)
         assert all(ex.orders[oid].status == 'CANCELED' for oid in original)
         assert ex.sdk.create_limit_order.call_count == signatures
         assert len(ex.posts) == 2

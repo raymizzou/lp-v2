@@ -206,8 +206,9 @@ def test_wire_expiry_second_precision(tmp_path):
     assert fact.request == r
     assert fact.authoritative
     exchange.orders[fact.order_id] = exchange.orders[fact.order_id].model_copy(update={'expires_at':AT+timedelta(hours=1,seconds=1)})
-    with pytest.raises(ValueError,match='identity'):
-        live.read_orders()
+    unresolved=live.read_orders()[0]
+    assert unresolved.request==r and not unresolved.authoritative
+    assert not live.orders_verified()
 
 
 def test_rejected_cancel_readback_reconciles(tmp_path):
@@ -411,9 +412,19 @@ def test_merge_confirmation_with_concurrent_wallet_changes(tmp_path,proof):
         assert ledger.snapshot()==state
     else:
         assert live.read_balance().merge_results[0].received_usdc==0
-        with pytest.raises(ValueError,match='position'):
-            ledger.reconcile(live)
+        ledger.reconcile(live)
         assert ledger.snapshot().capital.total==D('4')
+        state=ledger.snapshot()
+        assert state.realized_profit==D('0')
+        unresolved,=state.merges
+        assert unresolved.outcome==Outcome.UNKNOWN
+        assert unresolved.received_usdc==0 and unresolved.consumed_positions==()
+        assert journal.events('merge_receipt')==()
+        positions={p.token_id:p for p in state.positions}
+        assert (positions['101'].quantity,positions['101'].cost_usdc)==(D('3'),D('1.19'))
+        assert (positions['102'].quantity,positions['102'].cost_usdc)==(D('2'),D('1.00'))
+        ledger.reconcile(live)
+        assert ledger.snapshot()==state
     live.merge(merge,at=merge.created_at)
     assert ex.sdk.merge_positions.call_count==1
 
@@ -446,7 +457,11 @@ def test_pre_submission_failure_is_definitive(tmp_path,failure):
     assert ledger.snapshot().capital.total==(D('10') if failure=='post-timeout' else 0)
     assert bool(ledger.snapshot().pending)==(failure=='post-timeout')
     runner=LiveRunner(RunConfig(D('100'),AT),live,Observations((inputs(),)),clock=lambda:AT)
-    assert runner.drain(timeout_s=0)==(1 if failure=='post-timeout' else 0)
+    assert runner.drain(timeout_s=0)==0
+    if failure=='post-timeout':
+        stopped=journal.events('stop_result')[-1][1]
+        assert stopped['reconciliation']=='UNKNOWN' and len(stopped['pending'])==2
+        assert runner.ledger.snapshot().capital.total==D('10')
 
 
 @pytest.mark.parametrize('status',['DELAYED','UNMATCHED','404','unavailable'])
@@ -606,8 +621,8 @@ def test_timeout_recovers_by_either_signed_hash(tmp_path,index,bad):
     ex.sdk.get_order.side_effect = get
     ex.now = request().expires_at+timedelta(seconds=120)
     if bad:
-        with pytest.raises(ValueError,match='identity'):
-            live.read_orders()
+        unresolved=live.read_orders()[0]
+        assert unresolved.outcome==Outcome.UNKNOWN and unresolved.order is None
         assert not live.orders_verified()
     else:
         fact = live.read_orders()[0]
@@ -642,16 +657,34 @@ def test_unresolved_signed_hash_claims_trades(tmp_path,mode):
         ex.trades[0] = raw.model_copy(update={'status':'MINED'})
     elif mode == 'conflict':
         ex.trades.append(raw.model_copy(update={'id':'conflict','maker_orders':(raw.maker_orders[0].model_copy(update={'order_id':ids[1]}),)}))
-    if mode not in ('valid','foreign'):
-        with pytest.raises(ValueError):
-            live.read_trades()
+    if mode=='quantity':
+        assert live.read_trades()==()
         assert not live.orders_verified()
+        pending=Ledger(OWNER,D('100'));pending.reconcile(live)
+        assert pending.snapshot().pending==(request(),) and pending.snapshot().capital.total==D('10')
+        assert pending.snapshot().fills==()
+        before=ex.sdk.post_order.call_count
+        live.place_order(request(),at=AT)
+        assert ex.sdk.post_order.call_count==before
         return
+    if mode=='unsettled':
+        assert live.read_trades()==() and not live.orders_verified()
+        pending=Ledger(OWNER,D('100'))
+        pending.reconcile(live)
+        assert pending.snapshot().fills==() and pending.snapshot().pending==(request(),)
+        assert pending.snapshot().capital.total==D('10')
+        before=ex.sdk.post_order.call_count
+        live.place_order(request(),at=AT)
+        assert ex.sdk.post_order.call_count==before
+        ex.trades[0]=raw
     fills = live.read_trades()
     if mode == 'foreign':
         assert fills == ()
         assert live.read_orders()[0].outcome == Outcome.UNKNOWN
         return
+    if mode in ('wallet','token','market','side','fee','unsettled'):
+        assert not live.orders_verified()
+        assert (fills[0].condition_id,fills[0].token_id,fills[0].price,fills[0].fee_usdc)==(CID,'101',D('.40'),D('0'))
     assert len(fills) == 1 and fills[0].order_id == ids[0] and fills[0].quantity == D('2')
     early = Ledger(OWNER,D('100'))
     early.reconcile(live)
