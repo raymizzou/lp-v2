@@ -57,8 +57,6 @@ def evaluate_rotation(ranking, *, current, phase, complete, current_valid, now, 
     leader = ranking.leader
     if current is not None and current_valid is False:
         return RotationDecision('exit', None, 'current_invalid')
-    if window_end is None or now >= window_end:
-        return RotationDecision('hold', None, 'window_expired' if current else 'needs_new_on')
     if not complete:
         return RotationDecision('hold', None, 'incomplete_scan')
     if leader is None:

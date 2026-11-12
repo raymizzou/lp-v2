@@ -391,10 +391,8 @@ class ReadOnlySDK:
         return dict(blocked=raw.get('blocked'),country=raw.get('country'))
 
 
-    def read_conditional_inventory(self, now, condition_id):
-        """Fresh selected-market quantities, from verified tokens and authenticated GETs."""
-        from decimal import Decimal
-        from polymarket.models.clob.account import BalanceAllowance
+    def read_token_ids(self, condition_id):
+        """Resolve authenticated account/market identity without reading balances."""
         import json,re
         from polymarket._internal.wallet import classify_wallet_type
         from polymarket.environments import PRODUCTION
@@ -412,9 +410,15 @@ class ReadOnlySDK:
             if (not isinstance(tokens,list) or len(tokens)!=2 or outcomes!=['Yes','No']
                     or not all(isinstance(t,str) and re.fullmatch('[0-9]+',t) for t in tokens)
                     or len(set(tokens))!=2):raise ValueError()
-            tokens=tuple(tokens)
+            return tuple(tokens)
         except Exception:
             raise ConditionalIdentityUnavailable('CONDITIONAL_IDENTITY_UNAVAILABLE') from None
+
+    def read_conditional_inventory(self, now, condition_id):
+        """Fresh selected-market quantities, from verified tokens and authenticated GETs."""
+        from decimal import Decimal
+        from polymarket.models.clob.account import BalanceAllowance
+        tokens=self.read_token_ids(condition_id)
         quantities={}
         for token in tokens:
             raw=self.__account_get('/balance-allowance',now,dict(asset_type='CONDITIONAL',token_id=token,signature_type='1'))

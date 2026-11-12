@@ -228,14 +228,15 @@ def test_stop_timeout_records_residuals(tmp_path, mode):
     def wait(seconds):
         tick[0] += seconds
         assert tick[0] <= 5
-    assert runner.drain(timeout_s=5,monotonic=lambda:tick[0],wait=wait) != 0
+    result = runner.drain(timeout_s=5,monotonic=lambda:tick[0],wait=wait)
+    assert (result == 0) if mode == 'placement' else (result != 0)
     residual = journal.events('stop_result')[-1][1]
-    assert residual['exit_code'] != 0
+    assert (residual['exit_code'] == 0) if mode == 'placement' else (residual['exit_code'] != 0)
     if mode == 'placement':
         assert len(residual['pending']) == 2
     else:
         assert {o.order_id for o in residual['orders']} == {'order-1','order-2'}
-    assert tick[0] == 5
+    assert tick[0] == (0 if mode == 'placement' else 5)
 
 
 def test_restart_preserves_hedge(tmp_path):
@@ -286,7 +287,7 @@ def test_round_audit_contains_breakdown_and_uncertainty(tmp_path):
     tick=[0]
     def wait(seconds):
         tick[0]+=seconds
-    assert runner.drain(timeout_s=1,monotonic=lambda:tick[0],wait=wait)==1
+    assert runner.drain(timeout_s=1,monotonic=lambda:tick[0],wait=wait)==0
     residual=journal.events('stop_result')[-1][1]
     assert residual['inventory'][0]['quantity']==D('2')
     assert residual['inventory'][0]['cost_usdc']==D('.80')
@@ -313,10 +314,14 @@ def test_stop_attempts_known_cancels_when_reads_fail(tmp_path,failed_read):
     tick=[0]
     def wait(seconds):
         tick[0]+=seconds
-    assert runner.drain(timeout_s=1,monotonic=lambda:tick[0],wait=wait)==1
+    expected_exit=1 if failed_read=='open-orders' else 0
+    assert runner.drain(timeout_s=1,monotonic=lambda:tick[0],wait=wait)==expected_exit
     assert [c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list]==['order-1','order-2']
     assert ex.orders['foreign'].status=='LIVE'
-    assert journal.events('stop_result')[-1][1]['exit_code']==1
+    assert journal.events('stop_result')[-1][1]['exit_code']==expected_exit
+    if failed_read=='positions':
+        assert all(c.kwargs['asset_type']!='CONDITIONAL' for c in ex.sdk.get_balance_allowance.call_args_list)
+        assert len(ex.posts)==2
 
 
 @pytest.mark.parametrize('first',['exception','unknown','refused','persistent'])
@@ -394,7 +399,7 @@ def test_one_order_read_per_round(tmp_path,restart):
     assert runner.ledger.snapshot().positions[0].quantity==D('6')
     assert len(runner.ledger.snapshot().fills)==2
     ex.sdk.get_order.reset_mock()
-    assert runner.drain(timeout_s=0)==1  # Unknown hedge remains reserved; cancellation ack is insufficient.
+    assert runner.drain(timeout_s=0)==0  # The complete open list permits stopping; unknown hedge history remains.
     counts=Counter(c.kwargs['order_id'] for c in ex.sdk.get_order.call_args_list)
     assert all(counts[oid]==0 for oid in (*terminal,no))
     assert max(counts.values())<=1
@@ -424,11 +429,18 @@ def test_denied_or_failed_round_cancels_owned_orders(tmp_path,reason):
     before=len(ex.posts)
     result=step_at(runner, AT+timedelta(seconds=10))
     assert len(ex.posts)==before
-    assert {c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list}=={'order-1','order-2'}
+    if reason=='positions':
+        assert ex.sdk.cancel_order.call_args_list==[]
+        assert all(c.kwargs['asset_type']!='CONDITIONAL' for c in ex.sdk.get_balance_allowance.call_args_list)
+    else:
+        assert {c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list}=={'order-1','order-2'}
     assert ex.orders['foreign'].status=='LIVE'
     assert runner.ledger.snapshot().capital.total==D('10')
     if reason in ('jp-closed','blocked'):assert result['run']['region_check']=='blocked'
     assert runner.drain(timeout_s=0)==1
+    if reason=='positions':
+        assert [c.kwargs['order_id'] for c in ex.sdk.cancel_order.call_args_list]==['order-1','order-2']
+        assert ex.orders['foreign'].status=='LIVE'
 
 
 def timeout_second_post(ex):
@@ -598,14 +610,18 @@ def test_drain_cancels_owned_active_despite_terminal_history(tmp_path,mode):
     assert calls and calls[0] == ('order-1',0)
     assert all(oid == 'order-1' for oid,_ in calls)
     assert ex.orders['foreign'].status == 'LIVE'
-    if mode in ('success','transient'):
+    if mode in ('success','transient','failed-positions'):
         assert result == 0 and ex.orders['order-1'].status == 'CANCELED'
-        assert [at for _,at in calls] == ([0] if mode == 'success' else [0,5])
+        assert [at for _,at in calls] == ([0,5] if mode == 'transient' else [0])
         assert 'order-1' not in reads[-1][1] and len(reads) >= 2
         assert all(o.authoritative and o.status != 'live' for o in runner.ledger.snapshot().orders)
+        if mode=='failed-positions':
+            assert all(c.kwargs['asset_type']!='CONDITIONAL' for c in ex.sdk.get_balance_allowance.call_args_list)
+            assert journal.events('stop_result')[-1][1]['exit_code']==0
     else:
-        assert result == 1
-        assert journal.events('stop_result')[-1][1]['exit_code'] == 1
+        expected_exit = 1 if mode == 'persistent' else 0
+        assert result == expected_exit
+        assert journal.events('stop_result')[-1][1]['exit_code'] == expected_exit
         if mode == 'persistent':
             assert [at for _,at in calls] == [0,5,10]
             assert ex.orders['order-1'].status == 'LIVE'

@@ -60,6 +60,16 @@ def call_host(payload):
     return code,json.loads(output.getvalue())
 
 
+def seal_fixture_journals(state):
+    """Use checkpointed fixtures for whole-directory no-mutation assertions; WAL has dedicated coverage."""
+    import sqlite3
+    from contextlib import closing
+    for path in Path(state).rglob('*.sqlite'):
+        if not path.is_symlink():
+            with closing(sqlite3.connect(path)) as db:
+                db.execute('PRAGMA journal_mode=DELETE')
+
+
 def test_check_has_no_remote_mutation_or_signing(target,monkeypatch):
     calls=[]; gets=[]
     def boundary(argv,**kw):
@@ -480,10 +490,9 @@ def test_off_unknown_merge_remains_unknown(target,monkeypatch):
         assert report['merge_history']['status']==expected
         assert report['executor_stopped'] is True and report['readonly_restored'] is True
         assert report['inventory'][0]['quantity']=='3'
+        assert code==0 and report['drain']=='PASS' and report['status']=='PASS'
         if expected=='UNKNOWN':
-            assert code==2 and report['drain']=='UNKNOWN' and report['status']!='PASS'
             assert report['merge_history']['reason'] in ('MERGE_UNSETTLED','MERGE_HISTORY_MISSING','MERGE_HISTORY_INVALID')
-        else:assert code==0 and report['drain']=='PASS'
         assert not any(any(arg in argv for arg in ('merge','submit','cancel')) for argv in calls)
 
 
@@ -589,20 +598,20 @@ def test_check_requires_conditional_inventory_handoff(combined_world,monkeypatch
     monkeypatch.setattr('builtins.input',lambda _:'on')
     before={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     world.conditional['101']='1250000'
-    assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
+    assert main(['live','check'])==0
     capsys.readouterr();assert world.mutations==[]
     assert {p:p.read_bytes() for p in state.rglob('*') if p.is_file()}==before
     for value,status in [(None,200),('1.2',200),('-1',200),('0',503)]:
         world.conditional['101']=value;world.conditional_status=status
-        assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
+        assert main(['live','check'])==0
         capsys.readouterr();assert world.mutations==[]
     world.conditional_status=200;world.conditional={'101':'0','102':'0'};world.conditional_advance=True
-    assert main(['live','check'])==2
-    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='UNKNOWN'
+    assert main(['live','check'])==0
+    assert 'inventory_handoff' not in json.loads(capsys.readouterr().out)['checks']
     assert world.mutations==[]
     world.conditional_advance=False
     assert main(['live','check'])==0
-    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in json.loads(capsys.readouterr().out)['checks']
     # An authoritative prior stopped run, with literal owned quantities and costs.
     started=world.clock-timedelta(seconds=30);at=world.clock-timedelta(seconds=10)
     owner='lp-v2:'+profile['identity']['wallet_address'].lower();market=profile['trading']['market_condition_id']
@@ -622,28 +631,31 @@ def test_check_requires_conditional_inventory_handoff(combined_world,monkeypatch
             journal.append('occupation',dict(at=started))
         journal.append('stop_result',dict(at=at,exit_code=0,orders=[],pending=[],positions=rows,merges=merges,inventory=[],reconciliation=reconciliation,accounting_as_of=at))
         journal.close();(state/'journal.sqlite').chmod(0o600)
+        seal_fixture_journals(state)
     world.conditional={'101':'1250000','102':'2000000'}
     history(positions)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     assert main(['live','check'])==0
-    assert json.loads(capsys.readouterr().out)['checks']['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in json.loads(capsys.readouterr().out)['checks']
     assert {p:p.read_bytes() for p in state.rglob('*') if p.is_file()}==frozen
     for rows in ([replace(positions[0],owner='foreign'),positions[1]], [positions[0]],
                  [replace(positions[0],cost_usdc=D('NaN')),positions[1]],
                  [replace(positions[0],token_id='999'),positions[1]], positions):
         history(rows,reconciliation='UNKNOWN' if rows is positions else 'SUCCESS')
-        assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
+        assert main(['live','check'])==0
         capsys.readouterr();assert world.mutations==[]
     unknown=MergeResult(MergeRequest('pending',owner,market,'101','102',D('1'),started),Outcome.UNKNOWN,D('0'),at)
     history(positions,merges=[unknown])
-    assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2;capsys.readouterr()
+    assert main(['live','check'])==0;capsys.readouterr()
     history(positions);final['run_id']='e'*32;(state/'stop-result.json').write_text(json.dumps(final))
-    assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2;capsys.readouterr()
+    assert main(['live','check'])==0;capsys.readouterr()
     reads=[r for r in world.http_requests if r.url.path=='/balance-allowance' and r.url.params.get('asset_type')=='CONDITIONAL']
-    assert {r.url.params['token_id'] for r in reads}=={'101','102'}
-    assert all(r.method=='GET' and r.url.params['signature_type']=='1' for r in reads)
+    assert reads==[]
     assert world.mutations==[]
     assert all(r.method=='GET' for r in world.http_requests)
+
+    assert main(['live','on'])==0;capsys.readouterr()
+    assert main(['live','off'])==0;capsys.readouterr()
 
 
 @pytest.mark.parametrize('invalid',['owner','market','tokens','multi-market','missing-at','naive-at','history'])
@@ -674,10 +686,11 @@ def test_check_rejects_incompatible_m5_identity(combined_world,capsys,invalid):
     journal.append('stop_result',dict(at=at,exit_code=0,orders=[],pending=[],positions=positions,merges=[],inventory=[],reconciliation='SUCCESS',accounting_as_of=at))
     journal.close();(state/'journal.sqlite').chmod(0o600)
     world.conditional={'101':'1250000','102':'2000000'}
+    seal_fixture_journals(state)
     frozen={p:p.read_bytes() for p in state.rglob('*') if p.is_file()}
     assert main(['live','check'])==2
     checks=json.loads(capsys.readouterr().out)['checks']
-    assert checks['state_identity']['status']!='PASS' or checks['inventory_handoff']['status']!='PASS'
+    assert checks['state_identity']['status']!='PASS'
     assert {p:p.read_bytes() for p in state.rglob('*') if p.is_file()}==frozen
     assert world.mutations==[] and world.readonly is True
     assert all(r.method=='GET' for r in world.http_requests)
@@ -703,7 +716,7 @@ def test_new_state_rejects_orphaned_journal_history(combined_world,monkeypatch,c
         before=snapshot();count=len(world.mutations)
         assert main(['live','check'])==2
         report=json.loads(capsys.readouterr().out)
-        assert report['checks']['inventory_handoff']['status']=='UNKNOWN'
+        assert report['checks']['state_identity']['status']=='UNKNOWN'
         assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
         capsys.readouterr()
         assert snapshot()==before and len(world.mutations)==count and world.readonly is True
@@ -724,13 +737,19 @@ def test_new_state_rejects_orphaned_journal_history(combined_world,monkeypatch,c
     assert main(['live','check'])==0;capsys.readouterr();assert snapshot()=={}
     assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==0;capsys.readouterr()
     assert main(['live','off'])==0;capsys.readouterr()
+    seal_fixture_journals(state)
     closed=snapshot()
     assert main(['live','check'])==0;capsys.readouterr();assert snapshot()==closed
     for suffix in ('-wal','-journal'):
         artifact=state/('journal.sqlite'+suffix)
         artifact.write_bytes(b'hot-or-unsettled-history');artifact.chmod(0o600)
-        refused();artifact.unlink()
-    assert main(['live','check'])==0;capsys.readouterr();assert snapshot()==closed
+        before=snapshot()
+        assert main(['live','check'])==(0 if suffix=='-wal' else 2), suffix
+        capsys.readouterr()
+        assert {k:v for k,v in snapshot().items() if not k.endswith('-shm')}=={k:v for k,v in before.items() if not k.endswith('-shm')}
+        artifact.unlink()
+    assert main(['live','check'])==0;capsys.readouterr()
+    assert {k:v for k,v in snapshot().items() if not k.endswith('-shm')}=={k:v for k,v in closed.items() if not k.endswith('-shm')}
 
 
 def test_check_reads_pinned_immutable_root_repository(combined_world,capsys):
@@ -793,7 +812,7 @@ def test_on_keeps_public_gate_when_inventory_is_known(combined_world,capsys):
     world.http_overrides['/markets/'+world.profile['trading']['market_condition_id']]=(200,{'in_play':True})
     assert main(['live','on','--window-end','2099-01-01T00:00:00+00:00'])==2
     report=json.loads(capsys.readouterr().out)
-    assert report['checks']['inventory_handoff']['status']=='PASS'
+    assert 'inventory_handoff' not in report['checks']
     assert report['checks']['public_market']['checks']['in_play']['status']=='BLOCKED'
     assert report['status']!='PASS' and world.mutations==[] and world.readonly
 

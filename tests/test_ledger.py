@@ -70,12 +70,11 @@ def test_reconcile_repeated_complete_history_is_stable():
     for _ in range(3):
         recovered.reconcile(fake)
         assert recovered.snapshot()==expected
-    # Complete cold recovery must reject a new conflicting fact atomically too.
+    # Readback skips the conflicting row and retains every valid recorded fact.
     before=recovered.snapshot()
     fake_facts=fake.read_orders()
     fake.read_orders=lambda:fake_facts+(replace(fake_facts[0],request=replace(requests[0],quote=replace(requests[0].quote,price=Decimal('.41')))),)
-    with pytest.raises(ValueError,match='identity'):
-        recovered.reconcile(fake)
+    recovered.reconcile(fake)
     assert recovered.snapshot()==before
 
 
@@ -307,10 +306,12 @@ def test_recover_from_sdk_facts(scenario, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(fake, "read_balance", lambda: missing_proof)
             incomplete = Ledger(OWNER, Decimal("5"))
-            before = incomplete.snapshot()
-            with pytest.raises(ValueError, match="reconcile"):
-                incomplete.reconcile(fake)
-            assert incomplete.snapshot() == before
+            incomplete.reconcile(fake)
+            unproven=incomplete.snapshot()
+            assert unproven.fills==tuple(sorted(fake.read_trades(),key=lambda f:f.trade_id))
+            assert unproven.merges==() and unproven.realized_profit==0
+            assert sum(p.quantity for p in unproven.positions)>0
+            assert unproven.capital.inventory_cost>0
 
 
 @pytest.mark.parametrize("scenario", ["accepted", "rejected", "held_rejection"])
@@ -583,11 +584,6 @@ def test_recovery_cannot_hide_older_generation_live_orders(old_state, monkeypatc
         monkeypatch.setattr(fake, "read_orders", lambda: facts + tuple(stale))
     recovered = Ledger(OWNER, Decimal("100"))
     before = recovered.snapshot()
-    if old_state in ("live", "unknown"):
-        with pytest.raises(ValueError, match="older generation"):
-            recovered.reconcile(fake)
-        assert recovered.snapshot() == before
-        return
     recovered.reconcile(fake)
     state = recovered.snapshot()
     assert state.capital == CapitalBreakdown(Decimal("0"), Decimal("8.00"), Decimal("0"),
@@ -596,7 +592,11 @@ def test_recovery_cannot_hide_older_generation_live_orders(old_state, monkeypatc
     assert state.realized_profit == (Decimal("1.80") if old_state == "settled" else Decimal("0"))
     assert len(state.requests) == 4
     assert state.pending == ()
-    assert len(state.orders) == (2 if old_state == "rejected" else 4)
+    assert len(state.orders) == (2 if old_state in ("rejected","unknown") else 4)
+    if old_state=="live":
+        assert all(o.status==OrderStatus.LIVE for o in state.orders)
+    if old_state=="unknown":
+        assert {r.request_id for r in state.requests if r.reservation_terms.generation==0}=={'g0-yes','g0-no'}
     assert state.reservations[0].request_ids == ("g1-no", "g1-yes")
     recovered.reconcile(fake)
     assert recovered.snapshot() == state

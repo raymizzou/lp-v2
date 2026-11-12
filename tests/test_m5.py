@@ -260,10 +260,16 @@ def test_multimarket_execution_safety(tmp_path):
         reservation_terms=ReservationTerms(PAIRS[1],D('10'),(D('0'),D('0'))))
     assert sdk.place_order(hedge,at=AT).order is not None
     assert journal.events('intent')[-1][1]['hedge_ceiling']==D('.68')
-    # Readback must bind condition as well as token and wallet.
+    # Invalid readback keeps the original intent and reservation without a round failure.
     original=ex.orders['order-5']
     ex.orders['order-5']=original.model_copy(update={'condition_id':CIDS[1]})
-    with pytest.raises(ValueError):sdk.read_orders()
+    before_read=runner.ledger.snapshot()
+    rows=sdk.read_orders()
+    retained=next(r for r in rows if getattr(r,'order_id',None)=='order-5')
+    assert retained.request.quote.condition_id==CIDS[2] and retained.request.quote.token_id=='301'
+    assert not retained.authoritative and not sdk.orders_verified()
+    assert runner.ledger.snapshot()==before_read
+    assert any(p.get('reason')=='order_readback_invalid' for _,p in journal.events('diagnostic'))
     ex.orders['order-5']=original
     obs.region={}
     before=len(ex.posts)
@@ -394,10 +400,15 @@ def test_identity_market_transition(tmp_path,monkeypatch,mode):
     selected=replace(config,market=CIDS[1],markets=CIDS[1:])
     if mode=='tokens':selected=replace(config,markets=CIDS)
     kwargs=sources({**dict(zip(CIDS,PAIRS)),CID:('901','902')} if mode=='tokens' else None)
-    if mode in ('flat','terminal-empty','settled'):
+    if mode not in ('wallet','tokens','request-reuse'):
         removed=create_live_runner(selected,**kwargs)
         assert tuple(removed.sdk.markets)==CIDS[1:]
-        assert len(removed.sdk.journal.events('identity'))==3
+        assert len(removed.sdk.journal.events('identity'))==(4 if mode=='old-omission' else 3)
+        if mode in ('inventory','live','pending','unknown-order','old-omission'):
+            assert removed.sdk.journal.events('intent')[0][1]['request']==r
+        if mode=='unknown-merge':
+            assert removed.sdk.journal.events('merge_intent')[0][1]['request'].merge_id=='m'
+            assert removed.sdk.journal.events('merge_result')==()
         removed.sdk.close();removed.observations.close()
     else:
         with pytest.raises(ValueError):create_live_runner(selected,**kwargs)

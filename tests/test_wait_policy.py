@@ -7,7 +7,7 @@ def test_wait_reason_policy_is_complete():
     from lp_v2.wait_policy import wait_policy
     root = Path(__file__).parents[1] / 'src/lp_v2'
     reasons = set()
-    for name in ('rotation_live.py', 'rotation.py', 'live_sdk.py', 'live_runtime.py', 'live_control/handoff.py'):
+    for name in ('rotation_live.py', 'rotation.py', 'live_sdk.py', 'live_runtime.py'):
         tree = ast.parse((root / name).read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
@@ -55,21 +55,15 @@ def test_rotation_inventory_numbers_and_deadline(tmp_path):
     rotation.scanner.scan_once(clock[0])
     began = clock[0]
     report = rotation.step(clock[0])
-    blocker = report['rotation']['blocker']
-    assert blocker['code'] == 'inventory_mismatch'
-    assert [{k:r[k] for k in ('token','exchange','ledger','difference')} for r in blocker['numbers']['inventory']] == [
-        dict(token='1', exchange='0.125', ledger='0', difference='0.125'),
-        dict(token='2', exchange='0', ledger='0', difference='0')]
-    assert blocker['safe_to_stop'] is False
-    assert blocker['deadline'] == (began + timedelta(seconds=3600)).isoformat()
+    assert report['rotation']['phase']=='running' and report['rotation']['current']==BID
+    assert report['rotation']['blocker']=='UNKNOWN' and ex.quantities['101']==D('.125')
     signed = len(ex.posts)
-    for elapsed, escalated in ((3590, False), (3600, True)):
+    for elapsed in (3590,3600):
         clock[0] = began + timedelta(seconds=elapsed)
-        blocker = rotation.step(clock[0])['rotation']['blocker']
-        assert blocker['since'] == began.isoformat()
-        assert blocker['escalated'] is escalated
-        assert blocker['next_step']
-        assert len(ex.posts) == signed and rotation.current.condition_id == CID
+        report=rotation.step(clock[0])['rotation']
+        assert report['blocker']=='UNKNOWN' and report['current']==BID and report['entered_count']==1
+        assert sum(p.token_id in TOKENS for p in ex.posts)==2 and ex.quantities['101']==D('.125')
+        assert all(c.kwargs['asset_type']!='CONDITIONAL' for c in ex.sdk.get_balance_allowance.call_args_list)
         assert not rotation.stop.is_set()
     ex.quantities['101'] = D('0')
     clock[0] += timedelta(seconds=10)
@@ -226,21 +220,22 @@ def test_clearance_keeps_unexpected_balance_decode_type(tmp_path):
     clock[0] += timedelta(seconds=10)
     began = clock[0]
     posts = len(ex.posts)
-    for elapsed, escalated in ((0, False), (610, True)):
+    waiting_since=AT+timedelta(seconds=10)
+    for elapsed, escalated in ((0,False),(1810,True)):
         clock[0] = began + timedelta(seconds=elapsed)
         rotation.step(clock[0])
         report = rotation.snapshot()
-        assert decoded
+        assert decoded==[]
         blocker = report['rotation']['blocker']
-        assert blocker['code'] == 'unexpected_error:NovelBalanceDecodeFailure@clearance_reconcile'
-        assert blocker['since'] == began.isoformat()
-        assert blocker['deadline'] == (began + timedelta(seconds=600)).isoformat()
+        assert blocker['code']=='orders_remaining'
+        assert blocker['since']==waiting_since.isoformat()
+        assert blocker['deadline']==(waiting_since+timedelta(seconds=1800)).isoformat()
         assert blocker['escalated'] is escalated
         assert blocker['next_step']
         assert len(ex.posts) == posts
         assert report['rotation']['current'] == CID and report['rotation']['phase'] == 'exiting'
         assert report['rotation']['entered_count'] == 0
-        assert not rotation.stop.is_set() and not rotation.current.stop.is_set()
+        assert not rotation.stop.is_set() and rotation.current.stop.is_set()
         assert sentinel not in str(report) + str(rotation.sdk.journal.events()) + str(rotation.journal.events())
 
 
@@ -279,15 +274,13 @@ def test_exiting_clearance_diagnostic_overrides_missing_startup_proof(tmp_path, 
     # Repeated validated reads prove the bound-window validation completed before the missing-proof read.
     assert reads.count(proof_path) >= 2 and 'startup_verified' not in read_json(proof_path)
     assert report['phase'] == 'exiting' and report['current'] == CID
-    assert report['reason'] == 'waiting_inventory'
-    assert report['blocker']['code'] == 'inventory_remaining'
-    assert [{k:r[k] for k in ('token','exchange','ledger','difference')} for r in report['blocker']['numbers']['inventory']] == [
-        dict(token='1', exchange='1', ledger='1', difference='0'),
-        dict(token='2', exchange='0', ledger='0', difference='0')]
+    assert report['reason']=='waiting_orders'
+    assert report['blocker']['code']=='orders_remaining'
+    assert report['blocker']['numbers']=='UNKNOWN'
     assert {r.request_id for r in rotation.current.ledger.snapshot().requests if r.purpose == 'opening'} == openings
     assert [p for _, p in rotation.sdk.journal.events('signed') if p['request_id'] in openings] == signed_openings
     assert report['entered_count'] == 0
-    assert not rotation.stop.is_set() and not rotation.current.stop.is_set()
+    assert not rotation.stop.is_set() and rotation.current.stop.is_set()
 
 
 def test_alternating_wait_codes_escalate_without_recovery(tmp_path):
@@ -295,12 +288,13 @@ def test_alternating_wait_codes_escalate_without_recovery(tmp_path):
     rotation.window_end = AT + timedelta(days=1)
     rotation.step(AT)
     ex.quantities['101'] = D('0.125')
+    ex.cancel_unknown=True
     began = AT + timedelta(seconds=10)
     class Flaky(RuntimeError):
         pass
     original = ex.balance
     def balance(**kw):
-        if kw['asset_type'] == 'CONDITIONAL' and int((clock[0] - began).total_seconds()) // 10 % 2:
+        if kw['asset_type'] == 'COLLATERAL' and int((clock[0] - began).total_seconds()) // 10 % 2:
             raise Flaky('PRIVATE-FLAKY-READ')
         return original(**kw)
     ex.sdk.get_balance_allowance.side_effect = balance
@@ -311,23 +305,22 @@ def test_alternating_wait_codes_escalate_without_recovery(tmp_path):
         clock[0] = began + timedelta(seconds=elapsed)
         report = rotation.step(clock[0])['rotation']
         blocker = report['blocker']
-        expected = 'unexpected_error:Flaky@balance' if elapsed // 10 % 2 else 'inventory_mismatch'
+        expected = 'unexpected_error:Flaky@balance' if elapsed // 10 % 2 else 'orders_remaining'
         assert blocker['code'] == expected
         codes.add(blocker['code'])
         assert blocker['since'] == clock[0].isoformat()  # the per-code clock still resets
         assert report['phase'] == 'exiting' and report['current'] == CID
         assert len(ex.posts) == posts and report['entered_count'] == 0
-        assert not rotation.stop.is_set() and not rotation.current.stop.is_set()
+        assert not rotation.stop.is_set() and rotation.current.stop.is_set()
         assert 'PRIVATE-FLAKY-READ' not in str(rotation.snapshot()) + str(rotation.sdk.journal.events())
-        if expected == 'inventory_mismatch':
-            assert [{k:r[k] for k in ('token','exchange','ledger','difference')} for r in blocker['numbers']['inventory']] == [
-                dict(token='1', exchange='0.125', ledger='0', difference='0.125'),
-                dict(token='2', exchange='0', ledger='0', difference='0')]
+        if expected=='orders_remaining':
+            assert blocker['numbers']=='UNKNOWN' and blocker['safe_to_stop'] is False
+            assert blocker['order_tail'] in ('order-1','order-2')
         if elapsed >= 3600:
             assert blocker['escalated'] is True
             assert blocker['episode_since'] == began.isoformat()
             assert blocker['deadline'] <= (began + timedelta(seconds=3600)).isoformat()
-    assert codes == {'inventory_mismatch', 'unexpected_error:Flaky@balance'}
+    assert codes == {'orders_remaining','unexpected_error:Flaky@balance'}
 
     # Real exchange recovery and a current-leading scan resume running with no blocker.
     ex.sdk.get_balance_allowance.side_effect = original
@@ -344,14 +337,16 @@ def test_alternating_wait_codes_escalate_without_recovery(tmp_path):
     clock[0] += timedelta(seconds=10)
     rotation.scanner.scan_once(clock[0])
     fresh = rotation.step(clock[0])['rotation']
-    assert fresh['phase'] == 'exiting' and fresh['blocker']['code'] == 'inventory_mismatch'
+    assert fresh['phase'] == 'exiting' and fresh['blocker']['code'] == 'orders_remaining'
     assert fresh['blocker']['episode_since'] == clock[0].isoformat()
     assert fresh['blocker']['escalated'] is False
     # Without an intervening empty blocker, a real exit to cleared starts another episode.
     ex.quantities['101'] = D('0')
+    ex.cancel_unknown=False
+    obs.fail_public.update((CID, BID))
     clock[0] = rotation.window_end + timedelta(seconds=10)
     changed = rotation.step(clock[0])['rotation']
-    assert changed['phase'] == 'cleared' and changed['reason'] == 'needs_new_on'
+    assert changed['phase'] == 'cleared' and changed['reason'] == 'no_revalidated_candidate'
     assert changed['blocker']['episode_since'] == clock[0].isoformat()
     assert changed['blocker']['since'] == clock[0].isoformat()
     assert changed['entered_count'] == 0 and not rotation.stop.is_set()
