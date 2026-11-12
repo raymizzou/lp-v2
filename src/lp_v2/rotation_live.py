@@ -165,7 +165,7 @@ class RotationRunner:
             record_round(valid, at)
             if self.action_id is None:
                 self.reason = 'entry_authorization_missing'
-                return self.phase == 'running'
+                return self.phase == 'running' and valid is True
             if valid and self.control_run_id is not None:
                 if not self._startup_ready(self.current, at):
                     self.reason = 'waiting_seed_start_verification'
@@ -254,7 +254,7 @@ class RotationRunner:
             self._snapshot = self._build(now)
         return self.snapshot()
 
-    def _clearance_reason(self, now, *, runner=None, require_accounting=False):
+    def _clearance_reason(self, now, *, runner=None):
         runner = runner or self.current
         sdk = runner.sdk
         self._clearance_blocker = None

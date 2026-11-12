@@ -134,8 +134,16 @@ installation, missing secrets or a new release require separate authorization.
 
 Two fresh snapshots must independently prove the same run, full account identity,
 code, capital, matching market and live process, with the read-only process stopped.
-Readback, decision and snapshot times must advance. Accounting can remain UNKNOWN:
-that is not a settlement receipt. A temporary market pause keeps the process up and
+Readback, decision and snapshot times must advance.
+
+`accounting.status` reports the owned-order verification result (`orders_verified()`):
+it is SUCCESS only when that result is true. Any historical order still UNKNOWN
+keeps this field UNKNOWN, even when the round's readbacks completed. It is not a
+general "round reads completed" flag or a fill/merge settlement receipt. Startup
+confirmation accepts UNKNOWN while retaining the two fresh identity-bound reports;
+`off` does not require this field to be SUCCESS.
+
+A temporary market pause keeps the process up and
 returns its safe reason; it does not trigger rollback merely because quoting is
 unavailable. Missing, stale or foreign identity evidence still fails bounded
 startup verification. A running process does not prove orders were placed or scored.
